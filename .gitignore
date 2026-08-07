@@ -28,6 +28,8 @@ frontend/dist/
 
 # Logs
 logs/
+.quantgpt.pid
+*.bak-*
 
 # MCP config (local paths)
 .mcp.json
@@ -53,6 +55,9 @@ docs/factor_research/
 .DS_Store
 engine/target/
 engine/Cargo.lock
+
+# CodeGraph local index
+.codegraph/
 
 # Database
 *.db

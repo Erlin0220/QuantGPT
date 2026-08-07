@@ -183,9 +183,23 @@ def clean_expression(raw: str) -> str:
         text = text.rsplit("```", 1)[0]
     text = text.strip("`").strip()
     if "\n" in text:
-        factor_ops = ["rank(", "ts_mean(", "ts_std(", "ts_delta(", "ts_shift(",
-                       "ts_corr(", "where(", "sign_power(", "power(", "decay_linear(",
-                       "log(", "abs(", "zscore(", "close", "volume"]
+        factor_ops = [
+            "rank(",
+            "ts_mean(",
+            "ts_std(",
+            "ts_delta(",
+            "ts_shift(",
+            "ts_corr(",
+            "where(",
+            "sign_power(",
+            "power(",
+            "decay_linear(",
+            "log(",
+            "abs(",
+            "zscore(",
+            "close",
+            "volume",
+        ]
         for line in reversed(text.split("\n")):
             line = line.strip()
             if any(op in line for op in factor_ops):
@@ -197,9 +211,9 @@ def validate_parentheses(expr: str) -> str | None:
     """Check if parentheses are balanced. Returns error message or None."""
     depth = 0
     for i, ch in enumerate(expr):
-        if ch == '(':
+        if ch == "(":
             depth += 1
-        elif ch == ')':
+        elif ch == ")":
             depth -= 1
             if depth < 0:
                 return f"括号不平衡：位置 {i} 处多余的右括号 ')'"
@@ -210,6 +224,7 @@ def validate_parentheses(expr: str) -> str | None:
 
 def _get_client():
     from openai import OpenAI
+
     api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key:
         raise RuntimeError("DEEPSEEK_API_KEY environment variable is not set")
@@ -234,7 +249,7 @@ def call_deepseek(prompt: str) -> str:
             {"role": "user", "content": prompt},
         ],
         temperature=0.1,
-        max_tokens=256,
+        max_tokens=1024,
         timeout=30,
     )
     return clean_expression(resp.choices[0].message.content)
@@ -250,12 +265,7 @@ def call_fix_expression(expression: str, error: str, prompt: str) -> str:
         f"{operators_doc}\n\n"
         "修复下面的表达式。只返回修正后的表达式，不要任何解释、代码块或引号。"
     )
-    user = (
-        f"用户需求: {prompt}\n\n"
-        f"以下因子表达式执行失败:\n"
-        f"`{expression}`\n\n"
-        f"错误信息:\n{error}"
-    )
+    user = f"用户需求: {prompt}\n\n以下因子表达式执行失败:\n`{expression}`\n\n错误信息:\n{error}"
 
     resp = client.chat.completions.create(
         model=_get_model(),
@@ -264,7 +274,7 @@ def call_fix_expression(expression: str, error: str, prompt: str) -> str:
             {"role": "user", "content": user},
         ],
         temperature=0.1,
-        max_tokens=256,
+        max_tokens=1024,
         timeout=30,
     )
     return clean_expression(resp.choices[0].message.content)
@@ -321,8 +331,8 @@ def call_interpret_factor(
         f"用户需求：{prompt}\n"
         f"因子表达式：{expression}\n\n"
         f"回测指标（供参考）：\n"
-        f"- 年化收益：{cagr*100:.1f}%，Sharpe：{sharpe:.2f}，最大回撤：{max_dd*100:.1f}%\n"
-        f"- IC均值：{ic:.4f}，Rank IC：{rank_ic:.4f}，单调性：{mono:.2f}，换手率：{turnover*100:.1f}%\n"
+        f"- 年化收益：{cagr * 100:.1f}%，Sharpe：{sharpe:.2f}，最大回撤：{max_dd * 100:.1f}%\n"
+        f"- IC均值：{ic:.4f}，Rank IC：{rank_ic:.4f}，单调性：{mono:.2f}，换手率：{turnover * 100:.1f}%\n"
     )
 
     try:
@@ -348,9 +358,9 @@ def call_interpret_factor(
 
 
 _EXPR_KEYWORDS = re.compile(
-    r'(?:rank|zscore|ts_mean|ts_std|ts_delta|ts_shift|ts_rank|ts_corr|ts_cov|'
-    r'ts_max|ts_min|ts_sum|ts_argmax|ts_argmin|decay_linear|product|sign_power|'
-    r'where|clip|log|abs|sign|scale|tanh|sigmoid|exp|sqrt|power)\s*\('
+    r"(?:rank|zscore|ts_mean|ts_std|ts_delta|ts_shift|ts_rank|ts_corr|ts_cov|"
+    r"ts_max|ts_min|ts_sum|ts_argmax|ts_argmin|decay_linear|product|sign_power|"
+    r"where|clip|log|abs|sign|scale|tanh|sigmoid|exp|sqrt|power)\s*\("
 )
 
 
@@ -359,8 +369,9 @@ def looks_like_expression(text: str) -> bool:
     if _EXPR_KEYWORDS.search(text):
         return True
     from .fundamental_data import ALL_FUNDAMENTAL_NAMES as _FN
-    cols = {'open', 'high', 'low', 'close', 'volume', 'amount', 'returns', 'vwap'} | _FN
-    tokens = re.findall(r'[a-zA-Z_]\w*', text)
+
+    cols = {"open", "high", "low", "close", "volume", "amount", "returns", "vwap"} | _FN
+    tokens = re.findall(r"[a-zA-Z_]\w*", text)
     if tokens and all(t in cols for t in tokens):
         return True
     return False

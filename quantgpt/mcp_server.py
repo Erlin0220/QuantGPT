@@ -12,11 +12,14 @@ Provides tools for Agent-driven backtest workflow:
 """
 
 import asyncio
+import gzip
 import json
 import logging
+import math
+import os
 import sys
-import time
 import traceback
+from pathlib import Path
 
 import pandas as pd
 from mcp.server.fastmcp import FastMCP
@@ -26,24 +29,41 @@ from .expression_parser import __doc__ as _expr_module_doc
 from .expression_parser import parse_expression
 from .fundamental_data import ALL_FUNDAMENTAL_NAMES
 from .market_data import BENCHMARK_CODES, UNIVERSES, MarketDataFetcher, fetch_benchmark_returns, get_universe
-from .mcp_task_helper import complete_mcp_task, start_mcp_task
+from .mcp_task_helper import (
+    MCPTaskCapacityError,
+    cancel_mcp_task,
+    complete_mcp_task,
+    get_mcp_task_snapshot,
+    is_mcp_task_cancelled,
+    start_mcp_background_task,
+    start_mcp_task,
+    update_mcp_task,
+)
 from .report import generate_report
+from .task_executor import _run_backtest_in_process, get_executor
 from .wq_brain_service import (
+    prepare_wq_expression,
     run_batch_simulation,
     run_check_alphas,
     run_list_alphas,
     run_single_simulation,
     run_submit_by_ids,
-    safe_float,
 )
-from .task_executor import _run_backtest_in_process, get_executor
+from .wq_operator_registry import WQ_FALLBACK_OPERATORS
+from .wq_operator_registry import validate_wq_expression as validate_wq_catalog_expression
+from .wq_research_agent import run_research_batch
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s", stream=sys.stderr)
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP(
     "quantgpt",
-    instructions="QuantGPT — A 股因子回测服务。先用 list_operators 了解可用算子，再用 run_backtest 执行回测。可用 score_factor 评分、diagnose_factor 诊断、run_anti_overfit 检测过拟合、run_rolling_validation 滚动验证。",
+    instructions=(
+        "QuantGPT — A 股因子回测与 WorldQuant BRAIN 研究服务。"
+        "所有回测、验证、因子值计算、WQ 模拟、研究和正式提交均为异步任务：调用后立即返回 task_id，"
+        "使用 get_task_status 轮询直到 completed/failed/cancelled；需要中止时调用 cancel_task。"
+        "禁止在单次 MCP 调用中等待重任务完成。因子值结果使用 get_factor_values_page 分页读取。"
+    ),
     streamable_http_path="/",
     stateless_http=True,
     transport_security=TransportSecuritySettings(
@@ -55,6 +75,7 @@ mcp = FastMCP(
 def _enrich_with_fundamentals(expression: str, market_df, stock_codes: list, start_date: str, end_date: str):
     """Conditionally fetch and merge fundamental data if the expression uses fundamental vars."""
     from .fundamental_data import detect_fundamental_vars, enrich_market_data
+
     fund_vars = detect_fundamental_vars(expression)
     return enrich_market_data(market_df, fund_vars, stock_codes, start_date, end_date)
 
@@ -72,15 +93,354 @@ def _fetch_benchmark_for_market(benchmark: str, start_date: str, end_date: str):
     return fetch_benchmark_returns(benchmark, start_date, end_date)
 
 
+async def _enqueue_mcp_tool(
+    task_type: str,
+    expression: str | None,
+    params: dict,
+    worker,
+    *,
+    legacy_wq_poll: bool = False,
+    **response_extra,
+) -> str:
+    """Atomically accept a bounded background task and return its polling contract."""
+    try:
+        task_id = await start_mcp_task(task_type, expression, params, status="pending")
+    except MCPTaskCapacityError as exc:
+        return json.dumps({"error": str(exc), "retryable": True}, ensure_ascii=False)
+
+    try:
+        start_mcp_background_task(
+            task_id,
+            worker,
+            params,
+            expression=expression,
+        )
+    except Exception as exc:
+        await complete_mcp_task(task_id, error=f"Failed to enqueue background task: {exc}", expression=expression)
+        return json.dumps({"error": str(exc), "task_id": task_id}, ensure_ascii=False)
+
+    return _async_task_response(
+        task_id,
+        legacy_wq_poll=legacy_wq_poll,
+        **response_extra,
+    )
+
+
+def _load_local_factor_data(task_id: str, params: dict):
+    expression = params["expression"]
+    update_mcp_task(task_id, status="fetching_data", progress=5, progress_message="下载行情数据", persist=True)
+    market_df, stock_codes = _fetch_data_for_market(params["universe"], params["start_date"], params["end_date"])
+    if market_df is None or len(market_df) == 0:
+        return None, stock_codes, "No market data available. Check date range and stock codes."
+    if is_mcp_task_cancelled(task_id):
+        return None, stock_codes, "任务已取消"
+    update_mcp_task(task_id, progress=20, progress_message="加载基本面数据")
+    market_df = _enrich_with_fundamentals(
+        expression,
+        market_df,
+        stock_codes,
+        params["start_date"],
+        params["end_date"],
+    )
+    return market_df, stock_codes, None
+
+
+def _run_local_backtest_process(task_id: str, params: dict, *, cost_rate=None):
+    market_df, stock_codes, error = _load_local_factor_data(task_id, params)
+    if error:
+        return None, stock_codes, {"ok": False, "cancelled": error == "任务已取消", "error": error}
+
+    update_mcp_task(task_id, status="backtesting", progress=30, progress_message="执行因子回测", persist=True)
+    submit_kwargs = {
+        "neutralize_industry": params["neutralize_industry"],
+        "neutralize_cap": params["neutralize_cap"],
+    }
+    if cost_rate is not None:
+        submit_kwargs["cost_rate"] = cost_rate
+    future = get_executor().submit_cpu_work(
+        _run_backtest_in_process,
+        market_df,
+        params["expression"],
+        params["n_groups"],
+        params["holding_period"],
+        **submit_kwargs,
+    )
+    result = future.result(timeout=600)
+    if is_mcp_task_cancelled(task_id):
+        return None, stock_codes, {"ok": False, "cancelled": True, "error": "任务已取消"}
+    update_mcp_task(task_id, progress=70, progress_message="回测完成，整理结果")
+    return result, stock_codes, None
+
+
+def _run_local_backtest_mcp_task(task_id: str, params: dict) -> dict:
+    result, stock_codes, error = _run_local_backtest_process(task_id, params)
+    if error:
+        return error
+    assert result is not None
+
+    anti_overfit_result = None
+    factor_df = result.get("_factor_df")
+    if factor_df is not None and len(factor_df) > 100:
+        try:
+            from .anti_overfit import run_anti_overfit as _run_ao
+
+            update_mcp_task(task_id, progress=75, progress_message="执行反过拟合检查")
+            anti_overfit_result = _run_ao(factor_df, params["holding_period"])
+        except Exception as exc:
+            logger.warning("Anti-overfit analysis failed: %s", exc)
+
+    bm_returns = None
+    try:
+        update_mcp_task(task_id, progress=85, progress_message="加载基准并生成报告")
+        bm_returns = _fetch_benchmark_for_market(params["benchmark"], params["start_date"], params["end_date"])
+    except Exception as exc:
+        logger.warning("Benchmark fetch failed: %s", exc)
+
+    report_result = generate_report(
+        result["ls_returns"],
+        benchmark_returns=bm_returns,
+        title=f"Factor: {params['expression']}",
+    )
+    return {
+        "ok": True,
+        "report_path": report_result["report_path"],
+        "metrics": report_result["metrics"],
+        "backtest_summary": {
+            "long_short_sharpe": result["long_short_sharpe"],
+            "long_short_annual": result.get("long_short_annual", 0),
+            "top_group_sharpe": result.get("top_group_sharpe", 0),
+            "monotonicity_score": result["monotonicity_score"],
+            "spread": result["spread"],
+            "group_returns": result["group_returns"],
+            "ic_mean": result.get("ic_mean", 0),
+            "rank_ic_mean": result.get("rank_ic_mean", 0),
+            "ic_ir": result.get("ic_ir", 0),
+            "ic_win_rate": result.get("ic_win_rate", 0),
+            "turnover": result.get("turnover", 0),
+            "cost_adjusted": result.get("cost_adjusted", False),
+            "cost_rate": result.get("cost_rate", 0),
+            "total_cost_drag": result.get("total_cost_drag", 0),
+        },
+        "wq_brain": result.get("wq_brain", {}),
+        "anti_overfit": anti_overfit_result,
+        "params": {**params, "stock_count": len(stock_codes)},
+    }
+
+
+def _run_local_score_mcp_task(task_id: str, params: dict) -> dict:
+    from .iteration import compute_factor_score
+
+    result, _stock_codes, error = _run_local_backtest_process(task_id, params)
+    if error:
+        return error
+    assert result is not None
+    bm_returns = None
+    try:
+        bm_returns = _fetch_benchmark_for_market(params["benchmark"], params["start_date"], params["end_date"])
+    except Exception:
+        pass
+    update_mcp_task(task_id, progress=85, progress_message="计算因子评分")
+    report_result = generate_report(result["ls_returns"], benchmark_returns=bm_returns, title="Factor Score")
+    scoring = compute_factor_score(
+        backtest_summary={
+            "long_short_sharpe": result["long_short_sharpe"],
+            "monotonicity_score": result["monotonicity_score"],
+            "spread": result["spread"],
+            "ic_mean": result.get("ic_mean", 0),
+            "rank_ic_mean": result.get("rank_ic_mean", 0),
+            "ic_ir": result.get("ic_ir", 0),
+            "ic_win_rate": result.get("ic_win_rate", 0),
+        },
+        report_metrics=report_result["metrics"],
+    )
+    return {
+        "ok": True,
+        "score": scoring["score"],
+        "grade": scoring["grade"],
+        "component_scores": scoring["component_scores"],
+        "key_metrics": {
+            "ic_mean": result.get("ic_mean", 0),
+            "ic_ir": result.get("ic_ir", 0),
+            "monotonicity": result["monotonicity_score"],
+            "top_group_sharpe": result.get("top_group_sharpe", 0),
+            "turnover": result.get("turnover", 0),
+            "sharpe": report_result["metrics"].get("sharpe", 0),
+            "max_drawdown": report_result["metrics"].get("max_drawdown", 0),
+        },
+        "interpretation": {"rating": scoring["grade"]},
+    }
+
+
+def _run_local_anti_overfit_mcp_task(task_id: str, params: dict) -> dict:
+    from .anti_overfit import run_anti_overfit as _run_ao
+
+    result, _stock_codes, error = _run_local_backtest_process(task_id, params, cost_rate=0)
+    if error:
+        return error
+    assert result is not None
+    factor_df = result.get("_factor_df")
+    if factor_df is None or len(factor_df) < 100:
+        return {"ok": False, "error": "Insufficient factor data for anti-overfit analysis."}
+    update_mcp_task(task_id, progress=85, progress_message="执行反过拟合分析")
+    return {"ok": True, **_run_ao(factor_df, params["holding_period"])}
+
+
+def _run_local_rolling_validation_mcp_task(task_id: str, params: dict) -> dict:
+    from .rolling_validator import run_rolling_validation as _run_rv
+
+    result, _stock_codes, error = _run_local_backtest_process(task_id, params, cost_rate=0)
+    if error:
+        return error
+    assert result is not None
+    factor_df = result.get("_factor_df")
+    if factor_df is None or len(factor_df) < 100:
+        return {"ok": False, "error": "Insufficient factor data for rolling validation."}
+    update_mcp_task(task_id, progress=85, progress_message="执行滚动验证")
+    return {"ok": True, **_run_rv(factor_df, params["holding_period"])}
+
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_FACTOR_VALUES_DIR = _PROJECT_ROOT / "reports" / "mcp_factor_values"
+_MAX_FACTOR_VALUE_ARTIFACTS = max(1, int(os.environ.get("QUANTGPT_MAX_FACTOR_VALUE_ARTIFACTS", "100")))
+
+
+def _cleanup_factor_value_artifacts() -> None:
+    files = sorted(
+        _FACTOR_VALUES_DIR.glob("*.jsonl.gz"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for stale in files[_MAX_FACTOR_VALUE_ARTIFACTS:]:
+        try:
+            stale.unlink()
+        except OSError:
+            logger.warning("Failed to remove stale factor artifact: %s", stale)
+
+
+def _run_compute_factor_values_mcp_task(task_id: str, params: dict) -> dict:
+    from datetime import date, timedelta
+
+    import numpy as np
+
+    from .backtest import api_context
+
+    expression = params["expression"]
+    try:
+        factor_fn = parse_expression(expression)
+    except Exception as exc:
+        return {"ok": False, "error": f"Invalid expression: {exc}"}
+
+    with api_context():
+        update_mcp_task(task_id, status="fetching_data", progress=5, progress_message="加载股票池", persist=True)
+        stocks = get_universe(params["universe"])
+        if not stocks:
+            return {"ok": False, "error": f"Empty universe: {params['universe']}"}
+
+        end_dt = params["end_date"] or date.today().isoformat()
+        start_dt = params["start_date"] or (date.fromisoformat(end_dt) - timedelta(days=365)).isoformat()
+        d_start = date.fromisoformat(start_dt)
+        d_end = date.fromisoformat(end_dt)
+        if d_end < d_start:
+            return {"ok": False, "error": "end_date must be on or after start_date"}
+        if (d_end - d_start).days > 750:
+            return {"ok": False, "error": "Date range too large (max 750 days)"}
+
+        fetch_start = (d_start - timedelta(days=260)).isoformat()
+        update_mcp_task(task_id, progress=15, progress_message="下载行情数据")
+        df = MarketDataFetcher().fetch_stocks(stocks, fetch_start, end_dt)
+        if df is None or df.empty:
+            return {"ok": False, "error": "No market data available for this universe/date range"}
+        if is_mcp_task_cancelled(task_id):
+            return {"ok": False, "cancelled": True, "error": "任务已取消"}
+
+        update_mcp_task(task_id, status="computing", progress=45, progress_message="计算因子值", persist=True)
+        try:
+            df["factor_value"] = factor_fn(df)
+        except Exception as exc:
+            return {"ok": False, "error": f"Expression evaluation failed: {exc}"}
+
+        result_df = df[df["trade_date"] >= start_dt][["trade_date", "stock_code", "factor_value"]].dropna(
+            subset=["factor_value"]
+        )
+        grouped = result_df.groupby("trade_date")
+        total_days = grouped.ngroups
+
+        _FACTOR_VALUES_DIR.mkdir(parents=True, exist_ok=True)
+        artifact = _FACTOR_VALUES_DIR / f"{task_id}.jsonl.gz"
+        temporary = artifact.with_suffix(".jsonl.gz.tmp")
+        total_values = 0
+        written_days = 0
+        try:
+            with gzip.open(temporary, "wt", encoding="utf-8") as output:
+                for index, (trade_date, group) in enumerate(grouped, start=1):
+                    if is_mcp_task_cancelled(task_id):
+                        return {"ok": False, "cancelled": True, "error": "任务已取消"}
+                    values = {
+                        row.stock_code: round(float(row.factor_value), 6)
+                        for row in group.itertuples(index=False)
+                        if np.isfinite(row.factor_value)
+                    }
+                    if values:
+                        output.write(
+                            json.dumps(
+                                {
+                                    "date": str(trade_date),
+                                    "values": values,
+                                    "count": len(values),
+                                },
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                        )
+                        output.write("\n")
+                        written_days += 1
+                        total_values += len(values)
+                    if index == total_days or index % 20 == 0:
+                        progress = 60 + int(index * 35 / max(1, total_days))
+                        update_mcp_task(
+                            task_id,
+                            progress=min(progress, 95),
+                            progress_message=f"写入分页结果 {index}/{total_days}",
+                        )
+            temporary.replace(artifact)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+        _cleanup_factor_value_artifacts()
+        relative_path = artifact.relative_to(_PROJECT_ROOT).as_posix()
+        return {
+            "ok": True,
+            "expression": expression,
+            "universe": params["universe"],
+            "start_date": start_dt,
+            "end_date": end_dt,
+            "trading_days": written_days,
+            "total_values": total_values,
+            "result_storage": {
+                "format": "gzip-jsonl",
+                "path": relative_path,
+                "page_tool": "get_factor_values_page",
+                "default_page_size": 5,
+                "max_page_size": 20,
+            },
+        }
+
+
 # Dummy DataFrame for expression validation (includes fundamental columns)
-_VALIDATION_DUMMY = pd.DataFrame({
-    "open": [1.0, 2.0, 3.0], "high": [1.1, 2.1, 3.1],
-    "low": [0.9, 1.9, 2.9], "close": [1.0, 2.0, 3.0],
-    "volume": [100, 200, 300], "amount": [100, 400, 900],
-    "pct_change": [0, 100, 50],
-    "trade_date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
-    **{name: [1.0, 1.1, 1.2] for name in ALL_FUNDAMENTAL_NAMES},
-})
+_VALIDATION_DUMMY = pd.DataFrame(
+    {
+        "open": [1.0, 2.0, 3.0],
+        "high": [1.1, 2.1, 3.1],
+        "low": [0.9, 1.9, 2.9],
+        "close": [1.0, 2.0, 3.0],
+        "volume": [100, 200, 300],
+        "amount": [100, 400, 900],
+        "pct_change": [0, 100, 50],
+        "trade_date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
+        **{name: [1.0, 1.1, 1.2] for name in ALL_FUNDAMENTAL_NAMES},
+    }
+)
 
 
 @mcp.tool()
@@ -100,10 +460,62 @@ def list_universes() -> str:
         "csi2000": "中证2000成分股（派生: 全A - HS300 - CSI500 - CSI1000, 取前2000）",
     }
     a_share_benchmarks = {k: v["name"] for k, v in BENCHMARK_CODES.items()}
-    return json.dumps({
-        "universes": a_share_info,
-        "benchmarks": a_share_benchmarks,
-    }, ensure_ascii=False, indent=2)
+    return json.dumps(
+        {
+            "universes": a_share_info,
+            "benchmarks": a_share_benchmarks,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+@mcp.tool()
+async def list_wq_operators() -> str:
+    """返回当前 WorldQuant BRAIN 账号实际可用的 FASTEXPR 算子目录。
+
+    优先读取 BRAIN /operators 实时目录；账号未配置或目录读取失败时返回内置 fallback。
+    WQ Alpha 生成前应优先调用本工具，而不是复用 A 股本地算子列表。
+    """
+    from .wq_brain_client import get_client
+    from .wq_brain_client import is_configured as _wq_configured
+
+    if _wq_configured("primary"):
+        client = get_client("primary")
+        try:
+            authenticated = await asyncio.to_thread(client.authenticate)
+            if authenticated:
+                operators = await asyncio.to_thread(client.list_operators)
+                return json.dumps(
+                    {
+                        "source": "live",
+                        "count": len(operators),
+                        "operators": [
+                            {
+                                "name": item.get("name"),
+                                "category": item.get("category"),
+                                "definition": item.get("definition"),
+                            }
+                            for item in operators
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+        except Exception as e:
+            logger.warning(f"WQ operator catalog fetch failed, using fallback: {e}")
+        finally:
+            await asyncio.to_thread(client.close)
+
+    return json.dumps(
+        {
+            "source": "fallback",
+            "count": len(WQ_FALLBACK_OPERATORS),
+            "operators": sorted(WQ_FALLBACK_OPERATORS),
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -117,9 +529,9 @@ def validate_expression(expression: str, mode: str = "local") -> str:
 
     depth = 0
     for i, ch in enumerate(expression):
-        if ch == '(':
+        if ch == "(":
             depth += 1
-        elif ch == ')':
+        elif ch == ")":
             depth -= 1
             if depth < 0:
                 return f"ERROR: 括号不平衡：位置 {i} 处多余的右括号 ')'"
@@ -127,9 +539,40 @@ def validate_expression(expression: str, mode: str = "local") -> str:
         return f"ERROR: 括号不平衡：缺少 {depth} 个右括号 ')'"
 
     try:
-        func = parse_expression(expression, mode=mode)
         if mode == "wq":
-            return "OK: expression is valid for WQ BRAIN submission"
+            from .wq_brain_client import get_client
+            from .wq_brain_client import is_configured as _wq_configured
+
+            canonical = expression
+            catalog_source = "fallback"
+            if _wq_configured("primary"):
+                client = get_client("primary")
+                try:
+                    if client.authenticate():
+                        canonical, error, catalog_source = prepare_wq_expression(client, expression)
+                        if error:
+                            return f"ERROR: {error}"
+                    else:
+                        validation = validate_wq_catalog_expression(expression, WQ_FALLBACK_OPERATORS)
+                        if not validation.ok:
+                            return f"ERROR: {validation.error}"
+                        canonical = validation.expression
+                finally:
+                    client.close()
+            else:
+                validation = validate_wq_catalog_expression(expression, WQ_FALLBACK_OPERATORS)
+                if not validation.ok:
+                    return f"ERROR: {validation.error}"
+                canonical = validation.expression
+
+            if canonical != expression:
+                return (
+                    "OK: expression is valid for WQ BRAIN submission; "
+                    f"canonical_expression={canonical}; operator_catalog={catalog_source}"
+                )
+            return f"OK: expression is valid for WQ BRAIN submission; operator_catalog={catalog_source}"
+
+        func = parse_expression(expression, mode=mode)
         func(_VALIDATION_DUMMY)
         return "OK: expression is valid"
     except Exception as e:
@@ -164,93 +607,18 @@ async def run_backtest(
     Returns:
         JSON string with report_path, metrics, group_returns, anti_overfit.
     """
-    task_id = await start_mcp_task("backtest", expression, {
-        "universe": universe, "start_date": start_date, "end_date": end_date,
-        "n_groups": n_groups, "holding_period": holding_period, "benchmark": benchmark,
-        "neutralize_industry": neutralize_industry, "neutralize_cap": neutralize_cap,
-    })
-    _error_msg = None
-    _result = None
-    try:
-        logger.info(f"Getting universe: {universe}")
-        market_df, stock_codes = await asyncio.to_thread(_fetch_data_for_market, universe, start_date, end_date)
-        if market_df is None or len(market_df) == 0:
-            return json.dumps({"error": "No market data available. Check date range and stock codes."})
-
-        market_df = await asyncio.to_thread(_enrich_with_fundamentals, expression, market_df, stock_codes, start_date, end_date)
-
-        logger.info(f"Running backtest: {expression}")
-        executor = get_executor()
-        future = executor.submit_cpu_work(
-            _run_backtest_in_process, market_df, expression, n_groups, holding_period,
-            neutralize_industry=neutralize_industry, neutralize_cap=neutralize_cap,
-        )
-        result = await asyncio.to_thread(future.result, 600)
-
-        anti_overfit_result = None
-        factor_df = result.get("_factor_df")
-        if factor_df is not None and len(factor_df) > 100:
-            try:
-                from .anti_overfit import run_anti_overfit as _run_ao
-                anti_overfit_result = await asyncio.to_thread(_run_ao, factor_df, holding_period)
-            except Exception as e:
-                logger.warning(f"Anti-overfit analysis failed: {e}")
-
-        bm_returns = None
-        try:
-            bm_returns = await asyncio.to_thread(_fetch_benchmark_for_market, benchmark, start_date, end_date)
-        except Exception as e:
-            logger.warning(f"Benchmark fetch failed: {e}")
-
-        report_result = await asyncio.to_thread(
-            generate_report,
-            result["ls_returns"],
-            benchmark_returns=bm_returns,
-            title=f"Factor: {expression}",
-        )
-
-        _result = {
-            "report_path": report_result["report_path"],
-            "metrics": report_result["metrics"],
-            "backtest_summary": {
-                "long_short_sharpe": result["long_short_sharpe"],
-                "long_short_annual": result.get("long_short_annual", 0),
-                "top_group_sharpe": result.get("top_group_sharpe", 0),
-                "monotonicity_score": result["monotonicity_score"],
-                "spread": result["spread"],
-                "group_returns": result["group_returns"],
-                "ic_mean": result.get("ic_mean", 0),
-                "rank_ic_mean": result.get("rank_ic_mean", 0),
-                "ic_ir": result.get("ic_ir", 0),
-                "ic_win_rate": result.get("ic_win_rate", 0),
-                "turnover": result.get("turnover", 0),
-                "cost_adjusted": result.get("cost_adjusted", False),
-                "cost_rate": result.get("cost_rate", 0),
-                "total_cost_drag": result.get("total_cost_drag", 0),
-            },
-            "wq_brain": result.get("wq_brain", {}),
-            "anti_overfit": anti_overfit_result,
-            "params": {
-                "expression": expression,
-                "universe": universe,
-                "start_date": start_date,
-                "end_date": end_date,
-                "n_groups": n_groups,
-                "holding_period": holding_period,
-                "benchmark": benchmark,
-                "neutralize_industry": neutralize_industry,
-                "neutralize_cap": neutralize_cap,
-                "stock_count": len(stock_codes),
-            },
-        }
-        return json.dumps(_result, ensure_ascii=False, indent=2, default=str)
-
-    except Exception as e:
-        logger.error(f"Backtest failed: {traceback.format_exc()}")
-        _error_msg = str(e)
-        return json.dumps({"error": str(e)})
-    finally:
-        await complete_mcp_task(task_id, _result, _error_msg, expression)
+    params = {
+        "expression": expression,
+        "universe": universe,
+        "start_date": start_date,
+        "end_date": end_date,
+        "n_groups": n_groups,
+        "holding_period": holding_period,
+        "benchmark": benchmark,
+        "neutralize_industry": neutralize_industry,
+        "neutralize_cap": neutralize_cap,
+    }
+    return await _enqueue_mcp_tool("backtest", expression, params, _run_local_backtest_mcp_task)
 
 
 @mcp.tool()
@@ -283,77 +651,18 @@ async def score_factor(
     Returns:
         JSON with score, grade, component_scores, key metrics.
     """
-    from .iteration import compute_factor_score
-
-    task_id = await start_mcp_task("score", expression, {
-        "universe": universe, "start_date": start_date, "end_date": end_date,
-        "n_groups": n_groups, "holding_period": holding_period, "benchmark": benchmark,
-    })
-    _error_msg = None
-    _result = None
-    try:
-        market_df, stock_codes = await asyncio.to_thread(_fetch_data_for_market, universe, start_date, end_date)
-        if market_df is None or len(market_df) == 0:
-            return json.dumps({"error": "No market data available."})
-
-        market_df = await asyncio.to_thread(_enrich_with_fundamentals, expression, market_df, stock_codes, start_date, end_date)
-
-        executor = get_executor()
-        future = executor.submit_cpu_work(
-            _run_backtest_in_process, market_df, expression, n_groups, holding_period,
-            neutralize_industry=neutralize_industry, neutralize_cap=neutralize_cap,
-        )
-        result = await asyncio.to_thread(future.result, 600)
-
-        bm_returns = None
-        try:
-            bm_returns = await asyncio.to_thread(_fetch_benchmark_for_market, benchmark, start_date, end_date)
-        except Exception:
-            pass
-
-        report_result = await asyncio.to_thread(
-            generate_report,
-            result["ls_returns"],
-            benchmark_returns=bm_returns,
-            title="Factor Score",
-        )
-
-        scoring = compute_factor_score(
-            backtest_summary={
-                "long_short_sharpe": result["long_short_sharpe"],
-                "monotonicity_score": result["monotonicity_score"],
-                "spread": result["spread"],
-                "ic_mean": result.get("ic_mean", 0),
-                "rank_ic_mean": result.get("rank_ic_mean", 0),
-                "ic_ir": result.get("ic_ir", 0),
-                "ic_win_rate": result.get("ic_win_rate", 0),
-            },
-            report_metrics=report_result["metrics"],
-        )
-
-        _result = {
-            "score": scoring["score"],
-            "grade": scoring["grade"],
-            "component_scores": scoring["component_scores"],
-            "key_metrics": {
-                "ic_mean": result.get("ic_mean", 0),
-                "ic_ir": result.get("ic_ir", 0),
-                "monotonicity": result["monotonicity_score"],
-                "top_group_sharpe": result.get("top_group_sharpe", 0),
-                "turnover": result.get("turnover", 0),
-                "sharpe": report_result["metrics"].get("sharpe", 0),
-                "max_drawdown": report_result["metrics"].get("max_drawdown", 0),
-            },
-            "interpretation": {"rating": scoring["grade"]},
-        }
-        return json.dumps(_result, ensure_ascii=False, indent=2, default=str)
-
-    except Exception as e:
-        logger.error(f"Score failed: {traceback.format_exc()}")
-        _error_msg = str(e)
-        return json.dumps({"error": str(e)})
-    finally:
-        await complete_mcp_task(task_id, _result, _error_msg, expression)
+    params = {
+        "expression": expression,
+        "universe": universe,
+        "start_date": start_date,
+        "end_date": end_date,
+        "n_groups": n_groups,
+        "holding_period": holding_period,
+        "benchmark": benchmark,
+        "neutralize_industry": neutralize_industry,
+        "neutralize_cap": neutralize_cap,
+    }
+    return await _enqueue_mcp_tool("score", expression, params, _run_local_score_mcp_task)
 
 
 @mcp.tool()
@@ -440,41 +749,18 @@ async def run_anti_overfit(
     Returns:
         JSON with score, recommendation, and per-test details.
     """
-    from .anti_overfit import run_anti_overfit as _run_ao
-
-    task_id = await start_mcp_task("anti_overfit", expression, {
-        "universe": universe, "start_date": start_date, "end_date": end_date,
+    params = {
+        "expression": expression,
+        "universe": universe,
+        "start_date": start_date,
+        "end_date": end_date,
+        "n_groups": 5,
         "holding_period": holding_period,
-    })
-    _error_msg = None
-    _result = None
-    try:
-        market_df, stock_codes = await asyncio.to_thread(_fetch_data_for_market, universe, start_date, end_date)
-        if market_df is None or len(market_df) == 0:
-            return json.dumps({"error": "No market data available."})
-
-        market_df = await asyncio.to_thread(_enrich_with_fundamentals, expression, market_df, stock_codes, start_date, end_date)
-
-        executor = get_executor()
-        future = executor.submit_cpu_work(
-            _run_backtest_in_process, market_df, expression, 5, holding_period,
-            cost_rate=0,
-            neutralize_industry=neutralize_industry, neutralize_cap=neutralize_cap,
-        )
-        result = await asyncio.to_thread(future.result, 600)
-        factor_df = result.get("_factor_df")
-        if factor_df is None or len(factor_df) < 100:
-            return json.dumps({"error": "Insufficient factor data for anti-overfit analysis."})
-
-        _result = await asyncio.to_thread(_run_ao, factor_df, holding_period)
-        return json.dumps(_result, ensure_ascii=False, indent=2, default=str)
-
-    except Exception as e:
-        logger.error(f"Anti-overfit failed: {traceback.format_exc()}")
-        _error_msg = str(e)
-        return json.dumps({"error": str(e)})
-    finally:
-        await complete_mcp_task(task_id, _result, _error_msg, expression)
+        "benchmark": "hs300",
+        "neutralize_industry": neutralize_industry,
+        "neutralize_cap": neutralize_cap,
+    }
+    return await _enqueue_mcp_tool("anti_overfit", expression, params, _run_local_anti_overfit_mcp_task)
 
 
 @mcp.tool()
@@ -504,41 +790,249 @@ async def run_rolling_validation(
     Returns:
         JSON with composite score, per-window results, decay analysis.
     """
-    from .rolling_validator import run_rolling_validation as _run_rv
-
-    task_id = await start_mcp_task("rolling_validation", expression, {
-        "universe": universe, "start_date": start_date, "end_date": end_date,
+    params = {
+        "expression": expression,
+        "universe": universe,
+        "start_date": start_date,
+        "end_date": end_date,
+        "n_groups": 5,
         "holding_period": holding_period,
-    })
-    _error_msg = None
-    _result = None
+        "benchmark": "hs300",
+        "neutralize_industry": neutralize_industry,
+        "neutralize_cap": neutralize_cap,
+    }
+    return await _enqueue_mcp_tool(
+        "rolling_validation",
+        expression,
+        params,
+        _run_local_rolling_validation_mcp_task,
+    )
+
+
+def _run_wq_single_mcp_task(task_id: str, params: dict) -> dict:
+    from .wq_brain_client import get_client
+
+    client = get_client("primary")
     try:
-        market_df, stock_codes = await asyncio.to_thread(_fetch_data_for_market, universe, start_date, end_date)
-        if market_df is None or len(market_df) == 0:
-            return json.dumps({"error": "No market data available."})
+        update_mcp_task(task_id, status="authenticating", progress=0, progress_message="认证 WQ BRAIN", persist=True)
+        if not client.authenticate():
+            return {"ok": False, "error": "WQ BRAIN 认证失败"}
 
-        market_df = await asyncio.to_thread(_enrich_with_fundamentals, expression, market_df, stock_codes, start_date, end_date)
-
-        executor = get_executor()
-        future = executor.submit_cpu_work(
-            _run_backtest_in_process, market_df, expression, 5, holding_period,
-            cost_rate=0,
-            neutralize_industry=neutralize_industry, neutralize_cap=neutralize_cap,
+        update_mcp_task(
+            task_id, status="simulating", progress=0, progress_message="Simulation 已提交，等待 BRAIN", persist=True
         )
-        result = await asyncio.to_thread(future.result, 600)
-        factor_df = result.get("_factor_df")
-        if factor_df is None or len(factor_df) < 100:
-            return json.dumps({"error": "Insufficient factor data for rolling validation."})
 
-        _result = await asyncio.to_thread(_run_rv, factor_df, holding_period)
-        return json.dumps(_result, ensure_ascii=False, indent=2, default=str)
+        def on_progress(pct: int, message: str) -> None:
+            update_mcp_task(task_id, status="simulating", progress=pct, progress_message=message)
 
-    except Exception as e:
-        logger.error(f"Rolling validation failed: {traceback.format_exc()}")
-        _error_msg = str(e)
-        return json.dumps({"error": str(e)})
+        return run_single_simulation(
+            client,
+            params["expression"],
+            region=params["region"],
+            universe=params["universe"],
+            delay=params["delay"],
+            decay=params["decay"],
+            neutralization=params["neutralization"],
+            truncation=params["truncation"],
+            auto_submit=params["auto_submit"],
+            tag=params["tag"],
+            progress_callback=on_progress,
+            check_cancelled=lambda: is_mcp_task_cancelled(task_id),
+        )
     finally:
-        await complete_mcp_task(task_id, _result, _error_msg, expression)
+        client.close()
+
+
+def _run_wq_batch_mcp_task(task_id: str, params: dict) -> dict:
+    from .wq_brain_client import get_client
+
+    client = get_client("primary")
+    try:
+        update_mcp_task(task_id, status="authenticating", progress=0, progress_message="认证 WQ BRAIN", persist=True)
+        if not client.authenticate():
+            return {"ok": False, "error": "WQ BRAIN 认证失败"}
+
+        def on_progress(current: int, total: int, key: str) -> None:
+            pct = int((current - 1) * 100 / total) if total else 0
+            update_mcp_task(
+                task_id,
+                status="simulating",
+                progress=pct,
+                progress_current=current,
+                progress_total=total,
+                progress_message=f"模拟参数组合 {current}/{total}: {key}",
+            )
+
+        update_mcp_task(
+            task_id, status="simulating", progress=0, progress_message="开始参数网格 Simulation", persist=True
+        )
+        return run_batch_simulation(
+            client,
+            params["expression"],
+            regions=params["regions"],
+            delays=params["delays"],
+            universes=params["universes"],
+            neutralizations=params["neutralizations"],
+            decay=params["decay"],
+            truncation=params["truncation"],
+            auto_submit=params["auto_submit"],
+            tag=params["tag"],
+            on_progress=on_progress,
+            check_cancelled=lambda: is_mcp_task_cancelled(task_id),
+        )
+    finally:
+        client.close()
+
+
+def _run_wq_research_mcp_task(task_id: str, params: dict) -> dict:
+    from .wq_brain_client import get_client
+
+    client = get_client("primary")
+    try:
+        update_mcp_task(task_id, status="authenticating", progress=0, progress_message="认证 WQ BRAIN", persist=True)
+        if not client.authenticate():
+            return {"ok": False, "error": "WQ BRAIN 认证失败"}
+        update_mcp_task(
+            task_id, status="researching", progress=0, progress_message="执行 WQ Alpha 批量研究", persist=True
+        )
+
+        def on_progress(current: int, total: int, stage: str) -> None:
+            pct = int((current - 1) * 100 / total) if total else 0
+            update_mcp_task(
+                task_id,
+                status="researching",
+                progress=pct,
+                progress_current=current,
+                progress_total=total,
+                progress_message=f"研究进度 {current}/{total}: {stage[:160]}",
+            )
+
+        return run_research_batch(
+            client,
+            params["expressions"],
+            goal=params["goal"],
+            tag=params["tag"],
+            region=params["region"],
+            universe=params["universe"],
+            delay=params["delay"],
+            decay=params["decay"],
+            neutralization=params["neutralization"],
+            truncation=params["truncation"],
+            max_candidates=params["max_candidates"],
+            min_sharpe=params["min_sharpe"],
+            min_fitness=params["min_fitness"],
+            skip_existing=params["skip_existing"],
+            sweep_top_n=params["sweep_top_n"],
+            sweep_universes=params["sweep_universes"],
+            sweep_neutralizations=params["sweep_neutralizations"],
+            on_progress=on_progress,
+            check_cancelled=lambda: is_mcp_task_cancelled(task_id),
+        )
+    finally:
+        client.close()
+
+
+def _run_wq_submit_by_ids_mcp_task(task_id: str, params: dict) -> dict:
+    from .wq_brain_client import get_client
+
+    client = get_client(params["account"])
+    try:
+        update_mcp_task(task_id, status="authenticating", progress=0, progress_message="认证 WQ BRAIN", persist=True)
+        if not client.authenticate():
+            return {"ok": False, "error": "WQ BRAIN 认证失败"}
+
+        def on_progress(current: int, total: int, alpha_id: str) -> None:
+            pct = int((current - 1) * 100 / total) if total else 0
+            update_mcp_task(
+                task_id,
+                status="submitting",
+                progress=pct,
+                progress_current=current,
+                progress_total=total,
+                progress_message=f"提交 Alpha {current}/{total}: {alpha_id}",
+            )
+
+        update_mcp_task(task_id, status="submitting", progress=0, progress_message="开始正式提交 Alpha", persist=True)
+        result = run_submit_by_ids(
+            client,
+            params["alpha_ids"],
+            on_progress=on_progress,
+            check_cancelled=lambda: is_mcp_task_cancelled(task_id),
+        )
+        return {"ok": True, **result}
+    finally:
+        client.close()
+
+
+def _run_wq_finalize_mcp_task(task_id: str, params: dict) -> dict:
+    from .routes.wq_brain_batch import _finalize_alpha_statuses
+    from .wq_brain_client import get_client
+
+    client = get_client(params["account"])
+    try:
+        update_mcp_task(task_id, status="authenticating", progress=0, progress_message="认证 WQ BRAIN", persist=True)
+        if not client.authenticate():
+            return {"ok": False, "error": "WQ BRAIN 认证失败"}
+        update_mcp_task(task_id, status="finalizing", progress=0, progress_message="查询最终 SC 状态", persist=True)
+        result = _finalize_alpha_statuses(client, params["alpha_ids"], None)
+        return {"ok": True, **result}
+    finally:
+        client.close()
+
+
+def _async_task_response(
+    task_id: str,
+    *,
+    legacy_wq_poll: bool = False,
+    **extra,
+) -> str:
+    """Build the stable response returned by every long-running MCP tool."""
+    response = {
+        "task_id": task_id,
+        "status": "pending",
+        "async": True,
+        **extra,
+        "poll_with": "get_task_status",
+        "poll_after_seconds": 10,
+    }
+    if legacy_wq_poll:
+        response["legacy_poll"] = {
+            "tool": "wq_brain_check_alphas",
+            "alpha_ids": [f"task:{task_id}"],
+        }
+    return json.dumps(response, ensure_ascii=False)
+
+
+@mcp.tool()
+async def get_task_status(task_id: str) -> str:
+    """查询异步任务状态和最终结果。
+
+    WQ 长任务会立即返回 task_id。使用本工具轮询；当 status 为 completed 时读取 result，
+    status 为 failed 时读取 error。pending/running/authenticating/simulating/researching/submitting/finalizing
+    均表示后台任务仍在执行。
+    """
+    task = await get_mcp_task_snapshot(task_id)
+    if task is None:
+        return json.dumps({"error": f"Task not found: {task_id}"}, ensure_ascii=False)
+
+    status = task.get("status")
+    task["done"] = status in ("completed", "failed", "cancelled", "iteration_completed")
+    if not task["done"]:
+        task["poll_after_seconds"] = 10
+    return json.dumps(task, ensure_ascii=False, indent=2, default=str)
+
+
+@mcp.tool()
+async def cancel_task(task_id: str) -> str:
+    """取消一个正在后台执行的异步任务。
+
+    取消是协作式的：WQ Simulation 会在下一次轮询/等待点停止；已经提交给
+    WorldQuant 的远端请求可能仍会在平台侧完成，但 QuantGPT 不再继续阻塞等待。
+    """
+    task = await cancel_mcp_task(task_id)
+    if task is None:
+        return json.dumps({"error": f"Task not found: {task_id}"}, ensure_ascii=False)
+    return json.dumps(task, ensure_ascii=False, indent=2, default=str)
 
 
 @mcp.tool()
@@ -572,46 +1066,31 @@ async def wq_brain_submit(
         auto_submit: 如果检查全部通过，自动提交到 WQ 审核
 
     Returns:
-        JSON with IS/OOS metrics, alpha_id, checks, submittable status.
+        JSON with task_id. Simulation runs in the background; poll with get_task_status.
     """
-    from .wq_brain_client import get_client, is_configured as _wq_configured
+    from .wq_brain_client import is_configured as _wq_configured
 
-    task_id = await start_mcp_task("wq_brain_submit", expression, {
-        "expression": expression, "tag": tag, "region": region, "universe": universe,
-        "delay": delay, "decay": decay, "neutralization": neutralization,
-        "truncation": truncation, "auto_submit": auto_submit,
-    })
-    _error_msg = None
-    _result = None
-    try:
-        if not _wq_configured():
-            return json.dumps({"error": "WQ BRAIN 未配置 — 请设置 WQ_BRAIN_EMAIL 和 WQ_BRAIN_PASSWORD"})
+    if not _wq_configured("primary"):
+        return json.dumps({"error": "WQ BRAIN 未配置 — 请设置 WQ_BRAIN_EMAIL 和 WQ_BRAIN_PASSWORD"})
 
-        client = get_client("primary")
-        authenticated = await asyncio.to_thread(client.authenticate)
-        if not authenticated:
-            return json.dumps({"error": "WQ BRAIN 认证失败"})
-
-        _result = await asyncio.to_thread(
-            run_single_simulation, client,
-            expression, region=region, universe=universe,
-            delay=delay, decay=decay, neutralization=neutralization,
-            truncation=truncation, auto_submit=auto_submit, tag=tag,
-        )
-        await asyncio.to_thread(client.close)
-
-        if not _result.get("ok"):
-            _error_msg = _result.get("error", "Simulation failed")
-            return json.dumps({"error": _error_msg})
-
-        return json.dumps(_result, ensure_ascii=False, indent=2, default=str)
-
-    except Exception as e:
-        logger.error(f"WQ BRAIN submit failed: {traceback.format_exc()}")
-        _error_msg = str(e)
-        return json.dumps({"error": str(e)})
-    finally:
-        await complete_mcp_task(task_id, _result, _error_msg, expression)
+    params = {
+        "expression": expression,
+        "tag": tag,
+        "region": region,
+        "universe": universe,
+        "delay": delay,
+        "decay": decay,
+        "neutralization": neutralization,
+        "truncation": truncation,
+        "auto_submit": auto_submit,
+    }
+    return await _enqueue_mcp_tool(
+        "wq_brain_submit",
+        expression,
+        params,
+        _run_wq_single_mcp_task,
+        legacy_wq_poll=True,
+    )
 
 
 @mcp.tool()
@@ -643,54 +1122,117 @@ async def wq_brain_batch_submit(
         auto_submit: 全部检查通过时自动提交
 
     Returns:
-        JSON with per-combination results, best_fitness, submittable_count.
+        JSON with task_id. The parameter sweep runs in the background; poll with get_task_status.
     """
-    from .wq_brain_client import get_client, is_configured as _wq_configured
+    from .wq_brain_client import is_configured as _wq_configured
 
     regions = regions or ["USA"]
     delays = delays or [1]
     universes = universes or ["TOP3000"]
     neutralizations = neutralizations or ["SUBINDUSTRY"]
 
-    task_id = await start_mcp_task("wq_brain_batch", expression, {
-        "expression": expression, "tag": tag,
-        "regions": regions, "delays": delays, "universes": universes,
-        "neutralizations": neutralizations, "decay": decay, "truncation": truncation,
+    if not _wq_configured("primary"):
+        return json.dumps({"error": "WQ BRAIN 未配置 — 请设置 WQ_BRAIN_EMAIL 和 WQ_BRAIN_PASSWORD"})
+
+    total = len(regions) * len(delays) * len(universes) * len(neutralizations)
+    if total > 36:
+        return json.dumps({"error": f"组合数 {total} 超过上限 36"})
+
+    params = {
+        "expression": expression,
+        "tag": tag,
+        "regions": regions,
+        "delays": delays,
+        "universes": universes,
+        "neutralizations": neutralizations,
+        "decay": decay,
+        "truncation": truncation,
         "auto_submit": auto_submit,
-    })
-    _error_msg = None
-    _result = None
-    try:
-        if not _wq_configured():
-            return json.dumps({"error": "WQ BRAIN 未配置 — 请设置 WQ_BRAIN_EMAIL 和 WQ_BRAIN_PASSWORD"})
+    }
+    return await _enqueue_mcp_tool(
+        "wq_brain_batch",
+        expression,
+        params,
+        _run_wq_batch_mcp_task,
+        legacy_wq_poll=True,
+        total_combinations=total,
+    )
 
-        total = len(regions) * len(delays) * len(universes) * len(neutralizations)
-        if total > 36:
-            return json.dumps({"error": f"组合数 {total} 超过上限 36"})
 
-        client = get_client("primary")
-        authenticated = await asyncio.to_thread(client.authenticate)
-        if not authenticated:
-            return json.dumps({"error": "WQ BRAIN 认证失败"})
+@mcp.tool()
+async def wq_brain_research(
+    expressions: list[str],
+    tag: str = "wq-research",
+    goal: str = "",
+    region: str = "USA",
+    universe: str = "TOP3000",
+    delay: int = 1,
+    decay: int = 0,
+    neutralization: str = "SUBINDUSTRY",
+    truncation: float = 0.08,
+    max_candidates: int = 20,
+    min_sharpe: float = 1.25,
+    min_fitness: float = 1.0,
+    skip_existing: bool = True,
+    sweep_top_n: int = 0,
+    sweep_universes: list[str] | None = None,
+    sweep_neutralizations: list[str] | None = None,
+) -> str:
+    """批量研究 WQ Alpha：去重、真实 Simulation、筛选、诊断和可选参数扫描。
 
-        _result = await asyncio.to_thread(
-            run_batch_simulation, client, expression,
-            regions=regions, delays=delays, universes=universes,
-            neutralizations=neutralizations, decay=decay, truncation=truncation,
-            auto_submit=auto_submit, tag=tag,
-        )
-        await asyncio.to_thread(client.close)
+    本工具是 Autonomous WQ Research 的确定性执行层：调用方/ChatGPT 负责生成候选表达式，
+    QuantGPT 负责使用真实 BRAIN 数据进行验证和淘汰。无论结果多好，本工具都不会正式提交 Alpha。
 
-        if not _result.get("ok"):
-            _error_msg = _result.get("error")
-        return json.dumps(_result, ensure_ascii=False, indent=2, default=str)
+    Args:
+        expressions: 候选 FASTEXPR 列表，默认最多研究 20 个。
+        tag: 本轮研究标识。
+        goal: 研究目标/假设说明，仅用于记录结果。
+        region/universe/delay/decay/neutralization/truncation: BRAIN Simulation 参数。
+        min_sharpe/min_fitness: 候选筛选阈值。
+        skip_existing: 跳过账号最近已研究过的完全相同表达式。
+        sweep_top_n: 对排名前 N 个候选执行额外参数扫描，0 表示关闭。
+        sweep_universes/sweep_neutralizations: 参数扫描候选集合。
 
-    except Exception as e:
-        logger.error(f"WQ BRAIN batch failed: {traceback.format_exc()}")
-        _error_msg = str(e)
-        return json.dumps({"error": str(e)})
-    finally:
-        await complete_mcp_task(task_id, _result, _error_msg, expression)
+    Returns:
+        JSON with task_id. Research runs in the background; poll with get_task_status.
+    """
+    from .wq_brain_client import is_configured as _wq_configured
+
+    if not _wq_configured("primary"):
+        return json.dumps({"error": "WQ BRAIN 未配置 — 请设置 WQ_BRAIN_EMAIL 和 WQ_BRAIN_PASSWORD"})
+    if not expressions:
+        return json.dumps({"error": "expressions 不能为空"})
+    if max_candidates < 1 or max_candidates > 50:
+        return json.dumps({"error": "max_candidates 必须在 1~50 之间"})
+    if sweep_top_n < 0 or sweep_top_n > 5:
+        return json.dumps({"error": "sweep_top_n 必须在 0~5 之间"})
+
+    params = {
+        "expressions": expressions[:max_candidates],
+        "tag": tag,
+        "goal": goal,
+        "region": region,
+        "universe": universe,
+        "delay": delay,
+        "decay": decay,
+        "neutralization": neutralization,
+        "truncation": truncation,
+        "max_candidates": max_candidates,
+        "min_sharpe": min_sharpe,
+        "min_fitness": min_fitness,
+        "skip_existing": skip_existing,
+        "sweep_top_n": sweep_top_n,
+        "sweep_universes": sweep_universes,
+        "sweep_neutralizations": sweep_neutralizations,
+    }
+    return await _enqueue_mcp_tool(
+        "wq_research",
+        expressions[0],
+        params,
+        _run_wq_research_mcp_task,
+        legacy_wq_poll=True,
+        requested=len(params["expressions"]),
+    )
 
 
 @mcp.tool()
@@ -708,9 +1250,9 @@ async def wq_brain_submit_by_ids(
         account: WQ 账号（提交只能用 'primary'）
 
     Returns:
-        JSON with per-alpha result (ACTIVE/SC_FAIL/TIMEOUT) and summary.
+        JSON with task_id. Submission and SC polling run in the background.
     """
-    from .wq_brain_client import get_client, is_configured as _wq_configured
+    from .wq_brain_client import is_configured as _wq_configured
 
     if account != "primary":
         return json.dumps({"error": "Alpha 提交仅允许 primary 账号"})
@@ -719,30 +1261,15 @@ async def wq_brain_submit_by_ids(
     if len(alpha_ids) > 50:
         return json.dumps({"error": f"alpha_ids 数量 {len(alpha_ids)} 超过上限 50"})
 
-    task_id = await start_mcp_task(
+    params = {"alpha_ids": alpha_ids, "account": account}
+    return await _enqueue_mcp_tool(
         "wq_brain_submit_by_ids",
         None,
-        {"alpha_ids": alpha_ids, "account": account},
+        params,
+        _run_wq_submit_by_ids_mcp_task,
+        legacy_wq_poll=True,
+        total=len(alpha_ids),
     )
-    _result = None
-    _error_msg = None
-
-    try:
-        client = get_client(account)
-        authenticated = await asyncio.to_thread(client.authenticate)
-        if not authenticated:
-            _error_msg = "WQ BRAIN 认证失败"
-            return json.dumps({"error": _error_msg})
-
-        _result = await asyncio.to_thread(run_submit_by_ids, client, alpha_ids)
-        await asyncio.to_thread(client.close)
-
-        return json.dumps(_result, ensure_ascii=False, indent=2, default=str)
-    except Exception as e:
-        _error_msg = str(e)
-        return json.dumps({"error": _error_msg})
-    finally:
-        await complete_mcp_task(task_id, _result, _error_msg)
 
 
 @mcp.tool()
@@ -767,7 +1294,8 @@ async def wq_brain_list_alphas(
     Returns:
         JSON with alpha list, each containing alpha_id, expression, metrics.
     """
-    from .wq_brain_client import get_client, is_configured as _wq_configured
+    from .wq_brain_client import get_client
+    from .wq_brain_client import is_configured as _wq_configured
 
     if not _wq_configured(account):
         return json.dumps({"error": f"WQ BRAIN 未配置 (account={account})"})
@@ -778,9 +1306,12 @@ async def wq_brain_list_alphas(
         return json.dumps({"error": "WQ BRAIN 认证失败"})
 
     result = await asyncio.to_thread(
-        run_list_alphas, client,
-        limit=limit, offset=offset,
-        min_fitness=min_fitness, status_filter=status_filter,
+        run_list_alphas,
+        client,
+        limit=limit,
+        offset=offset,
+        min_fitness=min_fitness,
+        status_filter=status_filter,
     )
     await asyncio.to_thread(client.close)
 
@@ -804,9 +1335,22 @@ async def wq_brain_check_alphas(
         account: WQ 账号 ('primary' 或 'alt')
 
     Returns:
-        JSON with summary and per-alpha status.
+        JSON with summary and per-alpha status. For backward-compatible task
+        polling, pass a single pseudo id in the form ``task:<task_id>``.
     """
-    from .wq_brain_client import get_client, is_configured as _wq_configured
+    if len(alpha_ids) == 1 and str(alpha_ids[0]).startswith("task:"):
+        task_id = str(alpha_ids[0])[5:]
+        task = await get_mcp_task_snapshot(task_id)
+        if task is None:
+            return json.dumps({"error": f"Task not found: {task_id}"}, ensure_ascii=False)
+        status = task.get("status")
+        task["done"] = status in ("completed", "failed", "cancelled", "iteration_completed")
+        if not task["done"]:
+            task["poll_after_seconds"] = 10
+        return json.dumps({"task": task}, ensure_ascii=False, indent=2, default=str)
+
+    from .wq_brain_client import get_client
+    from .wq_brain_client import is_configured as _wq_configured
 
     if not _wq_configured(account):
         return json.dumps({"error": f"WQ BRAIN 未配置 (account={account})"})
@@ -839,41 +1383,24 @@ async def wq_brain_finalize_submissions(
         account: WQ 账号 ('primary' 或 'alt')
 
     Returns:
-        JSON: per-alpha final_status (ACTIVE/SC_FAIL/SC_PENDING/ERROR) + summary
+        JSON with task_id. Final SC status collection runs in the background.
     """
-    task_id = await start_mcp_task("wq_brain_finalize", None, {
-        "alpha_ids": alpha_ids[:10], "account": account, "total": len(alpha_ids),
-    })
-    _error_msg = None
-    _result = None
-    try:
-        from .wq_brain_client import get_client, is_configured as _wq_configured
-        from .routes.wq_brain_batch import _finalize_alpha_statuses
+    from .wq_brain_client import is_configured as _wq_configured
 
-        if not _wq_configured(account):
-            return json.dumps({"error": f"WQ BRAIN 未配置 (account={account})"})
-        if len(alpha_ids) > 100:
-            return json.dumps({"error": f"alpha_ids 数量 {len(alpha_ids)} 超过上限 100"})
+    if not _wq_configured(account):
+        return json.dumps({"error": f"WQ BRAIN 未配置 (account={account})"})
+    if len(alpha_ids) > 100:
+        return json.dumps({"error": f"alpha_ids 数量 {len(alpha_ids)} 超过上限 100"})
 
-        client = get_client(account)
-        authenticated = await asyncio.to_thread(client.authenticate)
-        if not authenticated:
-            return json.dumps({"error": "WQ BRAIN 认证失败"})
-
-        _result = await asyncio.to_thread(
-            _finalize_alpha_statuses, client, alpha_ids, None,
-        )
-
-        await asyncio.to_thread(client.close)
-
-        return json.dumps(_result, ensure_ascii=False, indent=2, default=str)
-
-    except Exception as e:
-        _error_msg = str(e)
-        logger.error(f"MCP wq_brain_finalize error: {e}")
-        return json.dumps({"error": f"Finalize failed: {e}"})
-    finally:
-        await complete_mcp_task(task_id, _result, _error_msg)
+    params = {"alpha_ids": alpha_ids, "account": account}
+    return await _enqueue_mcp_tool(
+        "wq_brain_finalize",
+        None,
+        params,
+        _run_wq_finalize_mcp_task,
+        legacy_wq_poll=True,
+        total=len(alpha_ids),
+    )
 
 
 @mcp.tool()
@@ -883,10 +1410,10 @@ async def compute_factor_values(
     start_date: str = "",
     end_date: str = "",
 ) -> str:
-    """计算因子截面值 — 返回每个交易日所有股票的因子得分。
+    """异步计算因子截面值，并把大结果写入分页文件。
 
     用于下游组合构建、因子库上传或外部分析。
-    输出格式: {trading_days, data: [{date, values: {symbol: score}, count}]}
+    立即返回 task_id。任务完成后使用 get_factor_values_page 分页读取，避免巨大 MCP JSON。
 
     Args:
         expression: 因子表达式（如 rank(ts_mean(close/open, 10))）
@@ -894,78 +1421,82 @@ async def compute_factor_values(
         start_date: 起始日期 YYYY-MM-DD（默认 end_date 前 365 天）
         end_date: 截止日期 YYYY-MM-DD（默认今天）
     """
-    import numpy as np
+    params = {
+        "expression": expression,
+        "universe": universe,
+        "start_date": start_date,
+        "end_date": end_date,
+    }
+    return await _enqueue_mcp_tool(
+        "compute_factor_values",
+        expression,
+        params,
+        _run_compute_factor_values_mcp_task,
+    )
 
-    from .backtest import api_context
-    from .expression_parser import parse_expression
-    from .market_data import MarketDataFetcher, get_universe
 
-    try:
-        factor_fn = parse_expression(expression)
-    except Exception as e:
-        return json.dumps({"error": f"Invalid expression: {e}"}, ensure_ascii=False)
+@mcp.tool()
+async def get_factor_values_page(
+    task_id: str,
+    page: int = 1,
+    page_size: int = 5,
+) -> str:
+    """分页读取 compute_factor_values 的结果，每条记录对应一个交易日。"""
+    if page < 1:
+        return json.dumps({"error": "page must be >= 1"}, ensure_ascii=False)
+    if page_size < 1 or page_size > 20:
+        return json.dumps({"error": "page_size must be between 1 and 20"}, ensure_ascii=False)
 
-    def _compute():
-        from datetime import date, timedelta
+    task = await get_mcp_task_snapshot(task_id)
+    if task is None:
+        return json.dumps({"error": f"Task not found: {task_id}"}, ensure_ascii=False)
+    if task.get("task_type") != "compute_factor_values":
+        return json.dumps({"error": f"Task {task_id} is not a factor-values task"}, ensure_ascii=False)
+    if task.get("status") != "completed":
+        return json.dumps(
+            {
+                "task_id": task_id,
+                "status": task.get("status"),
+                "error": task.get("error"),
+            },
+            ensure_ascii=False,
+        )
 
-        with api_context():
-            fetcher = MarketDataFetcher()
-            stocks = get_universe(universe)
-            if not stocks:
-                return {"error": f"Empty universe: {universe}"}
+    result = task.get("result") or {}
+    relative_path = (result.get("result_storage") or {}).get("path")
+    if not relative_path:
+        return json.dumps({"error": "Factor-values artifact is missing from task result"}, ensure_ascii=False)
+    artifact = (_PROJECT_ROOT / relative_path).resolve()
+    artifact_root = _FACTOR_VALUES_DIR.resolve()
+    if not artifact.is_relative_to(artifact_root) or not artifact.is_file():
+        return json.dumps({"error": "Factor-values artifact is unavailable"}, ensure_ascii=False)
 
-            end_dt = end_date or date.today().isoformat()
-            if not start_date:
-                start_dt = (date.fromisoformat(end_dt) - timedelta(days=365)).isoformat()
-            else:
-                start_dt = start_date
+    start_index = (page - 1) * page_size
+    end_index = start_index + page_size
+    rows = []
+    with gzip.open(artifact, "rt", encoding="utf-8") as source:
+        for index, line in enumerate(source):
+            if index < start_index:
+                continue
+            if index >= end_index:
+                break
+            rows.append(json.loads(line))
 
-            d_start = date.fromisoformat(start_dt)
-            d_end = date.fromisoformat(end_dt)
-            if (d_end - d_start).days > 750:
-                return {"error": "Date range too large (max 750 days)"}
-
-            extra_days = 260
-            fetch_start = (d_start - timedelta(days=extra_days)).isoformat()
-
-            df = fetcher.fetch_stocks(stocks, fetch_start, end_dt)
-            if df is None or df.empty:
-                return {"error": "No market data available for this universe/date range"}
-
-            try:
-                factor_values = factor_fn(df)
-            except Exception as e:
-                return {"error": f"Expression evaluation failed: {e}"}
-
-            df["factor_value"] = factor_values
-            result_df = df[df["trade_date"] >= start_dt][["trade_date", "stock_code", "factor_value"]].copy()
-            result_df = result_df.dropna(subset=["factor_value"])
-
-            dates_data = []
-            for trade_date, group in result_df.groupby("trade_date"):
-                values = {}
-                for _, row in group.iterrows():
-                    val = row["factor_value"]
-                    if np.isfinite(val):
-                        values[row["stock_code"]] = round(float(val), 6)
-                if values:
-                    dates_data.append({
-                        "date": str(trade_date),
-                        "values": values,
-                        "count": len(values),
-                    })
-
-            return {
-                "expression": expression,
-                "universe": universe,
-                "start_date": start_dt,
-                "end_date": end_dt,
-                "trading_days": len(dates_data),
-                "data": dates_data,
-            }
-
-    result = await asyncio.to_thread(_compute)
-    return json.dumps(result, ensure_ascii=False, default=str)
+    trading_days = int(result.get("trading_days", 0))
+    total_pages = math.ceil(trading_days / page_size) if trading_days else 0
+    return json.dumps(
+        {
+            "task_id": task_id,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+            "trading_days": trading_days,
+            "has_more": page < total_pages,
+            "data": rows,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
 
 
 # Operator documentation fallback

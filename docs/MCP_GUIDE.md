@@ -195,6 +195,17 @@ bash restart.sh   # 启动 HTTP 服务（端口 8003）
 | `/mcp/` | streamable-http | 推荐（需 `Accept: application/json, text/event-stream`） |
 | `/mcp-sse/` | SSE | 兼容旧客户端 |
 
+远程访问必须在 `.env` 配置独立 API Key，并由 MCP 客户端通过
+`Authorization: Bearer <key>`（或 `X-API-Key`）发送：
+
+```bash
+QUANTGPT_MCP_API_KEY=<至少 32 字节的随机密钥>
+QUANTGPT_RATE_LIMIT=50
+```
+
+未配置 API Key 时只允许回环地址访问；远程请求会返回 503。所有 MCP HTTP 请求还会按来源 IP
+应用每分钟限流。stdio 模式不经过这层 HTTP 鉴权。
+
 `mcp_server.py` 中的 `allowed_hosts` 需包含带端口的 host：
 
 ```python

@@ -7,7 +7,9 @@ WQ_BRAIN_EMAIL and WQ_BRAIN_PASSWORD.
 
 import logging
 import os
+import re
 import time
+from datetime import datetime
 from typing import Callable
 
 import requests
@@ -25,10 +27,25 @@ SUBMIT_THRESHOLDS = {
     "turnover_min": 0.01,
 }
 
-_POLL_INTERVAL = 10
-_POLL_MAX_ATTEMPTS = 36
+_POLL_INTERVAL = max(1, int(os.environ.get("WQ_SIM_POLL_INTERVAL", "10")))
+_SIM_POLL_MAX_WAIT = max(_POLL_INTERVAL, int(os.environ.get("WQ_SIM_POLL_MAX_WAIT", "1800")))
+_POLL_MAX_ATTEMPTS = max(1, _SIM_POLL_MAX_WAIT // _POLL_INTERVAL)
+_RECOVERY_LOOKUP_EVERY = max(1, int(os.environ.get("WQ_SIM_RECOVERY_LOOKUP_EVERY", "3")))
 _CONCURRENT_BACKOFF = 30
 _MAX_RETRIES = 5
+
+
+def _env_timeout(name: str, default: float) -> float:
+    try:
+        return max(0.1, float(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+HTTP_TIMEOUT = (
+    _env_timeout("WQ_HTTP_CONNECT_TIMEOUT", 10.0),
+    _env_timeout("WQ_HTTP_READ_TIMEOUT", 60.0),
+)
 
 
 _ACCOUNT_ENV = {
@@ -41,17 +58,11 @@ def is_configured(account: str | None = None) -> bool:
     if account:
         env_email, env_pwd = _ACCOUNT_ENV.get(account, _ACCOUNT_ENV["primary"])
         return bool(os.environ.get(env_email) and os.environ.get(env_pwd))
-    return any(
-        bool(os.environ.get(e) and os.environ.get(p))
-        for e, p in _ACCOUNT_ENV.values()
-    )
+    return any(bool(os.environ.get(e) and os.environ.get(p)) for e, p in _ACCOUNT_ENV.values())
 
 
 def configured_accounts() -> list[str]:
-    return [
-        name for name, (e, p) in _ACCOUNT_ENV.items()
-        if os.environ.get(e) and os.environ.get(p)
-    ]
+    return [name for name, (e, p) in _ACCOUNT_ENV.items() if os.environ.get(e) and os.environ.get(p)]
 
 
 def get_client(account: str = "primary") -> "WQBrainClient":
@@ -67,6 +78,7 @@ class WQBrainClient:
         self.email = email or os.environ.get("WQ_BRAIN_EMAIL", "")
         self.password = password or os.environ.get("WQ_BRAIN_PASSWORD", "")
         self._session: requests.Session | None = None
+        self._operators_cache: list[dict] | None = None
 
     def _get_session(self) -> requests.Session:
         if self._session is None:
@@ -83,12 +95,29 @@ class WQBrainClient:
             self._session.close()
             self._session = None
 
+    def fork_authenticated(self) -> "WQBrainClient":
+        """Create an independent worker client reusing this client's auth state.
+
+        ``requests.Session`` is not shared between simulation workers.  Cookies,
+        headers and the operator catalog are copied so parallel workers do not
+        need to authenticate or refetch operators for every Alpha.
+        """
+        child = WQBrainClient(email=self.email, password=self.password)
+        if self._session is not None:
+            child_session = child._get_session()
+            child_session.headers.update(self._session.headers)
+            child_session.cookies.update(self._session.cookies)
+        if self._operators_cache is not None:
+            child._operators_cache = list(self._operators_cache)
+        return child
+
     def authenticate(self, _max_retries: int = 5) -> bool:
         s = self._get_session()
         for attempt in range(_max_retries):
             r = s.post(
                 f"{API_BASE}/authentication",
                 auth=(self.email, self.password),
+                timeout=HTTP_TIMEOUT,
             )
             if r.status_code == 429:
                 retry = int(r.headers.get("Retry-After", "60"))
@@ -112,8 +141,28 @@ class WQBrainClient:
         return False
 
     def get_user_info(self) -> dict:
-        r = self._get_session().get(f"{API_BASE}/users/self")
+        r = self._get_session().get(f"{API_BASE}/users/self", timeout=HTTP_TIMEOUT)
         return r.json() if r.status_code == 200 else {}
+
+    def list_operators(self, refresh: bool = False) -> list[dict]:
+        """Return the operator catalog currently exposed to this BRAIN account."""
+        if self._operators_cache is not None and not refresh:
+            return self._operators_cache
+        r = self._get_session().get(f"{API_BASE}/operators", timeout=HTTP_TIMEOUT)
+        if r.status_code != 200:
+            raise RuntimeError(f"Failed to fetch WQ operators: HTTP {r.status_code}: {r.text[:300]}")
+        data = r.json()
+        if isinstance(data, list):
+            operators = [item for item in data if isinstance(item, dict)]
+        elif isinstance(data, dict):
+            operators = [item for item in data.get("results", []) if isinstance(item, dict)]
+        else:
+            operators = []
+        self._operators_cache = operators
+        return operators
+
+    def list_operator_names(self) -> set[str]:
+        return {str(item.get("name", "")).strip().lower() for item in self.list_operators() if item.get("name")}
 
     def simulate(
         self,
@@ -125,7 +174,16 @@ class WQBrainClient:
         neutralization: str = "SUBINDUSTRY",
         truncation: float = 0.08,
         progress_callback: Callable[[int, str], None] | None = None,
+        cancel_callback: Callable[[], bool] | None = None,
     ) -> dict:
+        """Start a BRAIN simulation and poll it in the worker, not in the MCP request.
+
+        Polling can run for up to ``WQ_SIM_POLL_MAX_WAIT`` (30 minutes by
+        default).  While polling, the client periodically reconciles against
+        ``/users/self/alphas``.  This handles the platform behaviour where an
+        Alpha is already created even though the simulation endpoint never
+        transitions to DONE for this client session.
+        """
         s = self._get_session()
         payload = {
             "type": "REGULAR",
@@ -145,16 +203,72 @@ class WQBrainClient:
             },
             "regular": expression,
         }
+        baseline_alpha_ids = {
+            str(alpha.get("id"))
+            for alpha in self._list_matching_alphas(expression, payload["settings"])
+            if alpha.get("id")
+        }
+        simulation_started_at = time.time()
+
+        def cancelled() -> bool:
+            try:
+                return bool(cancel_callback and cancel_callback())
+            except Exception:
+                logger.exception("WQ cancel callback failed")
+                return False
+
+        def wait(seconds: int) -> bool:
+            deadline = time.monotonic() + max(0, seconds)
+            while time.monotonic() < deadline:
+                if cancelled():
+                    return False
+                time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+            return not cancelled()
+
+        def recover_from_alpha_list(simulation_id: str) -> dict | None:
+            alpha = self._find_recent_matching_alpha(
+                expression,
+                payload["settings"],
+                created_after=simulation_started_at - 60,
+                exclude_ids=baseline_alpha_ids,
+            )
+            if not alpha:
+                return None
+            alpha_id = alpha.get("id")
+            if not alpha_id:
+                return None
+            logger.info(
+                "Recovered WQ simulation from alpha list: simulation=%s alpha=%s",
+                simulation_id,
+                alpha_id,
+            )
+            if progress_callback:
+                progress_callback(100, "平台已生成 Alpha，已从 Alpha 列表恢复结果")
+            return {
+                "ok": True,
+                "expression": expression,
+                "is": alpha.get("is", {}),
+                "oos": alpha.get("oos", {}),
+                "settings": alpha.get("settings", payload["settings"]),
+                "alpha_id": alpha_id,
+                "simulation_id": simulation_id,
+                "recovered_from_platform": True,
+            }
 
         for attempt in range(_MAX_RETRIES):
+            if cancelled():
+                return {"ok": False, "cancelled": True, "error": "WQ simulation cancelled"}
             try:
-                r = s.post(f"{API_BASE}/simulations", json=payload)
+                r = s.post(f"{API_BASE}/simulations", json=payload, timeout=HTTP_TIMEOUT)
             except (requests.ConnectionError, requests.Timeout) as e:
-                wait = _CONCURRENT_BACKOFF * (attempt + 1)
-                logger.warning(f"WQ connection error (attempt {attempt+1}/{_MAX_RETRIES}): {e}, retrying in {wait}s")
+                wait_seconds = _CONCURRENT_BACKOFF * (attempt + 1)
+                logger.warning(
+                    f"WQ connection error (attempt {attempt + 1}/{_MAX_RETRIES}): {e}, retrying in {wait_seconds}s"
+                )
                 if progress_callback:
-                    progress_callback(0, f"连接异常，等待 {wait}s（第 {attempt+1} 次重试）")
-                time.sleep(wait)
+                    progress_callback(0, f"连接异常，等待 {wait_seconds}s（第 {attempt + 1} 次重试）")
+                if not wait(wait_seconds):
+                    return {"ok": False, "cancelled": True, "error": "WQ simulation cancelled"}
                 continue
 
             if r.status_code in (200, 201, 202):
@@ -168,18 +282,20 @@ class WQBrainClient:
                     pass
 
                 if "CONCURRENT_SIMULATION_LIMIT" in detail:
-                    wait = _CONCURRENT_BACKOFF * (attempt + 1)
-                    logger.info(f"WQ concurrent limit, waiting {wait}s (attempt {attempt+1}/{_MAX_RETRIES})")
+                    wait_seconds = _CONCURRENT_BACKOFF * (attempt + 1)
+                    logger.info(f"WQ concurrent limit, waiting {wait_seconds}s (attempt {attempt + 1}/{_MAX_RETRIES})")
                     if progress_callback:
-                        progress_callback(0, f"并发限制，等待 {wait}s（第 {attempt+1} 次重试）")
-                    time.sleep(wait)
+                        progress_callback(0, f"并发限制，等待 {wait_seconds}s（第 {attempt + 1} 次重试）")
+                    if not wait(wait_seconds):
+                        return {"ok": False, "cancelled": True, "error": "WQ simulation cancelled"}
                     continue
 
                 retry = int(r.headers.get("Retry-After", "60"))
                 logger.info(f"WQ rate-limited, waiting {retry}s")
                 if progress_callback:
                     progress_callback(0, f"速率限制，等待 {retry}s")
-                time.sleep(retry + 1)
+                if not wait(retry + 1):
+                    return {"ok": False, "cancelled": True, "error": "WQ simulation cancelled"}
                 continue
 
             return {"ok": False, "error": f"HTTP {r.status_code}: {r.text[:300]}"}
@@ -191,34 +307,41 @@ class WQBrainClient:
             return {"ok": False, "error": "No Location header in response"}
 
         url = location if location.startswith("http") else f"{API_BASE}{location}"
+        simulation_id = url.rstrip("/").split("/")[-1]
 
         for i in range(_POLL_MAX_ATTEMPTS):
-            try:
-                r = s.get(url)
-            except (requests.ConnectionError, requests.Timeout):
-                logger.warning(f"WQ poll connection error (attempt {i+1}), retrying...")
-                time.sleep(_POLL_INTERVAL)
-                continue
-            if r.status_code != 200:
-                time.sleep(_POLL_INTERVAL)
-                continue
+            if cancelled():
+                return {
+                    "ok": False,
+                    "cancelled": True,
+                    "error": "WQ simulation cancelled",
+                    "simulation_id": simulation_id,
+                }
 
+            data: dict = {}
             try:
-                data = r.json()
-            except Exception:
-                time.sleep(_POLL_INTERVAL)
-                continue
-            status = data.get("status", "").upper()
+                poll_response = s.get(url, timeout=HTTP_TIMEOUT)
+                if poll_response.status_code == 200:
+                    try:
+                        data = poll_response.json()
+                    except Exception:
+                        data = {}
+            except (requests.ConnectionError, requests.Timeout):
+                logger.warning(f"WQ poll connection error (attempt {i + 1}), retrying...")
+
+            status = str(data.get("status", "")).upper()
             progress = data.get("progress", 0)
 
-            if progress_callback:
-                pct = int(progress * 100) if isinstance(progress, float) and progress <= 1 else int(progress)
-                progress_callback(min(pct, 99), f"模拟进行中 ({pct}%)")
+            if progress_callback and data:
+                try:
+                    pct = int(progress * 100) if isinstance(progress, float) and progress <= 1 else int(progress)
+                except (TypeError, ValueError):
+                    pct = 0
+                progress_callback(min(max(pct, 0), 99), f"模拟进行中 ({pct}%)")
 
             if status in ("DONE", "COMPLETE"):
                 alpha_raw = data.get("alpha", "")
                 alpha_id = alpha_raw.split("/")[-1] if alpha_raw else None
-
                 is_data = data.get("is", {})
                 oos_data = data.get("oos", {})
 
@@ -235,25 +358,139 @@ class WQBrainClient:
                     "expression": expression,
                     "is": is_data,
                     "oos": oos_data,
-                    "settings": data.get("settings", {}),
+                    "settings": data.get("settings", payload["settings"]),
                     "alpha_id": alpha_id,
-                    "simulation_id": data.get("id", ""),
+                    "simulation_id": data.get("id") or simulation_id,
                 }
-            elif status in ("ERROR", "FAILED"):
-                return {"ok": False, "error": f"WQ simulation failed: {data.get('message', status)}"}
+            if status in ("ERROR", "FAILED"):
+                return {
+                    "ok": False,
+                    "error": f"WQ simulation failed: {data.get('message', status)}",
+                    "simulation_id": data.get("id") or simulation_id,
+                }
 
-            time.sleep(_POLL_INTERVAL)
+            if (i + 1) % _RECOVERY_LOOKUP_EVERY == 0:
+                recovered = recover_from_alpha_list(simulation_id)
+                if recovered:
+                    return recovered
 
-        return {"ok": False, "error": "WQ simulation polling timeout (6min)"}
+            if not wait(_POLL_INTERVAL):
+                return {
+                    "ok": False,
+                    "cancelled": True,
+                    "error": "WQ simulation cancelled",
+                    "simulation_id": simulation_id,
+                }
+
+        recovered = recover_from_alpha_list(simulation_id)
+        if recovered:
+            return recovered
+        return {
+            "ok": False,
+            "error": f"WQ simulation polling timeout ({_SIM_POLL_MAX_WAIT}s)",
+            "simulation_id": simulation_id,
+        }
 
     def _fetch_alpha(self, alpha_id: str) -> dict:
-        r = self._get_session().get(f"{API_BASE}/alphas/{alpha_id}")
+        r = self._get_session().get(f"{API_BASE}/alphas/{alpha_id}", timeout=HTTP_TIMEOUT)
         if r.status_code == 200:
             try:
                 return r.json()
             except Exception:
                 logger.warning(f"Empty/invalid JSON from /alphas/{alpha_id}")
                 return {}
+        return {}
+
+    def _list_matching_alphas(
+        self,
+        expression: str,
+        settings: dict,
+        *,
+        created_after: float = 0,
+        limit: int = 100,
+    ) -> list[dict]:
+        """List recent platform Alphas matching the exact expression/settings."""
+        try:
+            r = self._get_session().get(
+                f"{API_BASE}/users/self/alphas",
+                params={"limit": min(limit, 100), "offset": 0, "order": "-dateCreated"},
+                timeout=HTTP_TIMEOUT,
+            )
+        except (requests.ConnectionError, requests.Timeout):
+            return []
+        if r.status_code != 200:
+            return []
+        try:
+            data = r.json()
+        except Exception:
+            return []
+
+        raw_alphas = data if isinstance(data, list) else data.get("results", [])
+        target_expression = re.sub(r"\s+", "", expression).lower()
+        keys = ("region", "universe", "delay", "decay", "neutralization", "truncation")
+
+        def settings_match(candidate: dict) -> bool:
+            for key in keys:
+                expected = settings.get(key)
+                actual = candidate.get(key)
+                if key == "truncation":
+                    if actual is None or expected is None:
+                        if actual != expected:
+                            return False
+                        continue
+                    try:
+                        if abs(float(actual) - float(expected)) > 1e-9:
+                            return False
+                    except (TypeError, ValueError):
+                        if actual != expected:
+                            return False
+                elif str(actual).upper() != str(expected).upper():
+                    return False
+            return True
+
+        matches: list[dict] = []
+        for alpha in raw_alphas:
+            created = alpha.get("dateCreated")
+            if created and created_after:
+                try:
+                    created_ts = datetime.fromisoformat(str(created).replace("Z", "+00:00")).timestamp()
+                    if created_ts < created_after:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+
+            regular = alpha.get("regular", {})
+            code = regular.get("code", "") if isinstance(regular, dict) else str(regular)
+            if re.sub(r"\s+", "", code).lower() != target_expression:
+                continue
+            if not settings_match(alpha.get("settings", {})):
+                continue
+            matches.append(alpha)
+        return matches
+
+    def _find_recent_matching_alpha(
+        self,
+        expression: str,
+        settings: dict,
+        *,
+        created_after: float,
+        exclude_ids: set[str] | None = None,
+        limit: int = 100,
+    ) -> dict:
+        """Find a newly created Alpha when the simulation endpoint lags.
+
+        ``exclude_ids`` is the pre-submit baseline, preventing a prior Alpha
+        with the same expression/settings from being mistaken for this run.
+        """
+        excluded = exclude_ids or set()
+        for alpha in self._list_matching_alphas(
+            expression,
+            settings,
+            created_after=created_after,
+            limit=limit,
+        ):
+            if str(alpha.get("id")) not in excluded:
+                return alpha
         return {}
 
     def check_alpha_status(self, alpha_id: str) -> dict:
@@ -281,12 +518,15 @@ class WQBrainClient:
             r = None
             for attempt in range(3):
                 try:
-                    r = s.post(f"{API_BASE}/alphas/{alpha_id}/submit")
+                    r = s.post(
+                        f"{API_BASE}/alphas/{alpha_id}/submit",
+                        timeout=HTTP_TIMEOUT,
+                    )
                     body = r.text[:500]
                     logger.info(f"Submit {alpha_id}: HTTP {r.status_code}, body={body}")
                     break
                 except (requests.ConnectionError, requests.Timeout) as e:
-                    logger.warning(f"Submit {alpha_id}: connection error (attempt {attempt+1}): {e}")
+                    logger.warning(f"Submit {alpha_id}: connection error (attempt {attempt + 1}): {e}")
                     time.sleep(5 * (attempt + 1))
             else:
                 return {"status_code": 0, "ok": False, "detail": "connection failed after retries"}
@@ -330,25 +570,35 @@ class WQBrainClient:
                 alpha_data = self._fetch_alpha(alpha_id)
                 actual_status = (alpha_data.get("status") or "").upper()
                 if actual_status == "UNSUBMITTED":
-                    logger.warning(f"Submit {alpha_id}: platform still UNSUBMITTED after poll, retrying submit (try {submit_try+1})")
+                    logger.warning(
+                        f"Submit {alpha_id}: platform still UNSUBMITTED after poll, retrying submit (try {submit_try + 1})"
+                    )
                     time.sleep(10)
                     continue
-                logger.info(f"Submit {alpha_id}: poll timeout but platform status={actual_status}, treating as submitted")
+                logger.info(
+                    f"Submit {alpha_id}: poll timeout but platform status={actual_status}, treating as submitted"
+                )
                 poll_result["ok"] = True
                 poll_result["detail"] = f"poll timeout but platform accepted (status={actual_status})"
                 return poll_result
 
             return poll_result
 
-        return {"status_code": 200, "ok": False, "detail": f"submit failed after 3 outer retries, alpha still UNSUBMITTED"}
+        return {
+            "status_code": 200,
+            "ok": False,
+            "detail": "submit failed after 3 outer retries, alpha still UNSUBMITTED",
+        }
 
     def _poll_alpha_submission(self, alpha_id: str, max_polls: int = 12, interval: int = 10) -> dict:
         """Poll alpha status until platform confirms submission or SC check completes."""
         s = self._get_session()
+        status = "UNKNOWN"
+        sc_result = "MISSING"
         for i in range(max_polls):
             time.sleep(interval)
             try:
-                r = s.get(f"{API_BASE}/alphas/{alpha_id}")
+                r = s.get(f"{API_BASE}/alphas/{alpha_id}", timeout=HTTP_TIMEOUT)
             except (requests.ConnectionError, requests.Timeout):
                 logger.warning(f"Submit poll {alpha_id}: connection error at poll #{i}")
                 continue
@@ -377,6 +627,7 @@ class WQBrainClient:
                     "platform_status": status,
                 }
             elif sc_result == "FAIL":
+                assert sc_check is not None
                 sc_value = sc_check.get("value", "?")
                 sc_limit = sc_check.get("limit", "?")
                 logger.warning(f"Submit {alpha_id}: SC FAIL (value={sc_value}, limit={sc_limit})")
@@ -391,7 +642,10 @@ class WQBrainClient:
             elif sc_result == "PASS" and status == "UNSUBMITTED":
                 logger.info(f"Submit {alpha_id}: SC PASS but still UNSUBMITTED, retrying submit...")
                 try:
-                    s.post(f"{API_BASE}/alphas/{alpha_id}/submit")
+                    s.post(
+                        f"{API_BASE}/alphas/{alpha_id}/submit",
+                        timeout=HTTP_TIMEOUT,
+                    )
                 except Exception:
                     pass
 
@@ -405,11 +659,15 @@ class WQBrainClient:
     def delete_alpha(self, alpha_id: str) -> dict:
         """Delete/retire an alpha from the platform."""
         s = self._get_session()
-        r = s.delete(f"{API_BASE}/alphas/{alpha_id}")
+        r = s.delete(f"{API_BASE}/alphas/{alpha_id}", timeout=HTTP_TIMEOUT)
         if r.status_code in (200, 204):
             return {"ok": True, "detail": f"Alpha {alpha_id} deleted"}
         if r.status_code == 405:
-            r2 = s.patch(f"{API_BASE}/alphas/{alpha_id}", json={"hidden": True})
+            r2 = s.patch(
+                f"{API_BASE}/alphas/{alpha_id}",
+                json={"hidden": True},
+                timeout=HTTP_TIMEOUT,
+            )
             if r2.status_code in (200, 204):
                 return {"ok": True, "detail": f"Alpha {alpha_id} hidden via PATCH"}
             return {"ok": False, "detail": f"DELETE 405, PATCH also failed: {r2.status_code} {r2.text[:200]}"}
@@ -418,8 +676,11 @@ class WQBrainClient:
     def unhide_alpha(self, alpha_id: str) -> dict:
         """Restore a hidden alpha."""
         s = self._get_session()
-        r = s.patch(f"{API_BASE}/alphas/{alpha_id}", json={"hidden": False})
+        r = s.patch(
+            f"{API_BASE}/alphas/{alpha_id}",
+            json={"hidden": False},
+            timeout=HTTP_TIMEOUT,
+        )
         if r.status_code in (200, 204):
             return {"ok": True, "detail": f"Alpha {alpha_id} restored"}
         return {"ok": False, "detail": f"Unhide failed: {r.status_code} {r.text[:200]}"}
-
