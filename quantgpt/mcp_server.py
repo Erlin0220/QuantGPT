@@ -18,7 +18,9 @@ import logging
 import math
 import os
 import sys
+import time
 import traceback
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 
 import pandas as pd
@@ -56,6 +58,13 @@ from .wq_research_agent import run_research_batch
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s", stream=sys.stderr)
 logger = logging.getLogger(__name__)
 
+_DEFAULT_MCP_ALLOWED_HOSTS = "localhost,localhost:8003,127.0.0.1,127.0.0.1:8003"
+_MCP_ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.environ.get("QUANTGPT_MCP_ALLOWED_HOSTS", _DEFAULT_MCP_ALLOWED_HOSTS).split(",")
+    if host.strip()
+]
+
 mcp = FastMCP(
     "quantgpt",
     instructions=(
@@ -67,7 +76,7 @@ mcp = FastMCP(
     streamable_http_path="/",
     stateless_http=True,
     transport_security=TransportSecuritySettings(
-        allowed_hosts=["localhost", "localhost:8003", "127.0.0.1", "127.0.0.1:8003"],
+        allowed_hosts=_MCP_ALLOWED_HOSTS,
     ),
 )
 
@@ -165,7 +174,29 @@ def _run_local_backtest_process(task_id: str, params: dict, *, cost_rate=None):
         params["holding_period"],
         **submit_kwargs,
     )
-    result = future.result(timeout=600)
+    timeout_seconds = max(1, int(os.environ.get("QUANTGPT_LOCAL_TASK_TIMEOUT", "600")))
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if is_mcp_task_cancelled(task_id):
+            future.cancel()
+            return None, stock_codes, {"ok": False, "cancelled": True, "error": "任务已取消"}
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            future.cancel()
+            return (
+                None,
+                stock_codes,
+                {
+                    "ok": False,
+                    "error": f"Local backtest timed out after {timeout_seconds}s",
+                },
+            )
+        try:
+            result = future.result(timeout=min(1.0, remaining))
+            break
+        except FutureTimeoutError:
+            if future.done():
+                raise
     if is_mcp_task_cancelled(task_id):
         return None, stock_codes, {"ok": False, "cancelled": True, "error": "任务已取消"}
     update_mcp_task(task_id, progress=70, progress_message="回测完成，整理结果")
@@ -302,19 +333,51 @@ def _run_local_rolling_validation_mcp_task(task_id: str, params: dict) -> dict:
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _FACTOR_VALUES_DIR = _PROJECT_ROOT / "reports" / "mcp_factor_values"
 _MAX_FACTOR_VALUE_ARTIFACTS = max(1, int(os.environ.get("QUANTGPT_MAX_FACTOR_VALUE_ARTIFACTS", "100")))
+_MAX_FACTOR_VALUE_ARTIFACT_BYTES = max(
+    1,
+    int(os.environ.get("QUANTGPT_MAX_FACTOR_VALUE_ARTIFACT_MB", "64")) * 1024 * 1024,
+)
+_MAX_FACTOR_VALUE_TOTAL_BYTES = max(
+    _MAX_FACTOR_VALUE_ARTIFACT_BYTES,
+    int(os.environ.get("QUANTGPT_MAX_FACTOR_VALUE_TOTAL_MB", "512")) * 1024 * 1024,
+)
+_FACTOR_VALUE_ARTIFACT_TTL_SECONDS = max(
+    60,
+    int(os.environ.get("QUANTGPT_FACTOR_VALUE_ARTIFACT_TTL_SECONDS", "86400")),
+)
 
 
 def _cleanup_factor_value_artifacts() -> None:
-    files = sorted(
-        _FACTOR_VALUES_DIR.glob("*.jsonl.gz"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    for stale in files[_MAX_FACTOR_VALUE_ARTIFACTS:]:
+    if not _FACTOR_VALUES_DIR.exists():
+        return
+    now = time.time()
+    files: list[tuple[Path, os.stat_result]] = []
+    for path in _FACTOR_VALUES_DIR.glob("*.jsonl.gz"):
         try:
-            stale.unlink()
+            metadata = path.stat()
         except OSError:
-            logger.warning("Failed to remove stale factor artifact: %s", stale)
+            continue
+        if now - metadata.st_mtime > _FACTOR_VALUE_ARTIFACT_TTL_SECONDS:
+            try:
+                path.unlink()
+            except OSError:
+                logger.warning("Failed to remove expired factor artifact: %s", path)
+            continue
+        files.append((path, metadata))
+
+    files.sort(key=lambda item: item[1].st_mtime, reverse=True)
+    retained_bytes = 0
+    for index, (path, metadata) in enumerate(files):
+        keep = (
+            index < _MAX_FACTOR_VALUE_ARTIFACTS and retained_bytes + metadata.st_size <= _MAX_FACTOR_VALUE_TOTAL_BYTES
+        )
+        if keep:
+            retained_bytes += metadata.st_size
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            logger.warning("Failed to remove stale factor artifact: %s", path)
 
 
 def _run_compute_factor_values_mcp_task(task_id: str, params: dict) -> dict:
@@ -402,6 +465,15 @@ def _run_compute_factor_values_mcp_task(task_id: str, params: dict) -> dict:
                             progress=min(progress, 95),
                             progress_message=f"写入分页结果 {index}/{total_days}",
                         )
+            artifact_size = temporary.stat().st_size
+            if artifact_size > _MAX_FACTOR_VALUE_ARTIFACT_BYTES:
+                return {
+                    "ok": False,
+                    "error": (
+                        "Factor-values artifact exceeds configured limit "
+                        f"({_MAX_FACTOR_VALUE_ARTIFACT_BYTES // (1024 * 1024)} MB)"
+                    ),
+                }
             temporary.replace(artifact)
         finally:
             if temporary.exists():

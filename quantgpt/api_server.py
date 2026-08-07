@@ -41,6 +41,9 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from .server_instance_lock import acquire_server_instance_lock
+
+    instance_lock = acquire_server_instance_lock()
     task_store.main_loop = asyncio.get_running_loop()
     await init_db()
     logger.info("Database initialized")
@@ -164,23 +167,28 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     logger.info("Scheduler started")
 
+    from .mcp_server import _cleanup_factor_value_artifacts
     from .mcp_server import mcp as _mcp_server
 
+    _cleanup_factor_value_artifacts()
     _mcp_server.streamable_http_app()
-    async with _mcp_server.session_manager.run():
-        logger.info("MCP streamable-http session manager started")
+    try:
+        async with _mcp_server.session_manager.run():
+            logger.info("MCP streamable-http session manager started")
+            yield
+    finally:
+        scheduler.shutdown(wait=False)
+        from .mcp_task_helper import shutdown_mcp_background_executor
+        from .task_executor import shutdown_executor
 
-        yield
-
-    scheduler.shutdown(wait=False)
-    from .mcp_task_helper import shutdown_mcp_background_executor
-    from .task_executor import shutdown_executor
-
-    shutdown_mcp_background_executor(wait=False)
-    shutdown_executor()
-    await close_db()
-    task_store.main_loop = None
-    logger.info("Database connection closed")
+        shutdown_mcp_background_executor(wait=False)
+        shutdown_executor()
+        try:
+            await close_db()
+        finally:
+            task_store.main_loop = None
+            instance_lock.release()
+        logger.info("Database connection closed")
 
 
 # ---- App ----
@@ -297,20 +305,29 @@ _CHARTS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/charts", StaticFiles(directory=str(_CHARTS_DIR)), name="charts")
 
 
-def _mcp_client_ip(request: Request) -> str:
-    forwarded = (
-        request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-    )
-    if forwarded:
-        return forwarded
+def _mcp_peer_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def _is_loopback_client(client_ip: str) -> bool:
+def _trusted_proxy_ips() -> set[str]:
+    configured = os.environ.get("QUANTGPT_TRUSTED_PROXY_IPS", "127.0.0.1,::1")
+    return {item.strip() for item in configured.split(",") if item.strip()}
+
+
+def _mcp_client_ip(request: Request) -> str:
+    """Use forwarding headers only when the actual peer is a trusted proxy."""
+    peer_ip = _mcp_peer_ip(request)
+    if peer_ip not in _trusted_proxy_ips():
+        return peer_ip
+    forwarded = (
+        request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    )
+    if not forwarded:
+        return peer_ip
     try:
-        return ip_address(client_ip).is_loopback
+        return str(ip_address(forwarded))
     except ValueError:
-        return False
+        return peer_ip
 
 
 def _mcp_api_key_valid(request: Request, configured_key: str) -> bool:
@@ -335,14 +352,13 @@ async def _mcp_security_and_path_rewrite(request: Request, call_next):
             )
 
         configured_key = os.environ.get("QUANTGPT_MCP_API_KEY", "").strip()
-        if configured_key:
-            if not _mcp_api_key_valid(request, configured_key):
-                return JSONResponse({"error": "Invalid or missing MCP API key"}, status_code=401)
-        elif not _is_loopback_client(client_ip):
+        if not configured_key:
             return JSONResponse(
-                {"error": "Remote MCP access requires QUANTGPT_MCP_API_KEY"},
+                {"error": "MCP access requires QUANTGPT_MCP_API_KEY"},
                 status_code=503,
             )
+        if not _mcp_api_key_valid(request, configured_key):
+            return JSONResponse({"error": "Invalid or missing MCP API key"}, status_code=401)
     return await call_next(request)
 
 

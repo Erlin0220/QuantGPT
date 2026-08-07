@@ -2,7 +2,9 @@
 
 import gzip
 import json
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -59,6 +61,31 @@ class TestFactorValuesPagination(unittest.IsolatedAsyncioTestCase):
                 "2026-01-04",
             ],
         )
+
+    def test_cleanup_enforces_ttl_count_and_total_bytes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact_root = Path(temp_dir)
+            now = time.time()
+            files = []
+            for index in range(4):
+                path = artifact_root / f"{index}.jsonl.gz"
+                path.write_bytes(b"x" * 10)
+                os.utime(path, (now - index * 10, now - index * 10))
+                files.append(path)
+            expired = artifact_root / "expired.jsonl.gz"
+            expired.write_bytes(b"x")
+            os.utime(expired, (now - 1000, now - 1000))
+
+            with (
+                patch.object(mcp_server, "_FACTOR_VALUES_DIR", artifact_root),
+                patch.object(mcp_server, "_MAX_FACTOR_VALUE_ARTIFACTS", 3),
+                patch.object(mcp_server, "_MAX_FACTOR_VALUE_TOTAL_BYTES", 20),
+                patch.object(mcp_server, "_FACTOR_VALUE_ARTIFACT_TTL_SECONDS", 100),
+            ):
+                mcp_server._cleanup_factor_value_artifacts()
+
+            self.assertEqual([path.exists() for path in files], [True, True, False, False])
+            self.assertFalse(expired.exists())
 
 
 if __name__ == "__main__":

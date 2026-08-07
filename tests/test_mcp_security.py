@@ -28,7 +28,7 @@ def _request(*, client_ip="203.0.113.10", headers=None):
 
 
 class TestMCPSecurityMiddleware(unittest.IsolatedAsyncioTestCase):
-    async def test_remote_access_requires_configured_key(self):
+    async def test_all_http_access_requires_configured_key(self):
         call_next = AsyncMock(return_value=Response(status_code=200))
         with (
             patch.dict(os.environ, {"QUANTGPT_MCP_API_KEY": ""}, clear=False),
@@ -36,6 +36,18 @@ class TestMCPSecurityMiddleware(unittest.IsolatedAsyncioTestCase):
         ):
             response = await api_server._mcp_security_and_path_rewrite(_request(), call_next)
         self.assertEqual(response.status_code, 503)
+        call_next.assert_not_awaited()
+
+    async def test_untrusted_peer_cannot_spoof_loopback_forwarding_header(self):
+        call_next = AsyncMock(return_value=Response(status_code=200))
+        request = _request(headers={"X-Forwarded-For": "127.0.0.1"})
+        with (
+            patch.dict(os.environ, {"QUANTGPT_MCP_API_KEY": ""}, clear=False),
+            patch.object(api_server.task_store, "check_rate_limit", return_value=True) as rate_limit,
+        ):
+            response = await api_server._mcp_security_and_path_rewrite(request, call_next)
+        self.assertEqual(response.status_code, 503)
+        rate_limit.assert_called_once_with("mcp:203.0.113.10")
         call_next.assert_not_awaited()
 
     async def test_valid_bearer_key_is_accepted(self):

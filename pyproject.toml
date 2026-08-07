@@ -23,6 +23,7 @@ dependencies = [
     "akshare>=1.10",
     "apscheduler>=3.10",
     "pyarrow>=14.0",
+    "psutil>=5.9",
 ]
 
 [project.optional-dependencies]

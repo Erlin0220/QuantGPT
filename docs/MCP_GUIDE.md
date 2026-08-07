@@ -201,10 +201,22 @@ bash restart.sh   # 启动 HTTP 服务（端口 8003）
 ```bash
 QUANTGPT_MCP_API_KEY=<至少 32 字节的随机密钥>
 QUANTGPT_RATE_LIMIT=50
+QUANTGPT_MCP_ALLOWED_HOSTS=localhost,localhost:8003,127.0.0.1,127.0.0.1:8003
+QUANTGPT_FACTOR_VALUE_ARTIFACT_TTL_SECONDS=86400
+QUANTGPT_MAX_FACTOR_VALUE_TOTAL_MB=512
 ```
 
-未配置 API Key 时只允许回环地址访问；远程请求会返回 503。所有 MCP HTTP 请求还会按来源 IP
-应用每分钟限流。stdio 模式不经过这层 HTTP 鉴权。
+所有 HTTP MCP 请求（包括本机请求）都必须携带 API Key；未配置服务端 Key 时返回 503。
+只有来自 `QUANTGPT_TRUSTED_PROXY_IPS` 的真实对端才允许通过转发头声明客户端 IP，防止伪造
+`X-Forwarded-For` 绕过限流。stdio 模式不经过这层 HTTP 鉴权。
+
+HTTP/MCP 服务强制单进程运行，因为任务状态、并发闸门和限流器均为进程内状态。Windows、Linux
+和 macOS 统一使用以下命令管理服务，脚本会校验 PID、端口归属和健康状态：
+
+```bash
+python scripts/manage_quantgpt.py status
+python scripts/manage_quantgpt.py restart
+```
 
 `mcp_server.py` 中的 `allowed_hosts` 需包含带端口的 host：
 

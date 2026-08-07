@@ -5,7 +5,7 @@ import json
 import os
 import time
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import quantgpt.mcp_server as mcp_server
 import quantgpt.mcp_task_helper as task_helper
@@ -109,6 +109,30 @@ class TestLocalMCPAsyncSurface(unittest.IsolatedAsyncioTestCase):
             with self.subTest(name=name):
                 await self._assert_enqueued(name, call)
 
+    def test_local_backtest_wait_honors_cooperative_cancellation(self):
+        future = Mock()
+        executor = Mock()
+        executor.submit_cpu_work.return_value = future
+        params = {
+            "expression": "rank(close)",
+            "n_groups": 5,
+            "holding_period": 5,
+            "neutralize_industry": True,
+            "neutralize_cap": True,
+        }
+        with (
+            patch.object(mcp_server, "_load_local_factor_data", return_value=(object(), ["000001.SZ"], None)),
+            patch.object(mcp_server, "get_executor", return_value=executor),
+            patch.object(mcp_server, "is_mcp_task_cancelled", return_value=True),
+            patch.object(mcp_server, "update_mcp_task"),
+        ):
+            result, _stocks, error = mcp_server._run_local_backtest_process("task", params)
+
+        self.assertIsNone(result)
+        assert error is not None
+        self.assertTrue(error["cancelled"])
+        future.cancel.assert_called_once_with()
+
 
 class TestMCPBackgroundLifecycle(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -148,7 +172,7 @@ class TestMCPBackgroundLifecycle(unittest.IsolatedAsyncioTestCase):
                 break
             await asyncio.sleep(0.01)
 
-        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
         self.assertEqual(snapshot["status"], "completed")
         self.assertEqual(snapshot["progress"], 100)
         self.assertEqual(snapshot["result"]["value"], 42)
@@ -169,6 +193,7 @@ class TestMCPBackgroundLifecycle(unittest.IsolatedAsyncioTestCase):
                 break
             await asyncio.sleep(0.01)
 
+        assert snapshot is not None
         self.assertEqual(snapshot["status"], "failed")
         self.assertEqual(snapshot["error"], "expected failure")
 
@@ -197,6 +222,8 @@ class TestMCPBackgroundLifecycle(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.03)
         snapshot = await task_helper.get_mcp_task_snapshot(task_id)
 
+        assert cancelled is not None
+        assert snapshot is not None
         self.assertEqual(cancelled["status"], "cancelled")
         self.assertEqual(snapshot["status"], "cancelled")
 

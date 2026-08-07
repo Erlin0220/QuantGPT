@@ -29,6 +29,7 @@ frontend/dist/
 # Logs
 logs/
 .quantgpt.pid
+.quantgpt.server.lock
 *.bak-*
 
 # MCP config (local paths)
