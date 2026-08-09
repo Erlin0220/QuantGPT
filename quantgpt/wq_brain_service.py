@@ -35,6 +35,8 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
 _GLOBAL_SIMULATION_LIMIT = _env_int("WQ_SIM_GLOBAL_CONCURRENCY", 4)
 _GLOBAL_SIMULATION_SLOTS = threading.BoundedSemaphore(_GLOBAL_SIMULATION_LIMIT)
 _GLOBAL_SLOT_STATE = threading.local()
+_ADAPTIVE_CONCURRENCY_LOCK = threading.Lock()
+_ADAPTIVE_CONCURRENCY_HINT: int | None = None
 
 
 def _acquire_global_simulation_slot(
@@ -57,9 +59,32 @@ def _release_global_simulation_slot(acquired: bool | None) -> None:
         _GLOBAL_SIMULATION_SLOTS.release()
 
 
+def _reset_adaptive_concurrency_hint() -> None:
+    """Reset the cross-task hint; primarily useful for deterministic tests."""
+    global _ADAPTIVE_CONCURRENCY_HINT
+    with _ADAPTIVE_CONCURRENCY_LOCK:
+        _ADAPTIVE_CONCURRENCY_HINT = None
+
+
+def _remember_adaptive_concurrency(final: int, throttle_events: int, maximum: int) -> None:
+    """Carry the last stable BRAIN concurrency into later tasks in this process."""
+    global _ADAPTIVE_CONCURRENCY_HINT
+    if not _env_int("WQ_SIM_CONCURRENCY_LEARN", 1, minimum=0):
+        return
+    stable = max(1, min(int(final), int(maximum), _GLOBAL_SIMULATION_LIMIT))
+    with _ADAPTIVE_CONCURRENCY_LOCK:
+        if throttle_events or _ADAPTIVE_CONCURRENCY_HINT is None:
+            _ADAPTIVE_CONCURRENCY_HINT = stable
+        else:
+            _ADAPTIVE_CONCURRENCY_HINT = max(_ADAPTIVE_CONCURRENCY_HINT, stable)
+
+
 def _concurrency_settings(total: int) -> tuple[int, int, int]:
-    initial = min(_env_int("WQ_SIM_CONCURRENCY", 3), _GLOBAL_SIMULATION_LIMIT)
-    maximum = min(max(initial, _env_int("WQ_SIM_CONCURRENCY_MAX", 4)), _GLOBAL_SIMULATION_LIMIT)
+    configured_initial = min(_env_int("WQ_SIM_CONCURRENCY", 3), _GLOBAL_SIMULATION_LIMIT)
+    maximum = min(max(configured_initial, _env_int("WQ_SIM_CONCURRENCY_MAX", 4)), _GLOBAL_SIMULATION_LIMIT)
+    with _ADAPTIVE_CONCURRENCY_LOCK:
+        learned = _ADAPTIVE_CONCURRENCY_HINT
+    initial = min(maximum, learned) if learned is not None else configured_initial
     growth_waves = _env_int("WQ_SIM_CONCURRENCY_GROWTH_WAVES", 2)
     return min(initial, total), min(maximum, total), growth_waves
 
@@ -179,6 +204,7 @@ def _run_adaptive_parallel(
                 clean_waves = 0
                 logger.info("WQ adaptive concurrency increase: %s -> %s", previous, current)
 
+    _remember_adaptive_concurrency(current, throttle_events, maximum)
     stats = {
         "initial": initial,
         "max": maximum,
@@ -186,6 +212,7 @@ def _run_adaptive_parallel(
         "final": current,
         "throttle_events": throttle_events,
         "global_limit": _GLOBAL_SIMULATION_LIMIT,
+        "learned_for_next_task": current,
     }
     return outputs, stats, cancelled
 

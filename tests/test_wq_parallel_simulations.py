@@ -9,7 +9,11 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
-from quantgpt.wq_brain_service import run_batch_simulation, run_single_simulation
+from quantgpt.wq_brain_service import (
+    _reset_adaptive_concurrency_hint,
+    run_batch_simulation,
+    run_single_simulation,
+)
 from quantgpt.wq_research_agent import run_research_batch
 
 
@@ -65,6 +69,9 @@ class _ParallelFakeClient:
 
 
 class TestAdaptiveParallelResearch(unittest.TestCase):
+    def setUp(self):
+        _reset_adaptive_concurrency_hint()
+
     def test_research_runs_multiple_simulations_concurrently(self):
         shared = _SharedState()
         expressions = [f"rank(-ts_delta(close, {window}))" for window in range(2, 8)]
@@ -111,7 +118,27 @@ class TestAdaptiveParallelResearch(unittest.TestCase):
         self.assertLess(concurrency["final"], concurrency["initial"])
 
 
+    def test_next_task_reuses_learned_backoff(self):
+        throttled = _SharedState(throttle_above=1)
+        expressions = [f"rank(-ts_delta(close, {window}))" for window in range(2, 8)]
+
+        with patch.dict(
+            os.environ,
+            {"WQ_SIM_CONCURRENCY": "3", "WQ_SIM_CONCURRENCY_MAX": "4", "WQ_SIM_CONCURRENCY_GROWTH_WAVES": "2"},
+            clear=False,
+        ):
+            first = run_research_batch(_ParallelFakeClient(throttled), expressions, skip_existing=False)
+            learned = first["summary"]["concurrency"]["final"]
+            second = run_research_batch(_ParallelFakeClient(_SharedState()), expressions[:3], skip_existing=False)
+
+        self.assertLess(learned, 3)
+        self.assertEqual(second["summary"]["concurrency"]["initial"], learned)
+
+
 class TestAdaptiveParallelSweep(unittest.TestCase):
+    def setUp(self):
+        _reset_adaptive_concurrency_hint()
+
     def test_parameter_sweep_uses_same_parallel_runner(self):
         shared = _SharedState()
 
@@ -137,6 +164,9 @@ class TestAdaptiveParallelSweep(unittest.TestCase):
 
 
 class TestGlobalSimulationGate(unittest.TestCase):
+    def setUp(self):
+        _reset_adaptive_concurrency_hint()
+
     def test_single_simulations_share_the_global_gate(self):
         shared = _SharedState()
         client = _ParallelFakeClient(shared)

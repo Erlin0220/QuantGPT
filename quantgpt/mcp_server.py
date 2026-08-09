@@ -627,6 +627,92 @@ async def list_wq_operators() -> str:
 
 
 @mcp.tool()
+async def wq_brain_data_catalog(
+    account: str = "primary",
+    region: str = "USA",
+    universe: str = "TOP3000",
+    delay: int = 1,
+    dataset_id: str | None = None,
+    search: str | None = None,
+    limit: int = 100,
+) -> str:
+    """读取当前 BRAIN 账号可用的 Data Explorer 数据集和 MATRIX Data Fields。
+
+    Autonomous Research 使用同一实时目录生成新 Alpha，避免依赖硬编码字段。
+    可用 dataset_id / search 缩小字段范围；本工具只读，不会创建 Simulation 或提交 Alpha。
+    """
+    from .wq_brain_client import get_client
+    from .wq_brain_client import is_configured as _wq_configured
+
+    if account not in {"primary", "alt"}:
+        return json.dumps({"error": "account 必须是 primary 或 alt"}, ensure_ascii=False)
+    if not _wq_configured(account):
+        return json.dumps({"error": f"WQ BRAIN 未配置 (account={account})"}, ensure_ascii=False)
+    limit = max(1, min(200, int(limit)))
+    client = get_client(account)
+    try:
+        if not await asyncio.to_thread(client.authenticate):
+            return json.dumps({"error": "WQ BRAIN 认证失败"}, ensure_ascii=False)
+        try:
+            datasets = await asyncio.to_thread(
+                client.list_datasets,
+                region=region,
+                universe=universe,
+                delay=delay,
+                limit=100,
+            )
+        except Exception as exc:
+            logger.warning("WQ dataset catalog fetch failed: %s", exc)
+            datasets = []
+        fields = await asyncio.to_thread(
+            client.list_data_fields,
+            region=region,
+            universe=universe,
+            delay=delay,
+            dataset_id=dataset_id,
+            search=search,
+            limit=limit,
+        )
+        matrix_fields = [item for item in fields if str(item.get("type") or "MATRIX").upper() == "MATRIX"]
+        return json.dumps(
+            {
+                "source": "live",
+                "account": account,
+                "scope": {"region": region, "universe": universe, "delay": delay},
+                "dataset_filter": dataset_id,
+                "search": search,
+                "dataset_count": len(datasets),
+                "datasets": [
+                    {
+                        "id": item.get("id"),
+                        "name": item.get("name"),
+                        "category": item.get("category"),
+                        "description": item.get("description"),
+                    }
+                    for item in datasets
+                ],
+                "field_count": len(matrix_fields),
+                "fields": [
+                    {
+                        "id": item.get("id"),
+                        "name": item.get("name"),
+                        "type": item.get("type"),
+                        "dataset": item.get("dataset"),
+                        "description": item.get("description"),
+                    }
+                    for item in matrix_fields
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    except Exception as exc:
+        return json.dumps({"error": str(exc)[:500]}, ensure_ascii=False)
+    finally:
+        await asyncio.to_thread(client.close)
+
+
+@mcp.tool()
 def validate_expression(expression: str, mode: str = "local") -> str:
     """验证因子表达式语法是否正确。返回 OK 或错误信息。
 
@@ -1474,10 +1560,11 @@ async def wq_brain_autonomous_research(
 ) -> str:
     """自主规划并研究 WQ Alpha，不需要调用方手工提供 expressions。
 
-    自动读取持久化研究记忆与近期 BRAIN Alpha，优先探索低覆盖信号家族，执行真实
-    Simulation，并依据 LOW_SHARPE / LOW_FITNESS / TURNOVER /
-    SELF_CORRELATION 等诊断做有限代定向变异。合格 Alpha 自动进入 Candidate Queue，
-    但本工具永远不会正式提交 Alpha，正式提交仍由 Submission Gate 控制。
+    自动读取 Research Memory、近期 BRAIN Alpha 和账号实时 Data Explorer 字段；在可用时
+    使用现有 DeepSeek/OpenAI-compatible provider 生成少量结构创新 FASTEXPR，并以真实
+    BRAIN Simulation 验证。Primary Pass 还会经过有限的跨 Universe/Neutralization
+    Robustness Funnel，只有 READY Candidate 才进入正式候选库存。工具永远不会正式提交
+    Alpha，正式提交仍由 Submission Gate 控制。
 
     Returns:
         JSON with task_id. Uses the same single-flight ``wq_research`` gate as manual research.

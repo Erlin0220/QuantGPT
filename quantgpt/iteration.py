@@ -315,7 +315,12 @@ def _evaluate_candidate(
 
 # ---- Main adaptive iteration loop ----
 
-def _call_llm(system_prompt: str, user_prompt: str, temperature: float = 0.9) -> str:
+def _call_llm(
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float = 0.9,
+    max_tokens: int = 256,
+) -> str:
     """Call LLM and return cleaned expression string."""
     import time as _time
 
@@ -339,7 +344,7 @@ def _call_llm(system_prompt: str, user_prompt: str, temperature: float = 0.9) ->
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=temperature,
-                max_tokens=256,
+                max_tokens=max(64, min(8192, int(max_tokens))),
                 timeout=60,
             )
             return _clean_expression(resp.choices[0].message.content)

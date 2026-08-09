@@ -102,6 +102,115 @@ def test_seed_plan_skips_fields_brain_reported_as_unknown():
     assert all("mdf_bp" not in item["expression"] for item in plan)
 
 
+def test_live_dataset_selection_spreads_across_categories_and_avoids_overused_dataset():
+    datasets = [
+        {"id": "fundamental2", "category": {"id": "fundamental"}},
+        {"id": "fundamental6", "category": {"id": "fundamental"}},
+        {"id": "news12", "category": {"id": "news"}},
+        {"id": "option8", "category": {"id": "option"}},
+        {"id": "pv1", "category": {"id": "pv"}},
+    ]
+    memory = {"recent_trials": [{"dataset_id": "fundamental2"}] * 10}
+
+    selected = autonomous._select_live_datasets(datasets, memory, limit=4)
+
+    ids = [item["id"] for item in selected]
+    categories = {autonomous._dataset_category(item) for item in selected}
+    assert "fundamental2" not in ids
+    assert "fundamental6" in ids
+    assert len(categories) == 4
+
+
+def test_live_field_candidates_round_robin_across_selected_datasets():
+    class FakeClient:
+        def list_datasets(self, **_kwargs):
+            return [
+                {"id": "analyst4", "category": {"id": "analyst"}},
+                {"id": "news12", "category": {"id": "news"}},
+                {"id": "pv1", "category": {"id": "pv"}},
+            ]
+
+        def list_data_fields(self, dataset_id=None, **_kwargs):
+            prefix = {"analyst4": "analyst", "news12": "news", "pv1": "pv"}[dataset_id]
+            return [
+                {"id": f"{prefix}_field_a", "type": "MATRIX", "dataset": {"id": dataset_id}},
+                {"id": f"{prefix}_field_b", "type": "MATRIX", "dataset": {"id": dataset_id}},
+            ]
+
+    fields, catalog = autonomous._live_field_candidates(
+        FakeClient(), {}, region="USA", universe="TOP3000", delay=1, limit=3
+    )
+
+    assert catalog["selected_datasets"] == ["analyst4", "news12", "pv1"]
+    assert [item["dataset"]["id"] for item in fields[:3]] == ["analyst4", "news12", "pv1"]
+
+
+def test_live_field_plan_prefers_matrix_fields_and_skips_unknown_memory_fields():
+    class FakeClient:
+        def list_data_fields(self, **_kwargs):
+            return [
+                {"id": "fresh_quality", "type": "MATRIX", "description": "company quality score", "dataset": {"id": "fundamentalX"}},
+                {"id": "bad_field", "type": "MATRIX", "description": "bad"},
+                {"id": "vector_field", "type": "VECTOR", "description": "vector"},
+            ]
+
+        def list_operator_names(self):
+            return {"rank", "ts_mean", "ts_backfill", "ts_delta", "ts_std_dev"}
+
+    memory = {
+        "recent_trials": [
+            {
+                "expression": "rank(bad_field)",
+                "mutation_targets": ['simulation_failed:Attempted to use unknown variable "bad_field".'],
+            }
+        ]
+    }
+
+    plan, catalog, fields = autonomous.build_live_field_plan(
+        FakeClient(),
+        memory,
+        seen=set(),
+        limit=3,
+        region="USA",
+        universe="TOP3000",
+        delay=1,
+        hypothesis="discover live fields",
+    )
+
+    assert catalog["available"] is True
+    assert len(fields) == 1
+    assert len(plan) == 3
+    assert all("fresh_quality" in item["expression"] for item in plan)
+    assert all(item["mutation_type"] == "live_field_seed" for item in plan)
+    assert all(item["family"] == "fundamental_quality" for item in plan)
+
+
+def test_llm_live_plan_rejects_invented_fields_and_keeps_catalog_expression(monkeypatch):
+    from quantgpt import iteration
+
+    class FakeClient:
+        def list_operator_names(self):
+            return {"rank", "ts_mean", "ts_backfill"}
+
+    fields = [{"id": "real_field", "type": "MATRIX", "description": "analyst revision signal"}]
+    generated = iter(["rank(fake_field)", "rank(ts_mean(ts_backfill(real_field, 60), 20))"])
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setattr(iteration, "_call_llm", lambda *_args, **_kwargs: next(generated))
+
+    plan = autonomous.build_llm_live_plan(
+        FakeClient(),
+        fields,
+        seen=set(),
+        limit=2,
+        hypothesis="new hypothesis",
+    )
+
+    assert len(plan) == 1
+    assert "real_field" in plan[0]["expression"]
+    assert plan[0]["mutation_type"] == "llm_live_field_seed"
+    assert plan[0]["data_fields"] == ["real_field"]
+
+
 def test_memory_mutation_plan_reuses_recent_failure_across_runs():
     parent = "rank(ts_mean(returns, 10))"
     memory = {
@@ -200,6 +309,63 @@ def test_next_generation_diversifies_parents_before_second_child():
 
     assert len(plan) == 2
     assert {item["parent_expression"] for item in plan} == {item["expression"] for item in ranked}
+
+
+def test_candidate_robustness_requires_cross_setting_support(monkeypatch):
+    monkeypatch.setattr(
+        autonomous,
+        "run_batch_simulation",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "sub_results": {
+                "a": {"status": "completed", "sharpe": 1.2, "fitness": 0.9, "returns": 0.05, "turnover": 0.2},
+                "b": {"status": "completed", "sharpe": 1.1, "fitness": 0.8, "returns": 0.03, "turnover": 0.25},
+            },
+        },
+    )
+
+    result = autonomous.validate_candidate_robustness(
+        object(),
+        {"expression": "rank(close)"},
+        region="USA",
+        universe="TOP3000",
+        delay=1,
+        decay=0,
+        neutralization="SUBINDUSTRY",
+        truncation=0.08,
+    )
+
+    assert result["status"] == "ready"
+    assert result["robustness_score"] == 1.0
+    assert result["validation_simulations"] == 2
+
+
+def test_candidate_robustness_failure_is_explicit(monkeypatch):
+    monkeypatch.setattr(
+        autonomous,
+        "run_batch_simulation",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "sub_results": {
+                "a": {"status": "completed", "sharpe": 0.4, "fitness": 0.3, "returns": -0.02, "turnover": 0.2},
+                "b": {"status": "completed", "sharpe": 0.6, "fitness": 0.4, "returns": 0.01, "turnover": 0.2},
+            },
+        },
+    )
+
+    result = autonomous.validate_candidate_robustness(
+        object(),
+        {"expression": "rank(close)"},
+        region="USA",
+        universe="TOP3000",
+        delay=1,
+        decay=0,
+        neutralization="SUBINDUSTRY",
+        truncation=0.08,
+    )
+
+    assert result["status"] == "robustness_fail"
+    assert result["robustness_score"] == 0.0
 
 
 def test_autonomous_research_runs_bounded_second_generation(monkeypatch):

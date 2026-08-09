@@ -130,6 +130,8 @@ def _trial_from_item(
         self_correlation_failed=_self_correlation_failed(item),
         mutation_targets=list(mutation_targets or []),
         settings=dict(item.get("settings") or settings or {}),
+        data_fields=list(meta.get("data_fields") or []),
+        dataset_id=str(meta.get("dataset_id") or "") or None,
         tag=tag,
     )
 
@@ -155,6 +157,10 @@ async def record_research_trials(
         str(item.get("alpha_id"))
         for item in (result.get("candidates") or [])
         if item.get("alpha_id")
+        and (
+            "validation" not in item
+            or str((item.get("validation") or {}).get("status") or "").lower() == "ready"
+        )
     }
     for item in result.get("results") or []:
         status = "candidate" if str(item.get("alpha_id")) in candidate_ids else "rejected"
@@ -229,6 +235,8 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
             "turnover": row.turnover,
             "self_correlation_failed": bool(row.self_correlation_failed),
             "mutation_targets": list(row.mutation_targets or []),
+            "data_fields": list(row.data_fields or []),
+            "dataset_id": row.dataset_id,
         }
         for row in rows[:200]
         if row.expression

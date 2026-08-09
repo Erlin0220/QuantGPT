@@ -57,6 +57,26 @@ def _structure_signature(expression: str) -> str:
     return value
 
 
+def _expression_tokens(expression: str) -> set[str]:
+    return set(re.findall(r"[a-z_][a-z0-9_]*", str(expression or "").lower()))
+
+
+def _novelty_score(expression: str, peers: list[str]) -> float:
+    """Cheap structural novelty proxy used before a true return-correlation API is available."""
+    tokens = _expression_tokens(expression)
+    if not tokens or not peers:
+        return 1.0
+    max_similarity = 0.0
+    for peer in peers:
+        other = _expression_tokens(peer)
+        if not other:
+            continue
+        union = tokens | other
+        similarity = len(tokens & other) / max(1, len(union))
+        max_similarity = max(max_similarity, similarity)
+    return round(max(0.0, 1.0 - max_similarity), 4)
+
+
 def _priority_score(candidate: dict[str, Any]) -> float:
     metrics = candidate.get("is_metrics") or {}
 
@@ -82,10 +102,22 @@ def _priority_score(candidate: dict[str, Any]) -> float:
 
     expression = str(candidate.get("expression") or "")
     complexity_penalty = max(0, expression.count("(") - 8) * 1.5
+    raw_validation = candidate.get("validation") or {}
+    validation = raw_validation if isinstance(raw_validation, dict) else {}
+    try:
+        robustness = float(validation.get("robustness_score") or 0.0)
+    except (TypeError, ValueError):
+        robustness = 0.0
+    try:
+        novelty = float(candidate.get("novelty_score") or 0.0)
+    except (TypeError, ValueError):
+        novelty = 0.0
     return (
         number("fitness") * 100.0
         + number("sharpe") * 20.0
         + number("returns") * 50.0
+        + robustness * 20.0
+        + novelty * 10.0
         - turnover_penalty
         - complexity_penalty
     )
@@ -131,6 +163,18 @@ async def record_research_candidates(
             existing = existing_result.scalar_one_or_none()
             metrics = candidate.get("is_metrics") or {}
             meta = candidate.get("research_meta") or {}
+            raw_validation = candidate.get("validation") or {}
+            validation = raw_validation if isinstance(raw_validation, dict) else {}
+            validation_status = str(validation.get("status") or "legacy_unvalidated")
+            peer_result = await session.execute(
+                select(WQResearchCandidate.expression).where(
+                    WQResearchCandidate.account == account,
+                    WQResearchCandidate.alpha_id != alpha_id,
+                    WQResearchCandidate.status.in_(["queued", "reserved", "submitted"]),
+                )
+            )
+            novelty_score = _novelty_score(expression, [str(value) for value in peer_result.scalars().all() if value])
+            candidate["novelty_score"] = novelty_score
             priority_score = _priority_score(candidate)
             structure_signature = _structure_signature(expression)
             values = {
@@ -153,8 +197,24 @@ async def record_research_candidates(
                 "generation": int(meta.get("generation") or 0),
                 "mutation_type": meta.get("mutation_type"),
                 "structure_signature": structure_signature,
+                "data_fields": list(meta.get("data_fields") or []),
+                "dataset_id": str(meta.get("dataset_id") or "") or None,
+                "validation_status": validation_status,
+                "robustness_score": validation.get("robustness_score"),
+                "novelty_score": novelty_score,
+                "validation_details": dict(validation),
                 "tag": tag,
             }
+
+            # Primary-pass Alphas are not automatically submission-ready. Autonomous
+            # candidates must clear the robustness funnel; manual/platform legacy
+            # candidates retain their old queue semantics and are still rechecked before submit.
+            if validation_status == "robustness_fail":
+                target_status = "robustness_fail"
+            elif validation_status in {"validation_pending", "robustness_unavailable"}:
+                target_status = "validation_pending"
+            else:
+                target_status = "queued"
 
             # Keep only the strongest nearby parameterization in the live queue.
             similar_result = await session.execute(
@@ -169,8 +229,7 @@ async def record_research_candidates(
                 .limit(1)
             )
             similar = similar_result.scalar_one_or_none()
-            target_status = "queued"
-            if similar is not None:
+            if target_status == "queued" and similar is not None:
                 if similar.status == "queued" and priority_score > float(similar.priority_score or 0.0):
                     similar.status = "redundant"
                 else:
@@ -183,7 +242,13 @@ async def record_research_candidates(
                     setattr(existing, key, value)
                 # Never put an already-attempted Alpha back into the submission queue.
                 if existing.status not in {"reserved", "submitted", "sc_fail", "submit_failed"}:
-                    existing.status = target_status
+                    if (
+                        existing.status in {"robustness_fail", "validation_pending"}
+                        and validation_status in {"legacy_unvalidated", "platform_recheck"}
+                    ):
+                        pass
+                    else:
+                        existing.status = target_status
             saved += 1
         await session.commit()
     return saved
@@ -230,6 +295,7 @@ async def record_platform_candidates(
                     "generation": 0,
                     "mutation_type": "platform_backfill",
                 },
+                "validation": {"status": "platform_recheck"},
             }
         )
     return await record_research_candidates(
@@ -303,6 +369,22 @@ async def reserve_submission(
                 "submission_day": day,
                 "daily_budget": budget,
                 "untracked_active_gap": int(state.untracked_active_gap or 0),
+            }
+
+        readiness_result = await session.execute(
+            select(WQResearchCandidate).where(
+                WQResearchCandidate.account == account,
+                WQResearchCandidate.alpha_id == alpha_id,
+            )
+        )
+        readiness_candidate = readiness_result.scalar_one_or_none()
+        if readiness_candidate is not None and readiness_candidate.status in {"robustness_fail", "validation_pending"}:
+            return {
+                "allowed": False,
+                "reason": "candidate_not_ready",
+                "alpha_id": alpha_id,
+                "candidate_status": readiness_candidate.status,
+                "validation_status": readiness_candidate.validation_status,
             }
 
         prior_result = await session.execute(
@@ -537,6 +619,11 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
                 "family": item.family,
                 "generation": item.generation,
                 "mutation_type": item.mutation_type,
+                "validation_status": item.validation_status,
+                "robustness_score": item.robustness_score,
+                "novelty_score": item.novelty_score,
+                "data_fields": list(item.data_fields or []),
+                "dataset_id": item.dataset_id,
                 "tag": item.tag,
             }
             for item in queue_result.scalars().all()

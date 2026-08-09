@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 from collections import Counter
 from typing import Any, Callable
 
-from .wq_brain_service import run_list_alphas
+from .wq_brain_service import run_batch_simulation, run_list_alphas
+from .wq_operator_registry import validate_wq_expression
 from .wq_research_agent import run_research_batch
 from .wq_research_memory import classify_wq_family, normalize_wq_expression
 
@@ -123,6 +125,305 @@ def _unknown_fields_from_memory(memory: dict[str, Any]) -> set[str]:
 def _uses_unknown_field(expression: str, unknown_fields: set[str]) -> bool:
     normalized = normalize_wq_expression(expression)
     return any(re.search(rf"(?<![a-z0-9_]){re.escape(field)}(?![a-z0-9_])", normalized) for field in unknown_fields)
+
+
+_CORE_WQ_FIELDS = {
+    "open", "high", "low", "close", "volume", "vwap", "returns", "cap",
+    "market", "sector", "industry", "subindustry",
+}
+
+
+def _classify_live_field(field: dict[str, Any]) -> str:
+    dataset = field.get("dataset") or {}
+    text = " ".join(
+        str(value or "").lower()
+        for value in (
+            field.get("id"), field.get("name"), field.get("description"),
+            dataset.get("id") if isinstance(dataset, dict) else dataset,
+            dataset.get("name") if isinstance(dataset, dict) else "",
+        )
+    )
+    if any(token in text for token in ("analyst", "estimate", "revision", "recommendation")):
+        return "analyst_revision"
+    if any(token in text for token in ("option", "implied_vol", "historical_vol")):
+        return "options_volatility"
+    if any(token in text for token in ("sentiment", "social", "news", "buzz", "nws")):
+        return "sentiment"
+    if any(token in text for token in ("cashflow", "fundamental", "asset", "debt", "earning", "book", "quality", "leverage")):
+        return "fundamental_quality"
+    if any(token in text for token in ("volume", "vwap", "price", "turnover")):
+        return "price_volume"
+    if any(token in text for token in ("volatility", "variance", "std", "risk")):
+        return "volatility_structure"
+    return "live_data"
+
+
+def _live_field_id(field: dict[str, Any]) -> str:
+    field_id = str(field.get("id") or "").strip()
+    return field_id if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", field_id) else ""
+
+
+def _dataset_category(dataset: dict[str, Any]) -> str:
+    category = dataset.get("category") or {}
+    if isinstance(category, dict):
+        return str(category.get("id") or category.get("name") or "unknown").lower()
+    return str(category or "unknown").lower()
+
+
+def _select_live_datasets(datasets: list[dict[str, Any]], memory: dict[str, Any], *, limit: int = 6) -> list[dict[str, Any]]:
+    """Prefer underused datasets while spreading a research round across categories."""
+    usage = Counter(str(item.get("dataset_id") or "") for item in (memory.get("recent_trials") or []))
+    by_category: dict[str, list[dict[str, Any]]] = {}
+    for dataset in datasets:
+        dataset_id = str(dataset.get("id") or "").strip()
+        if not dataset_id:
+            continue
+        by_category.setdefault(_dataset_category(dataset), []).append(dataset)
+    for values in by_category.values():
+        values.sort(key=lambda item: (usage[str(item.get("id") or "")], str(item.get("id") or "")))
+
+    selected: list[dict[str, Any]] = []
+    categories = sorted(by_category, key=lambda category: min(usage[str(item.get("id") or "")] for item in by_category[category]))
+    while len(selected) < max(1, int(limit)):
+        added = False
+        for category in categories:
+            values = by_category[category]
+            if not values:
+                continue
+            selected.append(values.pop(0))
+            added = True
+            if len(selected) >= limit:
+                break
+        if not added:
+            break
+    return selected
+
+
+def _live_field_candidates(client, memory: dict[str, Any], *, region: str, universe: str, delay: int, limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Fetch account-visible MATRIX fields and rank underused fields first."""
+    if limit <= 0 or not hasattr(client, "list_data_fields"):
+        return [], {"available": False, "count": 0, "error": "data-field catalog unavailable"}
+
+    raw: list[dict[str, Any]] = []
+    selected_datasets: list[dict[str, Any]] = []
+    if hasattr(client, "list_datasets"):
+        try:
+            datasets = client.list_datasets(region=region, universe=universe, delay=delay, limit=100)
+            selected_datasets = _select_live_datasets(datasets, memory, limit=min(6, max(3, limit)))
+            per_dataset = max(6, math.ceil(max(36, limit * 8) / max(1, len(selected_datasets))))
+            for dataset in selected_datasets:
+                dataset_id = str(dataset.get("id") or "").strip()
+                try:
+                    fields = client.list_data_fields(
+                        region=region,
+                        universe=universe,
+                        delay=delay,
+                        dataset_id=dataset_id,
+                        limit=per_dataset,
+                    )
+                except Exception:
+                    continue
+                for field in fields:
+                    item = dict(field)
+                    if not item.get("dataset"):
+                        item["dataset"] = {"id": dataset_id, "name": dataset.get("name")}
+                    raw.append(item)
+        except Exception:
+            selected_datasets = []
+
+    if not raw:
+        try:
+            raw = client.list_data_fields(region=region, universe=universe, delay=delay, limit=max(80, limit * 12))
+        except Exception as exc:
+            return [], {"available": False, "count": 0, "error": str(exc)[:300]}
+
+    unknown_fields = _unknown_fields_from_memory(memory)
+    previous = [str(item.get("expression") or "").lower() for item in (memory.get("recent_trials") or [])]
+    ranked_by_dataset: dict[str, list[tuple[int, str, dict[str, Any]]]] = {}
+    for field in raw:
+        field_id = _live_field_id(field)
+        if not field_id or field_id.lower() in unknown_fields:
+            continue
+        field_type = str(field.get("type") or "MATRIX").upper()
+        if field_type != "MATRIX":
+            continue
+        usage = sum(1 for expression in previous if re.search(rf"(?<![a-z0-9_]){re.escape(field_id.lower())}(?![a-z0-9_])", expression))
+        dataset = field.get("dataset") or {}
+        dataset_id = str(dataset.get("id") or "unknown") if isinstance(dataset, dict) else str(dataset or "unknown")
+        ranked_by_dataset.setdefault(dataset_id, []).append((usage, field_id.lower(), field))
+    for values in ranked_by_dataset.values():
+        values.sort(key=lambda item: (item[0], item[1]))
+
+    # Round-robin datasets so an alphabetically early fundamental dataset cannot
+    # monopolize the live-field budget when several data sources are available.
+    fields: list[dict[str, Any]] = []
+    dataset_order = sorted(
+        ranked_by_dataset,
+        key=lambda dataset_id: (
+            min((item[0] for item in ranked_by_dataset[dataset_id]), default=0),
+            dataset_id,
+        ),
+    )
+    while True:
+        added = False
+        for dataset_id in dataset_order:
+            values = ranked_by_dataset[dataset_id]
+            if not values:
+                continue
+            fields.append(values.pop(0)[2])
+            added = True
+        if not added:
+            break
+    return fields, {
+        "available": True,
+        "count": len(fields),
+        "raw_count": len(raw),
+        "selected_datasets": [str(item.get("id") or "") for item in selected_datasets],
+        "selected_categories": sorted({_dataset_category(item) for item in selected_datasets}),
+        "sample_ids": [_live_field_id(item) for item in fields[:10]],
+    }
+
+
+def _live_field_templates(field_id: str) -> list[str]:
+    base = f"ts_backfill({field_id}, 60)"
+    return [
+        f"rank(ts_mean({base}, 20))",
+        f"-rank(ts_mean({base}, 20))",
+        f"rank(ts_delta({base}, 20))",
+        f"-rank(ts_std_dev({base}, 20))",
+    ]
+
+
+def build_live_field_plan(
+    client,
+    memory: dict[str, Any] | None,
+    *,
+    seen: set[str],
+    limit: int,
+    region: str,
+    universe: str,
+    delay: int,
+    hypothesis: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
+    memory = memory or {}
+    fields, catalog = _live_field_candidates(client, memory, region=region, universe=universe, delay=delay, limit=limit)
+    if not fields or limit <= 0:
+        return [], catalog, fields
+    try:
+        supported = client.list_operator_names()
+    except Exception:
+        supported = set()
+
+    plan: list[dict[str, Any]] = []
+    for template_index in range(4):
+        for field in fields:
+            field_id = _live_field_id(field)
+            templates = _live_field_templates(field_id)
+            expression = templates[template_index]
+            validation = validate_wq_expression(expression, supported) if supported else None
+            if validation is not None and not validation.ok:
+                continue
+            expression = validation.expression if validation is not None else expression
+            normalized = normalize_wq_expression(expression)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            dataset = field.get("dataset") or {}
+            dataset_id = dataset.get("id") if isinstance(dataset, dict) else dataset
+            plan.append(
+                {
+                    "expression": expression,
+                    "family": _classify_live_field(field),
+                    "generation": 1,
+                    "hypothesis": hypothesis,
+                    "parent_expression": None,
+                    "mutation_type": "live_field_seed",
+                    "data_fields": [field_id],
+                    "dataset_id": dataset_id,
+                }
+            )
+            if len(plan) >= limit:
+                return plan, catalog, fields
+    return plan, catalog, fields
+
+
+def _expression_uses_only_catalog_fields(expression: str, operators: set[str], allowed_fields: set[str]) -> bool:
+    tokens = {token.lower() for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expression)}
+    allowed = {value.lower() for value in allowed_fields} | _CORE_WQ_FIELDS | {f"adv{days}" for days in (5, 10, 20, 60, 120)}
+    return all(token in operators or token in allowed for token in tokens)
+
+
+def build_llm_live_plan(
+    client,
+    fields: list[dict[str, Any]],
+    *,
+    seen: set[str],
+    limit: int,
+    hypothesis: str,
+) -> list[dict[str, Any]]:
+    """Use the existing DeepSeek/OpenAI-compatible provider as a bounded WQ idea generator."""
+    if limit <= 0 or not os.environ.get("DEEPSEEK_API_KEY") or not fields:
+        return []
+    try:
+        supported = client.list_operator_names()
+    except Exception:
+        return []
+    usable_fields = [_live_field_id(field) for field in fields if _live_field_id(field)][:24]
+    if not usable_fields:
+        return []
+
+    from .iteration import _call_llm
+
+    operators = sorted(supported)
+    operator_text = ", ".join(operators[:120])
+    field_text = ", ".join(usable_fields)
+    system_prompt = (
+        "You design WorldQuant BRAIN FASTEXPR research hypotheses. Output exactly one FASTEXPR expression, no prose. "
+        "Use only the supplied data fields/operators. Prefer simple economically interpretable structures, 2-5 operator calls, "
+        "and avoid pure lookback parameter tuning. Do not use assignments, semicolons, local-only indicators, or invented fields."
+    )
+    out: list[dict[str, Any]] = []
+    for index in range(limit):
+        avoid = [item for item in list(seen)[-8:]]
+        user_prompt = (
+            f"Research objective: {hypothesis}\n"
+            f"Allowed MATRIX fields: {field_text}\n"
+            f"Allowed operators: {operator_text}\n"
+            f"Already researched normalized expressions to avoid: {avoid}\n"
+            f"Generate idea {index + 1} with a distinct structural hypothesis."
+        )
+        try:
+            expression = _call_llm(
+                system_prompt,
+                user_prompt,
+                temperature=min(1.0 + index * 0.15, 1.4),
+                max_tokens=4096,
+            ).strip()
+        except Exception:
+            break
+        validation = validate_wq_expression(expression, supported)
+        if not validation.ok:
+            continue
+        expression = validation.expression
+        normalized = normalize_wq_expression(expression)
+        if not normalized or normalized in seen:
+            continue
+        if not _expression_uses_only_catalog_fields(expression, supported, set(usable_fields)):
+            continue
+        seen.add(normalized)
+        used = [field for field in usable_fields if re.search(rf"(?<![a-z0-9_]){re.escape(field.lower())}(?![a-z0-9_])", normalized)]
+        out.append(
+            {
+                "expression": expression,
+                "family": _classify_live_field(next((item for item in fields if _live_field_id(item) in used), {})),
+                "generation": 1,
+                "hypothesis": hypothesis,
+                "parent_expression": None,
+                "mutation_type": "llm_live_field_seed",
+                "data_fields": used,
+            }
+        )
+    return out
 
 
 def _seed_meta(
@@ -250,7 +551,11 @@ def build_targeted_mutations(
     sharpe = _safe_metric(metrics.get("sharpe"))
     variants: list[tuple[str, str]] = []
 
-    if "reduce_turnover" in targets or "improve_sub_universe_robustness" in targets:
+    if (
+        "reduce_turnover" in targets
+        or "improve_sub_universe_robustness" in targets
+        or "improve_cross_setting_robustness" in targets
+    ):
         variants.append((_widen_windows(expression), "widen_windows"))
     if "increase_turnover" in targets:
         variants.append((_narrow_windows(expression), "narrow_windows"))
@@ -384,6 +689,69 @@ def _annotate_batch(batch: dict[str, Any], plan: list[dict[str, Any]]) -> None:
                 item["research_meta"] = {k: v for k, v in meta.items() if k != "expression"}
 
 
+def validate_candidate_robustness(
+    client,
+    candidate: dict[str, Any],
+    *,
+    region: str,
+    universe: str,
+    delay: int,
+    decay: int,
+    neutralization: str,
+    truncation: float,
+    check_cancelled: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    """Run a small alternate-setting funnel before a primary-pass Alpha becomes READY."""
+    expression = str(candidate.get("expression") or "").strip()
+    if not expression:
+        return {"status": "robustness_unavailable", "robustness_score": 0.0, "reason": "missing_expression"}
+    alternate_universe = "TOP1000" if str(universe).upper() == "TOP3000" else "TOP3000"
+    alternate_neutralization = "INDUSTRY" if str(neutralization).upper() != "INDUSTRY" else "SUBINDUSTRY"
+    try:
+        sweep = run_batch_simulation(
+            client,
+            expression,
+            regions=[region],
+            delays=[delay],
+            universes=[alternate_universe],
+            neutralizations=[neutralization, alternate_neutralization],
+            decay=decay,
+            truncation=truncation,
+            auto_submit=False,
+            check_cancelled=check_cancelled,
+        )
+    except Exception as exc:
+        return {
+            "status": "robustness_unavailable",
+            "robustness_score": 0.0,
+            "reason": str(exc)[:300],
+            "validation_simulations": 0,
+        }
+
+    sub_results = list((sweep.get("sub_results") or {}).values()) if isinstance(sweep, dict) else []
+    completed = [item for item in sub_results if item.get("status") == "completed"]
+    passes = []
+    for item in completed:
+        sharpe = _safe_metric(item.get("sharpe"), -999.0)
+        fitness = _safe_metric(item.get("fitness"), -999.0)
+        turnover = _safe_metric(item.get("turnover"), 0.0)
+        returns = _safe_metric(item.get("returns"), -999.0)
+        if sharpe >= 1.0 and fitness >= 0.7 and 0.01 <= turnover <= 0.7 and returns > 0:
+            passes.append(item)
+    score = len(passes) / max(1, len(completed))
+    ready = len(completed) >= 2 and score >= 0.5
+    return {
+        "status": "ready" if ready else "robustness_fail",
+        "robustness_score": round(score, 4),
+        "validation_simulations": len(sub_results),
+        "completed": len(completed),
+        "passed": len(passes),
+        "alternate_universe": alternate_universe,
+        "neutralizations": [neutralization, alternate_neutralization],
+        "details": sub_results,
+    }
+
+
 def _rank_result(item: dict[str, Any]) -> tuple[float, float, float]:
     metrics = item.get("is_metrics") or {}
     def num(key: str) -> float:
@@ -437,10 +805,9 @@ def run_autonomous_research(
     first_budget = max_simulations if generations == 1 else max(4, math.ceil(max_simulations * 0.65))
     seen = set(normalized)
 
-    # Spend roughly one third of the first-generation budget improving the best
-    # recent failures. The rest explores under-covered signal families. If the
-    # static seed catalog is exhausted, research memory is allowed to consume the
-    # remaining budget so autonomous research keeps advancing across hourly runs.
+    # Exploit promising failures, but reserve most first-generation budget for
+    # genuinely new account-visible BRAIN fields and a small number of LLM ideas.
+    # Static seeds remain a safe fallback when Data Explorer or the LLM is unavailable.
     memory_parent_budget = min(first_budget, max(0, first_budget // 3))
     memory_plan = build_memory_mutation_plan(
         memory,
@@ -450,11 +817,31 @@ def run_autonomous_research(
         min_sharpe=min_sharpe,
         min_fitness=min_fitness,
     )
+    exploration_budget = max(0, first_budget - len(memory_plan))
+    live_budget = min(exploration_budget, max(0, math.ceil(exploration_budget * 0.6)))
+    live_plan, live_catalog, live_fields = build_live_field_plan(
+        client,
+        memory,
+        seen=seen,
+        limit=live_budget,
+        region=region,
+        universe=universe,
+        delay=delay,
+        hypothesis=goal,
+    )
+    llm_budget = min(2, max(0, exploration_budget - len(live_plan)))
+    llm_plan = build_llm_live_plan(
+        client,
+        live_fields,
+        seen=seen,
+        limit=llm_budget,
+        hypothesis=goal,
+    )
     seed_memory = dict(memory)
     seed_memory["normalized_expressions"] = sorted(seen)
     seed_plan = build_seed_plan(
         seed_memory,
-        limit=max(0, first_budget - len(memory_plan)),
+        limit=max(0, exploration_budget - len(live_plan) - len(llm_plan)),
         family_count=family_count,
         generation=1,
         hypothesis=goal,
@@ -462,18 +849,19 @@ def run_autonomous_research(
     for item in seed_plan:
         seen.add(normalize_wq_expression(item["expression"]))
 
-    if len(memory_plan) + len(seed_plan) < first_budget:
+    planned_count = len(memory_plan) + len(live_plan) + len(llm_plan) + len(seed_plan)
+    if planned_count < first_budget:
         memory_plan.extend(
             build_memory_mutation_plan(
                 memory,
                 seen=seen,
-                limit=first_budget - len(memory_plan) - len(seed_plan),
+                limit=first_budget - planned_count,
                 hypothesis=goal,
                 min_sharpe=min_sharpe,
                 min_fitness=min_fitness,
             )
         )
-    first_plan = seed_plan + memory_plan
+    first_plan = memory_plan + live_plan + llm_plan + seed_plan
     generation_results: list[dict[str, Any]] = []
     all_results: list[dict[str, Any]] = []
     all_candidates: list[dict[str, Any]] = []
@@ -558,8 +946,46 @@ def run_autonomous_research(
                 seen.add(normalize_wq_expression(item["expression"]))
         plan = next_plan
 
+    # A primary threshold pass is not enough to enter the submission-ready queue.
+    # Validate at most the two strongest candidates across alternate universe / neutralization
+    # settings; additional candidates stay validation_pending rather than consuming unbounded BRAIN time.
+    validation_simulations = 0
+    ranked_primary_candidates = sorted(all_candidates, key=_rank_result, reverse=True)
+    result_by_alpha = {str(item.get("alpha_id")): item for item in all_results if item.get("alpha_id")}
+    for index, candidate in enumerate(ranked_primary_candidates):
+        if index < 2 and not (check_cancelled and check_cancelled()):
+            validation = validate_candidate_robustness(
+                client,
+                candidate,
+                region=region,
+                universe=universe,
+                delay=delay,
+                decay=decay,
+                neutralization=neutralization,
+                truncation=truncation,
+                check_cancelled=check_cancelled,
+            )
+        else:
+            validation = {
+                "status": "validation_pending",
+                "robustness_score": None,
+                "validation_simulations": 0,
+                "reason": "per-round validation cap",
+            }
+        candidate["validation"] = validation
+        validation_simulations += int(validation.get("validation_simulations") or 0)
+        mirrored = result_by_alpha.get(str(candidate.get("alpha_id")))
+        if mirrored is not None:
+            mirrored["validation"] = validation
+            if validation.get("status") == "robustness_fail":
+                targets = list(mirrored.get("mutation_targets") or [])
+                if "improve_cross_setting_robustness" not in targets:
+                    targets.append("improve_cross_setting_robustness")
+                mirrored["mutation_targets"] = targets
+
+    ready_candidates = [item for item in ranked_primary_candidates if (item.get("validation") or {}).get("status") == "ready"]
     all_results.sort(key=_rank_result, reverse=True)
-    all_candidates.sort(key=_rank_result, reverse=True)
+    ranked_primary_candidates.sort(key=_rank_result, reverse=True)
     best = all_results[0] if all_results else None
     settings = {
         "region": region,
@@ -577,6 +1003,7 @@ def run_autonomous_research(
         "goal": goal,
         "tag": tag,
         "selected_families": selected_families,
+        "live_catalog": live_catalog,
         "memory_before": {
             "trials": int(memory.get("trials") or 0),
             "family_counts": dict(memory.get("family_counts") or {}),
@@ -587,9 +1014,15 @@ def run_autonomous_research(
             "generations_completed": len(generation_results),
             "max_simulations": max_simulations,
             "memory_parent_mutations": len(memory_plan),
+            "live_field_expressions": len(live_plan),
+            "llm_expressions": len(llm_plan),
             "seed_expressions": len(seed_plan),
             "simulated": sum(int((item.get("summary") or {}).get("simulated") or 0) for item in generation_results),
-            "candidates": len(all_candidates),
+            "primary_candidates": len(ranked_primary_candidates),
+            "candidates": len(ready_candidates),
+            "validation_pending": sum(1 for item in ranked_primary_candidates if (item.get("validation") or {}).get("status") == "validation_pending"),
+            "robustness_failed": sum(1 for item in ranked_primary_candidates if (item.get("validation") or {}).get("status") == "robustness_fail"),
+            "validation_simulations": validation_simulations,
             "simulation_failed": len(all_failed),
             "invalid": len(all_invalid),
             "formally_submitted": 0,
@@ -597,7 +1030,8 @@ def run_autonomous_research(
         },
         "generations": generation_results,
         "results": all_results,
-        "candidates": all_candidates,
+        "candidates": ranked_primary_candidates,
+        "ready_candidates": ready_candidates,
         "failed": all_failed,
         "invalid": all_invalid,
         "best": best,

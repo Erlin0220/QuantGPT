@@ -79,6 +79,8 @@ class WQBrainClient:
         self.password = password or os.environ.get("WQ_BRAIN_PASSWORD", "")
         self._session: requests.Session | None = None
         self._operators_cache: list[dict] | None = None
+        self._data_fields_cache: dict[tuple, list[dict]] = {}
+        self._datasets_cache: dict[tuple, list[dict]] = {}
 
     def _get_session(self) -> requests.Session:
         if self._session is None:
@@ -109,6 +111,8 @@ class WQBrainClient:
             child_session.cookies.update(self._session.cookies)
         if self._operators_cache is not None:
             child._operators_cache = list(self._operators_cache)
+        child._data_fields_cache = {key: list(value) for key, value in self._data_fields_cache.items()}
+        child._datasets_cache = {key: list(value) for key, value in self._datasets_cache.items()}
         return child
 
     def authenticate(self, _max_retries: int = 5) -> bool:
@@ -173,6 +177,93 @@ class WQBrainClient:
 
     def list_operator_names(self) -> set[str]:
         return {str(item.get("name", "")).strip().lower() for item in self.list_operators() if item.get("name")}
+
+    @staticmethod
+    def _catalog_results(data) -> list[dict]:
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        if isinstance(data, dict):
+            return [item for item in data.get("results", []) if isinstance(item, dict)]
+        return []
+
+    def list_data_fields(
+        self,
+        *,
+        region: str = "USA",
+        universe: str = "TOP3000",
+        delay: int = 1,
+        instrument_type: str = "EQUITY",
+        dataset_id: str | None = None,
+        search: str | None = None,
+        limit: int = 200,
+        refresh: bool = False,
+    ) -> list[dict]:
+        """Return BRAIN Data Explorer fields available to the authenticated account."""
+        limit = max(1, min(int(limit), 1000))
+        key = (instrument_type, region, universe, int(delay), dataset_id or "", search or "", limit)
+        if key in self._data_fields_cache and not refresh:
+            return list(self._data_fields_cache[key])
+
+        fields: list[dict] = []
+        offset = 0
+        page_size = min(50, limit)
+        while len(fields) < limit:
+            params = {
+                "instrumentType": instrument_type,
+                "region": region,
+                "delay": int(delay),
+                "universe": universe,
+                "limit": min(page_size, limit - len(fields)),
+                "offset": offset,
+            }
+            if dataset_id:
+                params["dataset.id"] = dataset_id
+            if search:
+                params["search"] = search
+            r = self._get_session().get(f"{API_BASE}/data-fields", params=params, timeout=HTTP_TIMEOUT)
+            if r.status_code != 200:
+                raise RuntimeError(f"Failed to fetch WQ data fields: HTTP {r.status_code}: {r.text[:300]}")
+            data = r.json()
+            page = self._catalog_results(data)
+            fields.extend(page)
+            total = int(data.get("count", len(fields))) if isinstance(data, dict) else len(fields)
+            if not page or len(fields) >= total:
+                break
+            offset += len(page)
+
+        result = fields[:limit]
+        self._data_fields_cache[key] = list(result)
+        return result
+
+    def list_datasets(
+        self,
+        *,
+        region: str = "USA",
+        universe: str = "TOP3000",
+        delay: int = 1,
+        instrument_type: str = "EQUITY",
+        limit: int = 100,
+        refresh: bool = False,
+    ) -> list[dict]:
+        """Return BRAIN data sets visible to the account for the requested scope."""
+        limit = max(1, min(int(limit), 500))
+        key = (instrument_type, region, universe, int(delay), limit)
+        if key in self._datasets_cache and not refresh:
+            return list(self._datasets_cache[key])
+        params = {
+            "instrumentType": instrument_type,
+            "region": region,
+            "delay": int(delay),
+            "universe": universe,
+            "limit": limit,
+            "offset": 0,
+        }
+        r = self._get_session().get(f"{API_BASE}/data-sets", params=params, timeout=HTTP_TIMEOUT)
+        if r.status_code != 200:
+            raise RuntimeError(f"Failed to fetch WQ datasets: HTTP {r.status_code}: {r.text[:300]}")
+        result = self._catalog_results(r.json())[:limit]
+        self._datasets_cache[key] = list(result)
+        return result
 
     def simulate(
         self,

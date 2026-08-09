@@ -150,6 +150,71 @@ async def test_platform_history_backfills_only_strong_unsubmitted_candidates(pol
 
 
 @pytest.mark.asyncio
+async def test_autonomous_candidate_waits_for_robustness_before_queue_and_submission(policy_db):
+    saved = await record_research_candidates(
+        "primary",
+        [
+            {
+                "alpha_id": "pending-robustness",
+                "expression": "rank(ts_mean(close, 20))",
+                "is_metrics": {"sharpe": 1.7, "fitness": 1.2, "returns": 0.08, "turnover": 0.2},
+                "validation": {"status": "validation_pending"},
+                "research_meta": {"family": "momentum_reversal", "generation": 2},
+            }
+        ],
+    )
+    assert saved == 1
+    status = await get_submission_policy_status("primary")
+    assert status["candidate_queue_count"] == 0
+
+    decision = await reserve_submission("primary", "pending-robustness")
+    assert decision["allowed"] is False
+    assert decision["reason"] == "candidate_not_ready"
+    assert decision["candidate_status"] == "validation_pending"
+
+
+@pytest.mark.asyncio
+async def test_ready_candidate_persists_robustness_novelty_and_live_fields(policy_db):
+    await record_research_candidates(
+        "primary",
+        [
+            {
+                "alpha_id": "peer",
+                "expression": "rank(ts_mean(volume, 20))",
+                "is_metrics": {"sharpe": 1.4, "fitness": 1.1, "returns": 0.05, "turnover": 0.2},
+            }
+        ],
+    )
+    saved = await record_research_candidates(
+        "primary",
+        [
+            {
+                "alpha_id": "ready-live",
+                "expression": "rank(ts_mean(fresh_quality, 20))",
+                "is_metrics": {"sharpe": 1.8, "fitness": 1.3, "returns": 0.09, "turnover": 0.18},
+                "validation": {"status": "ready", "robustness_score": 1.0, "passed": 2, "completed": 2},
+                "research_meta": {
+                    "family": "fundamental_quality",
+                    "generation": 1,
+                    "mutation_type": "live_field_seed",
+                    "data_fields": ["fresh_quality"],
+                    "dataset_id": "fundamentalX",
+                },
+            }
+        ],
+    )
+    assert saved == 1
+
+    status = await get_submission_policy_status("primary")
+    item = next(value for value in status["candidate_queue_top"] if value["alpha_id"] == "ready-live")
+    assert item["validation_status"] == "ready"
+    assert item["robustness_score"] == 1.0
+    assert 0.0 <= item["novelty_score"] <= 1.0
+    assert item["data_fields"] == ["fresh_quality"]
+    assert item["dataset_id"] == "fundamentalX"
+
+
+@pytest.mark.asyncio
 async def test_research_candidate_is_queued_then_removed_when_reserved(policy_db):
     saved = await record_research_candidates(
         "primary",

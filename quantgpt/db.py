@@ -95,6 +95,38 @@ def _migrate_add_columns(connection):
         connection, inspector, "wq_research_candidates", "structure_signature",
         "ALTER TABLE wq_research_candidates ADD COLUMN structure_signature TEXT",
     )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "data_fields",
+        "ALTER TABLE wq_research_candidates ADD COLUMN data_fields JSON",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "dataset_id",
+        "ALTER TABLE wq_research_candidates ADD COLUMN dataset_id VARCHAR(100)",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "validation_status",
+        "ALTER TABLE wq_research_candidates ADD COLUMN validation_status VARCHAR(30) NOT NULL DEFAULT 'research_pass'",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "robustness_score",
+        "ALTER TABLE wq_research_candidates ADD COLUMN robustness_score FLOAT",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "novelty_score",
+        "ALTER TABLE wq_research_candidates ADD COLUMN novelty_score FLOAT",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "validation_details",
+        "ALTER TABLE wq_research_candidates ADD COLUMN validation_details JSON",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_trials", "data_fields",
+        "ALTER TABLE wq_research_trials ADD COLUMN data_fields JSON",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_trials", "dataset_id",
+        "ALTER TABLE wq_research_trials ADD COLUMN dataset_id VARCHAR(100)",
+    )
 
 
 def _add_column_if_missing(connection, inspector, table, column, ddl):
