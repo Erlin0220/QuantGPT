@@ -4,16 +4,31 @@ from quantgpt import wq_autonomous_research as autonomous
 from quantgpt.wq_research_memory import normalize_wq_expression
 
 
-def test_family_selector_can_use_conservative_points_feedback():
+def test_family_selector_uses_only_confidence_gated_points_feedback():
     family_counts = {family: 10 for family in autonomous.FAMILY_SEEDS}
     memory = {
         "family_counts": family_counts,
-        "family_points_feedback": {"price_volume": 1500.0},
+        "family_points_feedback": {"price_volume": 10000.0},
+        "family_points_feedback_usable": {"analyst_revision": 1500.0},
     }
 
     selected = autonomous.select_research_families(memory, count=1)
 
-    assert selected == ["price_volume"]
+    assert selected == ["analyst_revision"]
+
+
+def test_family_selector_ignores_raw_points_feedback_when_gate_has_no_usable_evidence():
+    family_counts = {family: 10 for family in autonomous.FAMILY_SEEDS}
+    selected = autonomous.select_research_families(
+        {
+            "family_counts": family_counts,
+            "family_points_feedback": {"price_volume": 100000.0},
+            "family_points_feedback_usable": {},
+        },
+        count=1,
+    )
+
+    assert selected == [sorted(autonomous.FAMILY_SEEDS)[0]]
 
 
 def test_family_selector_prefers_undercovered_family():

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from collections import Counter
 from typing import Any
@@ -21,6 +22,21 @@ from .wq_lineage import (
 from .wq_mutation_policy import compile_prevention_rules, summarize_mutation_outcomes
 from .wq_operator_registry import canonicalize_wq_expression
 from .wq_research_scheduler import summarize_research_cells
+
+_DEFAULT_POINTS_FEEDBACK_MIN_CONFIDENCE = 0.5
+_DEFAULT_POINTS_FEEDBACK_MIN_SAMPLES = 2
+
+
+def _points_feedback_thresholds() -> tuple[float, int]:
+    try:
+        confidence = float(os.environ.get("WQ_POINTS_FEEDBACK_MIN_CONFIDENCE", str(_DEFAULT_POINTS_FEEDBACK_MIN_CONFIDENCE)))
+    except (TypeError, ValueError):
+        confidence = _DEFAULT_POINTS_FEEDBACK_MIN_CONFIDENCE
+    try:
+        samples = int(os.environ.get("WQ_POINTS_FEEDBACK_MIN_SAMPLES", str(_DEFAULT_POINTS_FEEDBACK_MIN_SAMPLES)))
+    except (TypeError, ValueError):
+        samples = _DEFAULT_POINTS_FEEDBACK_MIN_SAMPLES
+    return max(0.0, min(1.0, confidence)), max(1, samples)
 
 
 def normalize_wq_expression(expression: str) -> str:
@@ -343,7 +359,7 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
         funnel_events = list(funnel_result.scalars().all())
         attribution_result = await session.execute(
             select(WQSubmissionAttempt, WQResearchCandidate)
-            .join(
+            .outerjoin(
                 WQResearchCandidate,
                 (WQResearchCandidate.account == WQSubmissionAttempt.account)
                 & (WQResearchCandidate.alpha_id == WQSubmissionAttempt.alpha_id),
@@ -420,20 +436,64 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
         "rate": round(dataset_present / max(1, len(rows)), 4),
         "note": "unknown_is_valid_when_dataset_provenance_is_not_derivable",
     }
+    min_points_confidence, min_points_samples = _points_feedback_thresholds()
     family_points_attribution: Counter[str] = Counter()
     family_points_feedback: Counter[str] = Counter()
     dataset_points_attribution: Counter[str] = Counter()
     dataset_points_feedback: Counter[str] = Counter()
+    operator_points_attribution: Counter[str] = Counter()
+    operator_points_feedback: Counter[str] = Counter()
+    usable_family_feedback: Counter[str] = Counter()
+    usable_dataset_feedback: Counter[str] = Counter()
+    usable_operator_feedback: Counter[str] = Counter()
+    usable_family_samples: Counter[str] = Counter()
+    usable_dataset_samples: Counter[str] = Counter()
+    usable_operator_samples: Counter[str] = Counter()
+    confidence_total = 0.0
+    settled_points_total = 0.0
+    confidence_weighted_points_total = 0.0
+    usable_attempts = 0
+    settlement_cohorts: set[str] = set()
     for attempt, candidate in attribution_rows:
         share = float(attempt.attributed_points_share or 0.0)
         confidence = max(0.0, min(1.0, float(attempt.attribution_confidence or 0.0)))
         weighted = share * confidence
+        confidence_total += confidence
+        settled_points_total += share
+        confidence_weighted_points_total += weighted
+        details = attempt.attribution_details if isinstance(attempt.attribution_details, dict) else {}
+        cohort_ids = details.get("cohort_alpha_ids") or [attempt.alpha_id]
+        settlement_cohorts.add("|".join(sorted(str(value) for value in cohort_ids if value)))
+        if candidate is None:
+            continue
         family = str(candidate.family or "unknown")
         dataset_id = str(candidate.dataset_id or "unknown")
+        operator_pattern = str(candidate.operator_pattern or "unknown")
         family_points_attribution[family] += share
         family_points_feedback[family] += weighted
         dataset_points_attribution[dataset_id] += share
         dataset_points_feedback[dataset_id] += weighted
+        operator_points_attribution[operator_pattern] += share
+        operator_points_feedback[operator_pattern] += weighted
+        if share > 0.0 and confidence >= min_points_confidence:
+            usable_attempts += 1
+            usable_family_feedback[family] += weighted
+            usable_dataset_feedback[dataset_id] += weighted
+            usable_operator_feedback[operator_pattern] += weighted
+            usable_family_samples[family] += 1
+            usable_dataset_samples[dataset_id] += 1
+            usable_operator_samples[operator_pattern] += 1
+
+    def usable_groups(feedback: Counter[str], samples: Counter[str]) -> dict[str, float]:
+        return {
+            key: round(float(value), 4)
+            for key, value in feedback.items()
+            if int(samples.get(key, 0)) >= min_points_samples
+        }
+
+    family_points_feedback_usable = usable_groups(usable_family_feedback, usable_family_samples)
+    dataset_points_feedback_usable = usable_groups(usable_dataset_feedback, usable_dataset_samples)
+    operator_points_feedback_usable = usable_groups(usable_operator_feedback, usable_operator_samples)
 
     mutation_rows = [
         {
@@ -508,9 +568,31 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
         },
         "family_points_attribution": dict(family_points_attribution),
         "family_points_feedback": dict(family_points_feedback),
+        "family_points_feedback_usable": family_points_feedback_usable,
         "dataset_points_attribution": dict(dataset_points_attribution),
         "dataset_points_feedback": dict(dataset_points_feedback),
+        "dataset_points_feedback_usable": dataset_points_feedback_usable,
+        "operator_points_attribution": dict(operator_points_attribution),
+        "operator_points_feedback": dict(operator_points_feedback),
+        "operator_points_feedback_usable": operator_points_feedback_usable,
         "points_attribution_rule": "equal_share_confidence_weighted",
+        "points_feedback_gate": {
+            "min_confidence": min_points_confidence,
+            "min_samples_per_group": min_points_samples,
+            "planner_uses_only_gated_feedback": True,
+            "high_capacity_models_deferred": ["RUDDER", "ARES", "QR_DQN"],
+        },
+        "points_feedback_coverage": {
+            "settled_attempts": len(attribution_rows),
+            "settlement_cohorts": len(settlement_cohorts),
+            "settled_points_total": round(settled_points_total, 4),
+            "confidence_weighted_points_total": round(confidence_weighted_points_total, 4),
+            "mean_confidence": round(confidence_total / max(1, len(attribution_rows)), 4),
+            "usable_attempts": usable_attempts,
+            "usable_family_groups": len(family_points_feedback_usable),
+            "usable_dataset_groups": len(dataset_points_feedback_usable),
+            "usable_operator_groups": len(operator_points_feedback_usable),
+        },
         "active_conversion": conversion_feedback,
         "active_conversion_rate": (conversion_feedback.get("global") or {}).get("rate"),
         "terminal_submission_samples": (conversion_feedback.get("global") or {}).get("samples", 0),

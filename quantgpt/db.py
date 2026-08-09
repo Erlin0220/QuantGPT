@@ -228,6 +228,14 @@ def _migrate_add_columns(connection):
         connection, inspector, "wq_submission_attempts", "attribution_confidence",
         "ALTER TABLE wq_submission_attempts ADD COLUMN attribution_confidence FLOAT",
     )
+    _add_column_if_missing(
+        connection, inspector, "wq_submission_attempts", "attribution_details",
+        "ALTER TABLE wq_submission_attempts ADD COLUMN attribution_details JSON",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_submission_attempts", "settled_at",
+        "ALTER TABLE wq_submission_attempts ADD COLUMN settled_at DATETIME",
+    )
 
 
 def _add_column_if_missing(connection, inspector, table, column, ddl):

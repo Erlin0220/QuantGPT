@@ -100,7 +100,10 @@ def _family_priority(memory: dict[str, Any], family: str) -> tuple[float, str]:
     promise = sum(top_promises) / len(top_promises) if top_promises else 0.0
     candidate_rate = candidates / max(1.0, trials)
     self_corr_rate = self_corr / max(1.0, trials)
-    points_feedback = max(0.0, float((memory.get("family_points_feedback") or {}).get(family, 0.0) or 0.0))
+    points_feedback = max(
+        0.0,
+        float((memory.get("family_points_feedback_usable") or {}).get(family, 0.0) or 0.0),
+    )
     points_reward = min(1.0, math.log1p(points_feedback / 500.0) * 0.4)
     # Lower is better: retain exploration pressure while exploiting families that
     # have produced candidates, several near-threshold trials, or conservative

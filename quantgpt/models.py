@@ -316,6 +316,8 @@ class WQSubmissionAttempt(Base):
     points_status_at_reservation = Column(String(30), nullable=True)
     attributed_points_share = Column(Float, nullable=True)
     attribution_confidence = Column(Float, nullable=True)
+    attribution_details = Column(JSON, nullable=True)
+    settled_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)
 

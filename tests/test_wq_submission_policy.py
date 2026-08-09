@@ -413,3 +413,87 @@ async def test_research_memory_persists_family_lineage_and_failure_feedback(poli
     assert memory["family_counts"]["momentum_reversal"] == 1
     assert memory["self_correlation_family_counts"]["momentum_reversal"] == 1
     assert memory["status_counts"]["rejected"] == 1
+
+
+@pytest.mark.asyncio
+async def test_points_settlement_persists_exact_cohort_and_timing_assumptions(policy_db):
+    import quantgpt.db as db
+
+    await observe_account_status("primary", {"points": 1000, "points_status": "CURRENT"})
+    for alpha_id in ("cohort-a", "cohort-b"):
+        assert (await reserve_submission("primary", alpha_id))["allowed"] is True
+        await finalize_submission_attempt("primary", alpha_id, {"ok": True, "final_status": "ACTIVE"})
+    await observe_account_status("primary", {"points": 3000, "points_status": "CURRENT"})
+
+    factory = db._get_session_factory()
+    async with factory() as session:
+        attempts = list((await session.execute(
+            select(WQSubmissionAttempt).where(WQSubmissionAttempt.alpha_id.in_(["cohort-a", "cohort-b"]))
+        )).scalars().all())
+    assert {attempt.attributed_points_share for attempt in attempts} == {1000.0}
+    assert {attempt.attribution_confidence for attempt in attempts} == {0.5}
+    assert all(attempt.settled_at is not None for attempt in attempts)
+    for attempt in attempts:
+        details = attempt.attribution_details
+        assert details["cohort_alpha_ids"] == ["cohort-a", "cohort-b"]
+        assert details["delta"] == 2000.0
+        assert details["attribution_rule"] == "equal_share_confidence_weighted"
+
+
+@pytest.mark.asyncio
+async def test_untracked_active_gap_reduces_attribution_confidence(policy_db):
+    import quantgpt.db as db
+
+    await observe_account_status("primary", {"points": 1000, "points_status": "CURRENT"})
+    assert (await reserve_submission("primary", "ambiguous-a"))["allowed"] is True
+    await finalize_submission_attempt("primary", "ambiguous-a", {"ok": True, "final_status": "ACTIVE"})
+    await observe_account_status(
+        "primary",
+        {"points": 1500, "points_status": "CURRENT", "leaderboard": {"active_alpha_gap": 2}},
+    )
+    factory = db._get_session_factory()
+    async with factory() as session:
+        attempt = (await session.execute(
+            select(WQSubmissionAttempt).where(WQSubmissionAttempt.alpha_id == "ambiguous-a")
+        )).scalar_one()
+    assert attempt.attribution_confidence == pytest.approx(0.5)
+    assert attempt.attribution_details["untracked_active_gap"] == 1
+
+
+@pytest.mark.asyncio
+async def test_points_feedback_gate_exposes_operator_feedback(policy_db, monkeypatch):
+    monkeypatch.setenv("WQ_POINTS_FEEDBACK_MIN_CONFIDENCE", "0.5")
+    monkeypatch.setenv("WQ_POINTS_FEEDBACK_MIN_SAMPLES", "1")
+    await observe_account_status("primary", {"points": 1000, "points_status": "CURRENT"})
+    await record_research_candidates(
+        "primary",
+        [{
+            "alpha_id": "feedback-a",
+            "expression": "rank(ts_mean(field_feedback, 20))",
+            "is_metrics": {"sharpe": 1.8, "fitness": 1.3, "returns": 0.09, "turnover": 0.2},
+            "research_meta": {"family": "feedback_family", "dataset_id": "feedback_dataset"},
+        }],
+    )
+    assert (await reserve_submission("primary", "feedback-a"))["allowed"] is True
+    await finalize_submission_attempt("primary", "feedback-a", {"ok": True, "final_status": "ACTIVE"})
+    await observe_account_status("primary", {"points": 1800, "points_status": "CURRENT"})
+    memory = await load_research_memory("primary")
+    assert memory["family_points_feedback_usable"]["feedback_family"] == 800.0
+    assert memory["dataset_points_feedback_usable"]["feedback_dataset"] == 800.0
+    assert memory["operator_points_feedback_usable"]
+    assert memory["points_feedback_coverage"]["usable_attempts"] == 1
+    assert memory["points_feedback_gate"]["high_capacity_models_deferred"] == ["RUDDER", "ARES", "QR_DQN"]
+
+
+@pytest.mark.asyncio
+async def test_zero_delta_lineage_missing_settlement_keeps_uncertainty_visible(policy_db):
+    await observe_account_status("primary", {"points": 1000, "points_status": "CURRENT"})
+    assert (await reserve_submission("primary", "historical-no-lineage"))["allowed"] is True
+    await finalize_submission_attempt("primary", "historical-no-lineage", {"ok": True, "final_status": "ACTIVE"})
+    await observe_account_status("primary", {"points": 1000, "points_status": "CURRENT"})
+    memory = await load_research_memory("primary")
+    assert memory["points_feedback_coverage"]["settled_attempts"] == 1
+    assert memory["points_feedback_coverage"]["usable_attempts"] == 0
+    assert memory["family_points_feedback_usable"] == {}
+    assert memory["dataset_points_feedback_usable"] == {}
+    assert memory["operator_points_feedback_usable"] == {}

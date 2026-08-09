@@ -60,6 +60,14 @@ def submission_day(now: datetime | None = None) -> str:
     return instant.astimezone(_submission_timezone()).date().isoformat()
 
 
+def _normalized_datetime(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def _structure_signature(expression: str) -> str:
     """Collapse lookback constants so nearby parameter variants share one structure."""
     value = re.sub(r"\s+", "", str(expression or "").lower())
@@ -752,16 +760,43 @@ async def observe_account_status(account: str, status: dict[str, Any]) -> dict[s
                 if pending:
                     baseline = float(state.last_settled_points or 0.0)
                     delta = max(0.0, points_value - baseline)
-                    # BRAIN leaderboard points are batch-delayed, so when several
-                    # ACTIVE submissions settle together we cannot know the exact
-                    # per-Alpha contribution. Persist an equal-share attribution and
-                    # downweight its confidence by the batch size for planner feedback.
+                    cohort_ids = sorted(str(attempt.alpha_id) for attempt in pending)
                     attributed_share = delta / len(pending)
-                    attribution_confidence = 1.0 / len(pending)
+                    uncertainty_slots = max(0, int(state.untracked_active_gap or 0))
+                    attribution_confidence = 1.0 / max(1, len(pending) + uncertainty_slots)
+                    settled_at = datetime.now(timezone.utc)
+                    active_times = [
+                        value
+                        for value in (_normalized_datetime(attempt.updated_at) for attempt in pending)
+                        if value is not None
+                    ]
+                    assumptions = [
+                        "leaderboard_current_closes_pending_local_active_cohort",
+                        "equal_share_confidence_weighted_fallback",
+                    ]
+                    if uncertainty_slots:
+                        assumptions.append("untracked_active_gap_reduces_confidence")
+                    attribution_details = {
+                        "cohort_alpha_ids": cohort_ids,
+                        "cohort_size": len(cohort_ids),
+                        "baseline_points": baseline,
+                        "observed_points": points_value,
+                        "delta": delta,
+                        "points_status": points_status,
+                        "active_alpha_gap": active_alpha_gap,
+                        "untracked_active_gap": uncertainty_slots,
+                        "first_active_at": min(active_times).isoformat() if active_times else None,
+                        "last_active_at": max(active_times).isoformat() if active_times else None,
+                        "settled_at": settled_at.isoformat(),
+                        "attribution_rule": "equal_share_confidence_weighted",
+                        "assumptions": assumptions,
+                    }
                     for attempt in pending:
                         attempt.score_state = "SETTLED"
                         attempt.attributed_points_share = attributed_share
                         attempt.attribution_confidence = attribution_confidence
+                        attempt.attribution_details = dict(attribution_details)
+                        attempt.settled_at = settled_at
                     state.last_settled_delta = delta
                     state.last_settled_submission_count = len(pending)
                     # Only auto-calibrate within the conservative 1..2 range and
