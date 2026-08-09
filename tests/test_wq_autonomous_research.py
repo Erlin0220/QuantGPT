@@ -73,6 +73,35 @@ def test_seed_plan_expands_curated_catalog_after_raw_seeds_are_exhausted():
     assert all(item["parent_expression"] in seeds for item in plan)
 
 
+def test_seed_plan_skips_fields_brain_reported_as_unknown():
+    memory = {
+        "family_counts": {family: 50 for family in autonomous.FAMILY_SEEDS},
+        "recent_trials": [
+            {
+                "family": "fundamental_quality",
+                "status": "simulation_failed",
+                "mutation_targets": [
+                    'simulation_failed:WQ simulation failed: Attempted to use unknown variable "mdf_quality".'
+                ],
+            },
+            {
+                "family": "fundamental_quality",
+                "status": "simulation_failed",
+                "mutation_targets": [
+                    'simulation_failed:WQ simulation failed: Attempted to use unknown variable "mdf_bp".'
+                ],
+            },
+        ],
+    }
+    memory["family_counts"]["fundamental_quality"] = 0
+
+    plan = autonomous.build_seed_plan(memory, limit=4, family_count=1)
+
+    assert plan
+    assert all("mdf_quality" not in item["expression"] for item in plan)
+    assert all("mdf_bp" not in item["expression"] for item in plan)
+
+
 def test_memory_mutation_plan_reuses_recent_failure_across_runs():
     parent = "rank(ts_mean(returns, 10))"
     memory = {

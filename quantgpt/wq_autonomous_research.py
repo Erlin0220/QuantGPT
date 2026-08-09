@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections import Counter
 from typing import Any, Callable
 
@@ -107,6 +108,23 @@ def select_research_families(memory: dict[str, Any] | None = None, count: int = 
     return ordered[: max(1, min(len(ordered), int(count)))]
 
 
+def _unknown_fields_from_memory(memory: dict[str, Any]) -> set[str]:
+    """Learn account-specific unsupported BRAIN fields from prior remote errors."""
+    unknown: set[str] = set()
+    pattern = re.compile(r'unknown variable ["\']([^"\']+)["\']', re.IGNORECASE)
+    for trial in memory.get("recent_trials") or []:
+        for target in trial.get("mutation_targets") or []:
+            match = pattern.search(str(target))
+            if match:
+                unknown.add(match.group(1).strip().lower())
+    return unknown
+
+
+def _uses_unknown_field(expression: str, unknown_fields: set[str]) -> bool:
+    normalized = normalize_wq_expression(expression)
+    return any(re.search(rf"(?<![a-z0-9_]){re.escape(field)}(?![a-z0-9_])", normalized) for field in unknown_fields)
+
+
 def _seed_meta(
     expression: str,
     family: str,
@@ -168,6 +186,7 @@ def build_seed_plan(
     """Round-robin low-coverage families while excluding already researched expressions."""
     memory = memory or {}
     seen = set(memory.get("normalized_expressions") or [])
+    unknown_fields = _unknown_fields_from_memory(memory)
     families = select_research_families(memory, family_count)
     plan: list[dict[str, Any]] = []
     offsets = Counter()
@@ -181,7 +200,7 @@ def build_seed_plan(
                 item = pool[offsets[family]]
                 offsets[family] += 1
                 normalized = normalize_wq_expression(item["expression"])
-                if normalized in seen:
+                if normalized in seen or _uses_unknown_field(item["expression"], unknown_fields):
                     continue
                 seen.add(normalized)
                 plan.append(item)
