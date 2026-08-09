@@ -59,12 +59,45 @@ FAMILY_SEEDS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _safe_metric(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _trial_promise_score(
+    item: dict[str, Any],
+    *,
+    min_sharpe: float = 1.25,
+    min_fitness: float = 1.0,
+) -> float:
+    """Score how close a failed trial is to being useful without rewarding raw parameter chasing."""
+    sharpe = _safe_metric(item.get("sharpe"))
+    fitness = _safe_metric(item.get("fitness"))
+    turnover = _safe_metric(item.get("turnover"))
+    sharpe_progress = max(0.0, min(1.5, sharpe / max(0.01, min_sharpe)))
+    fitness_progress = max(0.0, min(1.5, fitness / max(0.01, min_fitness)))
+    score = sharpe_progress * 0.55 + fitness_progress * 0.45
+    if turnover and not 0.01 <= turnover <= 0.7:
+        score -= 0.25
+    if item.get("self_correlation_failed"):
+        score -= 0.5
+    return score
+
+
 def _family_priority(memory: dict[str, Any], family: str) -> tuple[float, str]:
     trials = float((memory.get("family_counts") or {}).get(family, 0))
     candidates = float((memory.get("candidate_family_counts") or {}).get(family, 0))
     self_corr = float((memory.get("self_correlation_family_counts") or {}).get(family, 0))
-    # Explore under-covered families, reward demonstrated candidate yield, penalize self-correlation clusters.
-    score = trials - candidates * 2.0 + self_corr * 2.5
+    recent = [item for item in (memory.get("recent_trials") or []) if item.get("family") == family]
+    top_promises = sorted((_trial_promise_score(item) for item in recent), reverse=True)[:3]
+    promise = sum(top_promises) / len(top_promises) if top_promises else 0.0
+    candidate_rate = candidates / max(1.0, trials)
+    self_corr_rate = self_corr / max(1.0, trials)
+    # Lower is better: retain exploration pressure while exploiting families that
+    # have produced candidates or several near-threshold trials.
+    score = math.log1p(trials) - candidate_rate * 8.0 - promise * 1.5 + self_corr_rate * 4.0
     return score, family
 
 
@@ -74,15 +107,54 @@ def select_research_families(memory: dict[str, Any] | None = None, count: int = 
     return ordered[: max(1, min(len(ordered), int(count)))]
 
 
-def _seed_meta(expression: str, family: str, generation: int, hypothesis: str) -> dict[str, Any]:
+def _seed_meta(
+    expression: str,
+    family: str,
+    generation: int,
+    hypothesis: str,
+    *,
+    parent_expression: str | None = None,
+    mutation_type: str = "seed",
+) -> dict[str, Any]:
     return {
         "expression": expression,
         "family": family,
         "generation": generation,
         "hypothesis": hypothesis,
-        "parent_expression": None,
-        "mutation_type": "seed",
+        "parent_expression": parent_expression,
+        "mutation_type": mutation_type,
     }
+
+
+def _seed_expansion_variants(expression: str) -> list[tuple[str, str]]:
+    """Create a small structural fallback pool after the curated seed catalog is exhausted."""
+    variants: list[tuple[str, str]] = []
+    widened = _widen_windows(expression)
+    narrowed = _narrow_windows(expression)
+    if normalize_wq_expression(widened) != normalize_wq_expression(expression):
+        variants.append((widened, "seed_widen_windows"))
+    if normalize_wq_expression(narrowed) != normalize_wq_expression(expression):
+        variants.append((narrowed, "seed_narrow_windows"))
+    variants.append((f"rank(ts_mean(({expression}), 10))", "seed_smooth_signal"))
+    return variants
+
+
+def _family_seed_pool(family: str, generation: int, hypothesis: str) -> list[dict[str, Any]]:
+    seeds = FAMILY_SEEDS[family]
+    pool = [_seed_meta(expression, family, generation, hypothesis) for expression in seeds]
+    for expression in seeds:
+        for variant, mutation_type in _seed_expansion_variants(expression):
+            pool.append(
+                _seed_meta(
+                    variant,
+                    family,
+                    generation,
+                    hypothesis,
+                    parent_expression=expression,
+                    mutation_type=mutation_type,
+                )
+            )
+    return pool
 
 
 def build_seed_plan(
@@ -99,19 +171,20 @@ def build_seed_plan(
     families = select_research_families(memory, family_count)
     plan: list[dict[str, Any]] = []
     offsets = Counter()
+    pools = {family: _family_seed_pool(family, generation, hypothesis) for family in families}
 
     while len(plan) < max(1, int(limit)):
         added = False
         for family in families:
-            seeds = FAMILY_SEEDS[family]
-            while offsets[family] < len(seeds):
-                expression = seeds[offsets[family]]
+            pool = pools[family]
+            while offsets[family] < len(pool):
+                item = pool[offsets[family]]
                 offsets[family] += 1
-                normalized = normalize_wq_expression(expression)
+                normalized = normalize_wq_expression(item["expression"])
                 if normalized in seen:
                     continue
                 seen.add(normalized)
-                plan.append(_seed_meta(expression, family, generation, hypothesis))
+                plan.append(item)
                 added = True
                 break
             if len(plan) >= limit:
@@ -154,6 +227,8 @@ def build_targeted_mutations(
     family = str(meta.get("family") or classify_wq_family(expression))
     generation = int(meta.get("generation") or 1) + 1
     targets = list(result.get("mutation_targets") or [])
+    metrics = result.get("is_metrics") or {}
+    sharpe = _safe_metric(metrics.get("sharpe"))
     variants: list[tuple[str, str]] = []
 
     if "reduce_turnover" in targets or "improve_sub_universe_robustness" in targets:
@@ -163,7 +238,11 @@ def build_targeted_mutations(
     if "reduce_weight_concentration" in targets and not expression.lstrip().startswith("rank("):
         variants.append((f"rank({expression})", "cross_sectional_rank"))
     if "improve_signal_sharpe" in targets or "improve_fitness" in targets:
-        variants.append((f"-1 * ({expression})", "invert_signal"))
+        # A positive-but-insufficient signal should not waste a simulation on a
+        # deterministic sign flip that is likely to make Sharpe negative. Smooth
+        # it first; only invert genuinely negative signals.
+        if sharpe < 0:
+            variants.append((f"-1 * ({expression})", "invert_signal"))
         variants.append((f"rank(ts_mean(({expression}), 10))", "smooth_signal"))
 
     out: list[dict[str, Any]] = []
@@ -193,6 +272,9 @@ def build_memory_mutation_plan(
     seen: set[str],
     limit: int,
     hypothesis: str = "",
+    min_sharpe: float = 1.25,
+    min_fitness: float = 1.0,
+    min_parent_promise: float = 0.55,
 ) -> list[dict[str, Any]]:
     """Reuse recent failed trials as parents across autonomous runs.
 
@@ -205,10 +287,7 @@ def build_memory_mutation_plan(
     memory = memory or {}
     recent = list(memory.get("recent_trials") or [])
     recent.sort(
-        key=lambda item: (
-            float(item.get("fitness") or -999.0),
-            float(item.get("sharpe") or -999.0),
-        ),
+        key=lambda item: _trial_promise_score(item, min_sharpe=min_sharpe, min_fitness=min_fitness),
         reverse=True,
     )
 
@@ -220,8 +299,17 @@ def build_memory_mutation_plan(
         targets = list(trial.get("mutation_targets") or [])
         if not targets or targets == ["candidate_passes_primary_thresholds"]:
             continue
+        promise = _trial_promise_score(trial, min_sharpe=min_sharpe, min_fitness=min_fitness)
+        if promise < min_parent_promise:
+            continue
         synthetic = {
             "expression": trial.get("expression"),
+            "is_metrics": {
+                "sharpe": trial.get("sharpe"),
+                "fitness": trial.get("fitness"),
+                "returns": trial.get("returns"),
+                "turnover": trial.get("turnover"),
+            },
             "mutation_targets": targets,
             "research_meta": {
                 "family": trial.get("family") or classify_wq_family(str(trial.get("expression") or "")),
@@ -238,6 +326,33 @@ def build_memory_mutation_plan(
         plan.extend(variants)
         if len(plan) >= limit:
             break
+    return plan
+
+
+def _build_next_generation_plan(
+    ranked: list[dict[str, Any]],
+    *,
+    seen: set[str],
+    limit: int,
+    hypothesis: str,
+) -> list[dict[str, Any]]:
+    """Allocate one child per promising parent before giving any parent a second child."""
+    if limit <= 0:
+        return []
+    plan: list[dict[str, Any]] = []
+    for per_parent_limit in (1, 2):
+        for item in ranked:
+            mutations = build_targeted_mutations(
+                item,
+                seen=seen,
+                limit=per_parent_limit,
+                hypothesis=hypothesis,
+            )
+            for mutation in mutations:
+                if mutation not in plan:
+                    plan.append(mutation)
+                    if len(plan) >= limit:
+                        return plan
     return plan
 
 
@@ -313,6 +428,8 @@ def run_autonomous_research(
         seen=seen,
         limit=memory_parent_budget,
         hypothesis=goal,
+        min_sharpe=min_sharpe,
+        min_fitness=min_fitness,
     )
     seed_memory = dict(memory)
     seed_memory["normalized_expressions"] = sorted(seen)
@@ -333,6 +450,8 @@ def run_autonomous_research(
                 seen=seen,
                 limit=first_budget - len(memory_plan) - len(seed_plan),
                 hypothesis=goal,
+                min_sharpe=min_sharpe,
+                min_fitness=min_fitness,
             )
         )
     first_plan = seed_plan + memory_plan
@@ -391,18 +510,13 @@ def run_autonomous_research(
         if generation_index >= generations or remaining <= 0:
             break
 
-        next_plan: list[dict[str, Any]] = []
         ranked = sorted(batch.get("results") or [], key=_rank_result, reverse=True)
-        for item in ranked:
-            mutations = build_targeted_mutations(
-                item,
-                seen=seen,
-                limit=min(2, remaining - len(next_plan)),
-                hypothesis=goal,
-            )
-            next_plan.extend(mutations)
-            if len(next_plan) >= remaining:
-                break
+        next_plan = _build_next_generation_plan(
+            ranked,
+            seen=seen,
+            limit=remaining,
+            hypothesis=goal,
+        )
 
         # SELF_CORRELATION needs orthogonal information, not another nearby lookback.
         self_corr_present = any("reduce_self_correlation" in (item.get("mutation_targets") or []) for item in ranked)
