@@ -136,6 +136,22 @@ def _migrate_add_columns(connection):
         "ALTER TABLE wq_research_trials ADD COLUMN dataset_id VARCHAR(100)",
     )
     _add_column_if_missing(
+        connection, inspector, "wq_research_trials", "failure_stage",
+        "ALTER TABLE wq_research_trials ADD COLUMN failure_stage VARCHAR(30)",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_trials", "failure_reason",
+        "ALTER TABLE wq_research_trials ADD COLUMN failure_reason VARCHAR(60)",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_trials", "failure_reasons",
+        "ALTER TABLE wq_research_trials ADD COLUMN failure_reasons JSON",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_trials", "failure_evidence",
+        "ALTER TABLE wq_research_trials ADD COLUMN failure_evidence JSON",
+    )
+    _add_column_if_missing(
         connection, inspector, "wq_submission_attempts", "attributed_points_share",
         "ALTER TABLE wq_submission_attempts ADD COLUMN attributed_points_share FLOAT",
     )

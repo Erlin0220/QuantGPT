@@ -20,7 +20,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from sqlalchemy import func, select
 
 from .db import _get_session_factory
-from .models import WQResearchCandidate, WQSubmissionAttempt, WQSubmissionState
+from .models import WQResearchCandidate, WQResearchTrial, WQSubmissionAttempt, WQSubmissionState
+from .wq_failure_taxonomy import classify_research_failure
 
 _DEFAULT_DAILY_BUDGET = 2
 _MAX_CONFIGURED_BUDGET = 5
@@ -556,6 +557,27 @@ async def finalize_submission_attempt(account: str, alpha_id: str, result: dict[
                 candidate.status = "sc_fail"
             else:
                 candidate.status = "submit_failed"
+
+        if final_status in {"SC_FAIL", "OTHER_FAIL"}:
+            trial_result = await session.execute(
+                select(WQResearchTrial)
+                .where(
+                    WQResearchTrial.account == account,
+                    WQResearchTrial.alpha_id == alpha_id,
+                )
+                .order_by(WQResearchTrial.created_at.desc())
+                .limit(1)
+            )
+            trial = trial_result.scalar_one_or_none()
+            if trial is not None:
+                diagnostic = classify_research_failure(
+                    {"final_status": final_status, "error": attempt.detail},
+                    status="rejected",
+                )
+                trial.failure_stage = diagnostic["failure_stage"]
+                trial.failure_reason = diagnostic["failure_reason"]
+                trial.failure_reasons = list(diagnostic["failure_reasons"] or [])
+                trial.failure_evidence = diagnostic["failure_evidence"]
 
         await session.commit()
 

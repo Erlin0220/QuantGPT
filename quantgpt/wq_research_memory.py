@@ -10,6 +10,7 @@ from sqlalchemy import select
 
 from .db import _get_session_factory
 from .models import WQResearchCandidate, WQResearchTrial, WQSubmissionAttempt
+from .wq_failure_taxonomy import classify_research_failure
 from .wq_operator_registry import canonicalize_wq_expression
 
 
@@ -111,6 +112,7 @@ def _trial_from_item(
     if mutation_targets is None and status in {"invalid", "simulation_failed"}:
         error = str(item.get("error") or "").strip()
         mutation_targets = [f"{status}:{error}"] if error else [status]
+    diagnostics = classify_research_failure(item, status=status)
 
     return WQResearchTrial(
         account=account,
@@ -128,6 +130,10 @@ def _trial_from_item(
         returns=_safe_float(metrics.get("returns")),
         turnover=_safe_float(metrics.get("turnover")),
         self_correlation_failed=_self_correlation_failed(item),
+        failure_stage=diagnostics["failure_stage"],
+        failure_reason=diagnostics["failure_reason"],
+        failure_reasons=list(diagnostics["failure_reasons"] or []),
+        failure_evidence=diagnostics["failure_evidence"],
         mutation_targets=list(mutation_targets or []),
         settings=dict(item.get("settings") or settings or {}),
         data_fields=list(meta.get("data_fields") or []),
@@ -233,6 +239,16 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
     self_corr_family_counts = Counter(
         str(row.family or "unknown") for row in rows if bool(row.self_correlation_failed)
     )
+    failure_stage_counts = Counter(str(row.failure_stage) for row in rows if row.failure_stage)
+    failure_reason_counts = Counter(str(row.failure_reason) for row in rows if row.failure_reason)
+    failure_reason_family_counts: dict[str, Counter[str]] = {}
+    failure_reason_dataset_counts: dict[str, Counter[str]] = {}
+    for row in rows:
+        if not row.failure_reason:
+            continue
+        reason = str(row.failure_reason)
+        failure_reason_family_counts.setdefault(reason, Counter())[str(row.family or "unknown")] += 1
+        failure_reason_dataset_counts.setdefault(reason, Counter())[str(row.dataset_id or "unknown")] += 1
     normalized = {str(row.expression_normalized or "") for row in rows if row.expression_normalized}
     family_points_attribution: Counter[str] = Counter()
     family_points_feedback: Counter[str] = Counter()
@@ -263,6 +279,10 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
             "returns": row.returns,
             "turnover": row.turnover,
             "self_correlation_failed": bool(row.self_correlation_failed),
+            "failure_stage": row.failure_stage,
+            "failure_reason": row.failure_reason,
+            "failure_reasons": list(row.failure_reasons or []),
+            "failure_evidence": row.failure_evidence,
             "mutation_targets": list(row.mutation_targets or []),
             "data_fields": list(row.data_fields or []),
             "dataset_id": row.dataset_id,
@@ -277,6 +297,14 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
         "candidate_family_counts": dict(candidate_family_counts),
         "self_correlation_family_counts": dict(self_corr_family_counts),
         "status_counts": dict(status_counts),
+        "failure_stage_counts": dict(failure_stage_counts),
+        "failure_reason_counts": dict(failure_reason_counts),
+        "failure_reason_family_counts": {
+            reason: dict(counts) for reason, counts in failure_reason_family_counts.items()
+        },
+        "failure_reason_dataset_counts": {
+            reason: dict(counts) for reason, counts in failure_reason_dataset_counts.items()
+        },
         "family_points_attribution": dict(family_points_attribution),
         "family_points_feedback": dict(family_points_feedback),
         "dataset_points_attribution": dict(dataset_points_attribution),
