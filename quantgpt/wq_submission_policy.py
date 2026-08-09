@@ -21,9 +21,11 @@ from sqlalchemy import func, select
 
 from .db import _get_session_factory
 from .models import WQResearchCandidate, WQResearchTrial, WQSubmissionAttempt, WQSubmissionState
+from .wq_candidate_calibration import calibrate_active_probability, calibration_report
 from .wq_correlation_proxy import correlation_priority_multiplier
 from .wq_failure_taxonomy import classify_research_failure
 from .wq_lineage import lineage_id_for, parent_lineage_id_for, recover_research_metadata
+from .wq_research_scheduler import research_cell_key
 
 _DEFAULT_DAILY_BUDGET = 2
 _MAX_CONFIGURED_BUDGET = 5
@@ -175,15 +177,21 @@ async def _load_conversion_feedback(session, account: str) -> dict[str, Any]:
     )
     family_counts: dict[str, list[int]] = {}
     dataset_counts: dict[str, list[int]] = {}
+    cell_counts: dict[str, list[int]] = {}
+    resolved_predictions: list[tuple[float, bool]] = []
     for attempt, candidate in grouped_result.all():
         is_positive = int(str(attempt.status or "").upper() in _TERMINAL_POSITIVE_STATUSES)
+        cell_key = research_cell_key(candidate)
         for mapping, key in (
             (family_counts, str(candidate.family or "unknown")),
             (dataset_counts, str(candidate.dataset_id or "unknown")),
+            (cell_counts, cell_key),
         ):
             values = mapping.setdefault(key, [0, 0])
             values[0] += is_positive
             values[1] += 1
+        if candidate.active_probability is not None:
+            resolved_predictions.append((float(candidate.active_probability), bool(is_positive)))
 
     def summarize(mapping: dict[str, list[int]]) -> dict[str, dict[str, Any]]:
         return {
@@ -203,6 +211,8 @@ async def _load_conversion_feedback(session, account: str) -> dict[str, Any]:
         "global": {"rate": round(global_rate, 4), "samples": samples, "active": positive, "failed": samples - positive},
         "family": summarize(family_counts),
         "dataset": summarize(dataset_counts),
+        "cell": summarize(cell_counts),
+        "calibration": calibration_report(resolved_predictions),
         "smoothing": {"global_prior": "beta(2,2)", "group_prior_strength": _CONVERSION_GROUP_PRIOR_STRENGTH},
     }
 
@@ -232,6 +242,7 @@ async def record_research_candidates(
     factory = _get_session_factory()
     saved = 0
     async with factory() as session:
+        conversion_feedback = await _load_conversion_feedback(session, account)
         for candidate in candidates:
             alpha_id = str(candidate.get("alpha_id") or "").strip()
             expression = str(candidate.get("expression") or "").strip()
@@ -290,7 +301,10 @@ async def record_research_candidates(
             )
             novelty_score = _novelty_score(expression, [str(value) for value in peer_result.scalars().all() if value])
             candidate["novelty_score"] = novelty_score
-            priority_score = _priority_score(candidate)
+            candidate["research_meta"] = meta
+            calibration = calibrate_active_probability(candidate, conversion_feedback)
+            active_probability = float(calibration["probability"])
+            priority_score = _priority_score(candidate) * (0.75 + active_probability * 0.5)
             structure_signature = str(meta.get("structure_signature") or _structure_signature(expression))
             lineage_id = str(meta.get("lineage_id") or "") or lineage_id_for(expression, settings=settings, metadata=meta)
             parent_lineage_id = str(meta.get("parent_lineage_id") or "") or parent_lineage_id_for(
@@ -310,6 +324,11 @@ async def record_research_candidates(
                 "returns": metrics.get("returns"),
                 "turnover": metrics.get("turnover"),
                 "priority_score": priority_score,
+                "active_probability": active_probability,
+                "confidence_tier": calibration["tier"],
+                "probability_support": int(calibration["support"]),
+                "probability_provenance": str(calibration["provenance"]),
+                "calibration_details": calibration,
                 "family": meta.get("family"),
                 "hypothesis": meta.get("hypothesis"),
                 "parent_expression": meta.get("parent_expression"),
@@ -811,6 +830,11 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
                 "sharpe": item.sharpe,
                 "turnover": item.turnover,
                 "priority_score": item.priority_score,
+                "active_probability": item.active_probability,
+                "confidence_tier": item.confidence_tier,
+                "probability_support": int(item.probability_support or 0),
+                "probability_provenance": item.probability_provenance,
+                "calibration_details": item.calibration_details,
                 "family": item.family,
                 "generation": item.generation,
                 "mutation_type": item.mutation_type,

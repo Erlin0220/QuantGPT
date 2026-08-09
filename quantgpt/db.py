@@ -144,6 +144,26 @@ def _migrate_add_columns(connection):
         "ALTER TABLE wq_research_candidates ADD COLUMN local_correlation_at DATETIME",
     )
     _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "active_probability",
+        "ALTER TABLE wq_research_candidates ADD COLUMN active_probability FLOAT",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "confidence_tier",
+        "ALTER TABLE wq_research_candidates ADD COLUMN confidence_tier VARCHAR(1)",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "probability_support",
+        "ALTER TABLE wq_research_candidates ADD COLUMN probability_support INTEGER DEFAULT 0 NOT NULL",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "probability_provenance",
+        "ALTER TABLE wq_research_candidates ADD COLUMN probability_provenance VARCHAR(200)",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "calibration_details",
+        "ALTER TABLE wq_research_candidates ADD COLUMN calibration_details JSON",
+    )
+    _add_column_if_missing(
         connection, inspector, "wq_research_trials", "data_fields",
         "ALTER TABLE wq_research_trials ADD COLUMN data_fields JSON",
     )

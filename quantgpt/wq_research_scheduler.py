@@ -84,10 +84,13 @@ def summarize_research_cells(
             candidate_by_alpha[alpha_id] = candidate
         cell = ensure(candidate)
         ready = str(_get(candidate, "validation_status") or "").lower() == "ready"
+        tier = str(_get(candidate, "confidence_tier") or "").upper()
         robustness = float(_get(candidate, "robustness_score") or 0.0)
         sharpe = float(_get(candidate, "sharpe") or 0.0)
         fitness = float(_get(candidate, "fitness") or 0.0)
-        if ready and robustness >= 0.5 and sharpe >= 1.25 and fitness >= 1.0:
+        calibrated_high_confidence = tier in {"S", "A"}
+        legacy_high_confidence = not tier and robustness >= 0.5 and sharpe >= 1.25 and fitness >= 1.0
+        if ready and (calibrated_high_confidence or legacy_high_confidence):
             cell["high_confidence_candidates"] += 1
 
     terminal_failures = {"SC_FAIL", "OTHER_FAIL"}
