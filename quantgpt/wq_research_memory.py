@@ -391,12 +391,48 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
 
     research_cells = summarize_research_cells(rows, candidate_rows, formal_rows)
     overfitting_rows = []
+    local_correlation_available = 0
+    local_correlation_high_risk = 0
     for candidate in candidate_rows:
+        if candidate.local_correlation is not None:
+            local_correlation_available += 1
+            if float(candidate.local_correlation) >= 0.70:
+                local_correlation_high_risk += 1
         details = candidate.validation_details if isinstance(candidate.validation_details, dict) else {}
         evidence = details.get("overfitting_evidence") if isinstance(details, dict) else None
         if isinstance(evidence, dict):
             overfitting_rows.append({"alpha_id": candidate.alpha_id, **evidence})
     overfitting_available = [item for item in overfitting_rows if item.get("status") == "available"]
+    formal_attempts = len(formal_rows)
+    active_attempts = sum(1 for attempt, _candidate in formal_rows if str(attempt.status or "").upper() == "ACTIVE")
+    settled_active = sum(
+        1
+        for attempt, _candidate in formal_rows
+        if str(attempt.status or "").upper() == "ACTIVE" and str(attempt.score_state or "").upper() == "SETTLED"
+    )
+    trial_candidates = sum(1 for row in rows if str(row.status or "").lower() == "candidate")
+    high_confidence_candidates = sum(
+        1
+        for candidate in candidate_rows
+        if str(candidate.confidence_tier or "B").upper() in {"S", "A"}
+        and str(candidate.status or "").lower() == "queued"
+        and str(candidate.validation_status or "").lower() == "ready"
+    )
+
+    def conversion(numerator: int, denominator: int) -> dict[str, Any]:
+        return {
+            "count": numerator,
+            "denominator": denominator,
+            "rate": round(numerator / denominator, 4) if denominator > 0 else None,
+        }
+
+    learning_funnel = {
+        "trial_to_candidate": conversion(trial_candidates, len(rows)),
+        "candidate_to_high_confidence": conversion(high_confidence_candidates, len(candidate_rows)),
+        "candidate_to_submit": conversion(formal_attempts, len(candidate_rows)),
+        "submit_to_active": conversion(active_attempts, formal_attempts),
+        "active_to_points_settled": conversion(settled_active, active_attempts),
+    }
     funnel_summary_all = summarize_funnel(funnel_events)
     funnel_summary_recent = summarize_funnel(funnel_events[:500])
     family_counts = Counter(str(row.family or "unknown") for row in rows)
@@ -567,6 +603,13 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
         },
         "metadata_completeness": metadata_completeness,
         "research_cells": research_cells,
+        "learning_funnel": learning_funnel,
+        "local_correlation_risk": {
+            "available": local_correlation_available,
+            "high_risk": local_correlation_high_risk,
+            "high_risk_threshold": 0.70,
+            "official_platform_check": False,
+        },
         "overfitting_evidence": {
             "available": len(overfitting_available),
             "unavailable": len(overfitting_rows) - len(overfitting_available),

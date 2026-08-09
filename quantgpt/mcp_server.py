@@ -1160,8 +1160,9 @@ def _run_wq_research_mcp_task(task_id: str, params: dict) -> dict:
 
 def _run_wq_autonomous_research_mcp_task(task_id: str, params: dict) -> dict:
     from .wq_brain_client import get_client
+    from .wq_control_tower import build_research_control_tower
     from .wq_research_memory import load_research_memory_sync, record_research_trials_sync
-    from .wq_submission_policy import record_research_candidates_sync
+    from .wq_submission_policy import _run_coro_sync, get_submission_policy_status, record_research_candidates_sync
 
     client = get_client("primary")
     try:
@@ -1177,6 +1178,10 @@ def _run_wq_autonomous_research_mcp_task(task_id: str, params: dict) -> dict:
             persist=True,
         )
         memory = load_research_memory_sync("primary")
+        submission_policy = _run_coro_sync(get_submission_policy_status("primary"))
+        memory["inventory"] = submission_policy.get("inventory") or {}
+        memory["submission"] = submission_policy
+        memory["research_learning"] = build_research_control_tower(memory, submission_policy)
 
         def on_progress(current: int, total: int, stage: str) -> None:
             pct = int(current * 100 / total) if total else 0
@@ -1729,17 +1734,34 @@ async def wq_brain_account_status(account: str = "primary") -> str:
                 "active_task": active_summary,
                 "stale_after_seconds": _WQ_RESEARCH_STALE_SECONDS,
             }
+            from .wq_control_tower import build_research_control_tower
             from .wq_research_memory import load_research_memory
 
             memory = await load_research_memory(account, limit=2000)
+            result["research_learning"] = build_research_control_tower(
+                memory,
+                result.get("submission_policy") or {},
+            )
             result["research_memory"] = {
                 "trials": memory.get("trials", 0),
                 "family_counts": memory.get("family_counts", {}),
                 "candidate_family_counts": memory.get("candidate_family_counts", {}),
                 "self_correlation_family_counts": memory.get("self_correlation_family_counts", {}),
                 "status_counts": memory.get("status_counts", {}),
+                "failure_stage_counts": memory.get("failure_stage_counts", {}),
+                "failure_reason_counts": memory.get("failure_reason_counts", {}),
+                "metadata_completeness": memory.get("metadata_completeness", {}),
+                "candidate_funnel": memory.get("candidate_funnel", {}),
+                "learning_funnel": memory.get("learning_funnel", {}),
+                "research_cells": memory.get("research_cells", []),
+                "local_correlation_risk": memory.get("local_correlation_risk", {}),
+                "overfitting_evidence": memory.get("overfitting_evidence", {}),
+                "active_conversion": memory.get("active_conversion", {}),
                 "family_points_feedback": memory.get("family_points_feedback", {}),
                 "dataset_points_feedback": memory.get("dataset_points_feedback", {}),
+                "operator_points_feedback": memory.get("operator_points_feedback", {}),
+                "points_feedback_coverage": memory.get("points_feedback_coverage", {}),
+                "points_feedback_gate": memory.get("points_feedback_gate", {}),
                 "points_attribution_rule": memory.get("points_attribution_rule"),
             }
         except Exception as exc:
