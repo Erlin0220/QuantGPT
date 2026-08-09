@@ -81,6 +81,7 @@ class WQBrainClient:
         self._operators_cache: list[dict] | None = None
         self._data_fields_cache: dict[tuple, list[dict]] = {}
         self._datasets_cache: dict[tuple, list[dict]] = {}
+        self._alpha_pnl_cache: dict[str, dict] = {}
 
     def _get_session(self) -> requests.Session:
         if self._session is None:
@@ -113,6 +114,7 @@ class WQBrainClient:
             child._operators_cache = list(self._operators_cache)
         child._data_fields_cache = {key: list(value) for key, value in self._data_fields_cache.items()}
         child._datasets_cache = {key: list(value) for key, value in self._datasets_cache.items()}
+        child._alpha_pnl_cache = {key: dict(value) for key, value in self._alpha_pnl_cache.items()}
         return child
 
     def authenticate(self, _max_retries: int = 5) -> bool:
@@ -611,6 +613,35 @@ class WQBrainClient:
             "is": data.get("is", {}),
             "checks": data.get("checks", {}),
         }
+
+    def fetch_alpha_pnl(self, alpha_id: str, *, refresh: bool = False) -> dict:
+        """Fetch cumulative Alpha PnL for a local, non-official diversity proxy."""
+        key = str(alpha_id or "").strip()
+        if not key:
+            return {}
+        if key in self._alpha_pnl_cache and not refresh:
+            return dict(self._alpha_pnl_cache[key])
+        try:
+            response = self._get_session().get(
+                f"{API_BASE}/alphas/{key}/recordsets/pnl",
+                timeout=HTTP_TIMEOUT,
+            )
+        except (requests.ConnectionError, requests.Timeout):
+            return {}
+        if response.status_code != 200:
+            return {}
+        try:
+            payload = response.json()
+        except Exception:
+            return {}
+        if isinstance(payload, dict):
+            self._alpha_pnl_cache[key] = dict(payload)
+            return dict(payload)
+        if isinstance(payload, list):
+            wrapped = {"records": payload}
+            self._alpha_pnl_cache[key] = wrapped
+            return dict(wrapped)
+        return {}
 
     def submit_alpha(self, alpha_id: str) -> dict:
         s = self._get_session()

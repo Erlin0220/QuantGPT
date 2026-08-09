@@ -21,6 +21,7 @@ from sqlalchemy import func, select
 
 from .db import _get_session_factory
 from .models import WQResearchCandidate, WQResearchTrial, WQSubmissionAttempt, WQSubmissionState
+from .wq_correlation_proxy import correlation_priority_multiplier
 from .wq_failure_taxonomy import classify_research_failure
 from .wq_lineage import lineage_id_for, parent_lineage_id_for, recover_research_metadata
 
@@ -120,7 +121,7 @@ def _priority_score(candidate: dict[str, Any]) -> float:
         novelty = float(candidate.get("novelty_score") or 0.0)
     except (TypeError, ValueError):
         novelty = 0.0
-    return (
+    score = (
         number("fitness") * 100.0
         + number("sharpe") * 20.0
         + number("returns") * 50.0
@@ -130,6 +131,7 @@ def _priority_score(candidate: dict[str, Any]) -> float:
         - turnover_penalty
         - complexity_penalty
     )
+    return score * correlation_priority_multiplier(candidate.get("local_correlation_proxy"))
 
 
 async def _get_or_create_state(session, account: str) -> WQSubmissionState:
@@ -189,6 +191,23 @@ async def record_research_candidates(
             except (TypeError, ValueError):
                 self_correlation = None
             sc_status = str((sc_check or {}).get("result") or "").upper() or None
+            raw_local_correlation = candidate.get("local_correlation_proxy") or validation.get("local_correlation_proxy") or {}
+            local_proxy = raw_local_correlation if isinstance(raw_local_correlation, dict) else {}
+            try:
+                local_correlation = float(local_proxy.get("max_correlation"))
+            except (TypeError, ValueError):
+                local_correlation = None
+            local_correlation_alpha_id = str(local_proxy.get("matching_alpha_id") or "") or None
+            try:
+                local_correlation_samples = int(local_proxy.get("sample_length") or 0)
+            except (TypeError, ValueError):
+                local_correlation_samples = 0
+            local_correlation_at = None
+            if local_proxy.get("calculated_at"):
+                try:
+                    local_correlation_at = datetime.fromisoformat(str(local_proxy["calculated_at"]).replace("Z", "+00:00"))
+                except (TypeError, ValueError):
+                    local_correlation_at = None
             peer_result = await session.execute(
                 select(WQResearchCandidate.expression).where(
                     WQResearchCandidate.account == account,
@@ -239,6 +258,10 @@ async def record_research_candidates(
                 "novelty_score": novelty_score,
                 "self_correlation": self_correlation,
                 "sc_status": sc_status,
+                "local_correlation": local_correlation,
+                "local_correlation_alpha_id": local_correlation_alpha_id,
+                "local_correlation_samples": local_correlation_samples or None,
+                "local_correlation_at": local_correlation_at,
                 "validation_details": dict(validation),
                 "tag": tag,
             }
@@ -723,6 +746,14 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
                 "novelty_score": item.novelty_score,
                 "self_correlation": item.self_correlation,
                 "sc_status": item.sc_status,
+                "local_correlation_proxy": {
+                    "status": "available" if item.local_correlation is not None else "unavailable",
+                    "max_correlation": item.local_correlation,
+                    "matching_alpha_id": item.local_correlation_alpha_id,
+                    "sample_length": item.local_correlation_samples or 0,
+                    "calculated_at": item.local_correlation_at.isoformat() if item.local_correlation_at else None,
+                    "official_sc": False,
+                },
                 "data_fields": list(item.data_fields or []),
                 "dataset_id": item.dataset_id,
                 "tag": item.tag,

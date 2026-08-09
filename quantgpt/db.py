@@ -128,6 +128,22 @@ def _migrate_add_columns(connection):
         "ALTER TABLE wq_research_candidates ADD COLUMN sc_status VARCHAR(20)",
     )
     _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "local_correlation",
+        "ALTER TABLE wq_research_candidates ADD COLUMN local_correlation FLOAT",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "local_correlation_alpha_id",
+        "ALTER TABLE wq_research_candidates ADD COLUMN local_correlation_alpha_id VARCHAR(50)",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "local_correlation_samples",
+        "ALTER TABLE wq_research_candidates ADD COLUMN local_correlation_samples INTEGER",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "local_correlation_at",
+        "ALTER TABLE wq_research_candidates ADD COLUMN local_correlation_at DATETIME",
+    )
+    _add_column_if_missing(
         connection, inspector, "wq_research_trials", "data_fields",
         "ALTER TABLE wq_research_trials ADD COLUMN data_fields JSON",
     )

@@ -18,6 +18,7 @@ from .wq_brain_service import (
     run_list_alphas,
     run_single_simulation,
 )
+from .wq_correlation_proxy import daily_changes_from_pnl, portfolio_correlation_proxy
 from .wq_operator_registry import WQ_FALLBACK_OPERATORS, canonicalize_wq_expression, validate_wq_expression
 
 
@@ -84,6 +85,35 @@ def _rank_key(item: dict) -> tuple[float, float, float]:
         _safe_number(metrics.get("sharpe"), -999.0),
         _safe_number(metrics.get("returns"), -999.0),
     )
+
+
+def _attach_local_correlation_proxy(client, candidates: list[dict]) -> None:
+    """Attach non-blocking candidate-vs-ACTIVE daily PnL correlation evidence."""
+    if not candidates or not hasattr(client, "fetch_alpha_pnl"):
+        return
+    active_result = run_list_alphas(client, limit=100, status_filter="ACTIVE")
+    if not active_result.get("ok"):
+        return
+    active_changes: dict[str, dict[str, float]] = {}
+    for alpha in active_result.get("alphas") or []:
+        alpha_id = str(alpha.get("alpha_id") or alpha.get("id") or "").strip()
+        if not alpha_id:
+            continue
+        changes = daily_changes_from_pnl(client.fetch_alpha_pnl(alpha_id))
+        if changes:
+            active_changes[alpha_id] = changes
+    for candidate in candidates:
+        alpha_id = str(candidate.get("alpha_id") or "").strip()
+        if not alpha_id:
+            continue
+        evidence = portfolio_correlation_proxy(
+            daily_changes_from_pnl(client.fetch_alpha_pnl(alpha_id, refresh=True)),
+            active_changes,
+        )
+        candidate["local_correlation_proxy"] = evidence
+        validation = candidate.get("validation")
+        if isinstance(validation, dict):
+            validation["local_correlation_proxy"] = dict(evidence)
 
 
 def run_research_batch(
@@ -208,6 +238,7 @@ def run_research_batch(
 
     results.sort(key=_rank_key, reverse=True)
     candidates = [item for item in results if item.get("passes_primary_thresholds")]
+    _attach_local_correlation_proxy(client, candidates)
 
     sweeps: list[dict] = []
     if sweep_top_n > 0 and not cancelled:
