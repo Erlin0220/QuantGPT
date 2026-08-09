@@ -13,6 +13,7 @@ from .wq_mutation_policy import preferred_mutation_classes
 from .wq_operator_registry import validate_wq_expression
 from .wq_research_agent import run_research_batch
 from .wq_research_memory import classify_wq_family, normalize_wq_expression
+from .wq_research_scheduler import allocate_research_cells
 
 FAMILY_SEEDS: dict[str, tuple[str, ...]] = {
     "price_volume": (
@@ -110,8 +111,17 @@ def _family_priority(memory: dict[str, Any], family: str) -> tuple[float, str]:
 
 def select_research_families(memory: dict[str, Any] | None = None, count: int = 3) -> list[str]:
     memory = memory or {}
+    adaptive = memory.get("adaptive_allocation") or {}
+    selected: list[str] = []
+    for cell in adaptive.get("selected_cells") or []:
+        family = str(cell.get("family") or "")
+        if family in FAMILY_SEEDS and family not in selected:
+            selected.append(family)
     ordered = sorted(FAMILY_SEEDS, key=lambda family: _family_priority(memory, family))
-    return ordered[: max(1, min(len(ordered), int(count)))]
+    for family in ordered:
+        if family not in selected:
+            selected.append(family)
+    return selected[: max(1, min(len(selected), int(count)))]
 
 
 def _unknown_fields_from_memory(memory: dict[str, Any]) -> set[str]:
@@ -502,13 +512,20 @@ def build_seed_plan(
     seen = set(memory.get("normalized_expressions") or [])
     unknown_fields = _unknown_fields_from_memory(memory)
     families = select_research_families(memory, family_count)
+    adaptive = memory.get("adaptive_allocation") or {}
+    family_slots = Counter()
+    for cell in adaptive.get("selected_cells") or []:
+        family = str(cell.get("family") or "")
+        if family in families:
+            family_slots[family] += int(cell.get("slots") or 0)
+    family_cycle = [family for family in families for _ in range(max(1, family_slots[family]))]
     plan: list[dict[str, Any]] = []
     offsets = Counter()
     pools = {family: _family_seed_pool(family, generation, hypothesis) for family in families}
 
     while len(plan) < max(1, int(limit)):
         added = False
-        for family in families:
+        for family in family_cycle:
             pool = pools[family]
             while offsets[family] < len(pool):
                 item = pool[offsets[family]]
@@ -868,6 +885,20 @@ def run_autonomous_research(
     memory["normalized_expressions"] = sorted(normalized)
 
     first_budget = max_simulations if generations == 1 else max(4, math.ceil(max_simulations * 0.65))
+    inventory = memory.get("inventory") or {}
+    explicit_inventory_mode = str(inventory.get("mode") or memory.get("inventory_mode") or "").upper()
+    high_confidence_inventory = sum(
+        int(cell.get("high_confidence_candidates") or 0) for cell in (memory.get("research_cells") or [])
+    )
+    inventory_mode = explicit_inventory_mode or (
+        "REPLENISHMENT" if high_confidence_inventory < 30 else "EXPLORATION" if high_confidence_inventory > 50 else "NORMAL"
+    )
+    adaptive_allocation = allocate_research_cells(
+        memory.get("research_cells") or [],
+        budget=first_budget,
+        inventory_mode=inventory_mode,
+    )
+    memory["adaptive_allocation"] = adaptive_allocation
     seen = set(normalized)
 
     # Exploit promising failures, but reserve most first-generation budget for
@@ -1071,6 +1102,7 @@ def run_autonomous_research(
         "goal": goal,
         "tag": tag,
         "selected_families": selected_families,
+        "adaptive_allocation": adaptive_allocation,
         "live_catalog": live_catalog,
         "memory_before": {
             "trials": int(memory.get("trials") or 0),

@@ -20,6 +20,7 @@ from .wq_lineage import (
 )
 from .wq_mutation_policy import compile_prevention_rules, summarize_mutation_outcomes
 from .wq_operator_registry import canonicalize_wq_expression
+from .wq_research_scheduler import summarize_research_cells
 
 
 def normalize_wq_expression(expression: str) -> str:
@@ -354,10 +355,25 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
             )
         )
         attribution_rows = list(attribution_result.all())
+        candidate_result = await session.execute(
+            select(WQResearchCandidate).where(WQResearchCandidate.account == account)
+        )
+        candidate_rows = list(candidate_result.scalars().all())
+        formal_result = await session.execute(
+            select(WQSubmissionAttempt, WQResearchCandidate)
+            .join(
+                WQResearchCandidate,
+                (WQResearchCandidate.account == WQSubmissionAttempt.account)
+                & (WQResearchCandidate.alpha_id == WQSubmissionAttempt.alpha_id),
+            )
+            .where(WQSubmissionAttempt.account == account)
+        )
+        formal_rows = list(formal_result.all())
         from .wq_submission_policy import _load_conversion_feedback
 
         conversion_feedback = await _load_conversion_feedback(session, account)
 
+    research_cells = summarize_research_cells(rows, candidate_rows, formal_rows)
     funnel_summary_all = summarize_funnel(funnel_events)
     funnel_summary_recent = summarize_funnel(funnel_events[:500])
     family_counts = Counter(str(row.family or "unknown") for row in rows)
@@ -483,6 +499,7 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
             reason: dict(counts) for reason, counts in failure_reason_dataset_counts.items()
         },
         "metadata_completeness": metadata_completeness,
+        "research_cells": research_cells,
         "candidate_funnel": {
             "all_time": funnel_summary_all,
             "recent_500_events": funnel_summary_recent,
