@@ -151,6 +151,39 @@ def _migrate_add_columns(connection):
         connection, inspector, "wq_research_trials", "failure_evidence",
         "ALTER TABLE wq_research_trials ADD COLUMN failure_evidence JSON",
     )
+    for table in ("wq_research_trials", "wq_research_candidates"):
+        _add_column_if_missing(
+            connection, inspector, table, "lineage_id",
+            f"ALTER TABLE {table} ADD COLUMN lineage_id VARCHAR(40)",
+        )
+        _add_column_if_missing(
+            connection, inspector, table, "parent_lineage_id",
+            f"ALTER TABLE {table} ADD COLUMN parent_lineage_id VARCHAR(40)",
+        )
+        _add_column_if_missing(
+            connection, inspector, table, "operator_pattern",
+            f"ALTER TABLE {table} ADD COLUMN operator_pattern TEXT",
+        )
+        _add_column_if_missing(
+            connection, inspector, table, "operators",
+            f"ALTER TABLE {table} ADD COLUMN operators JSON",
+        )
+        _add_column_if_missing(
+            connection, inspector, table, "mutation_reason",
+            f"ALTER TABLE {table} ADD COLUMN mutation_reason TEXT",
+        )
+        _add_column_if_missing(
+            connection, inspector, table, "planner_strategy",
+            f"ALTER TABLE {table} ADD COLUMN planner_strategy VARCHAR(100)",
+        )
+        _add_column_if_missing(
+            connection, inspector, table, "allocation_cell",
+            f"ALTER TABLE {table} ADD COLUMN allocation_cell VARCHAR(200)",
+        )
+        _add_column_if_missing(
+            connection, inspector, table, "source_run_id",
+            f"ALTER TABLE {table} ADD COLUMN source_run_id VARCHAR(100)",
+        )
     _add_column_if_missing(
         connection, inspector, "wq_submission_attempts", "attributed_points_share",
         "ALTER TABLE wq_submission_attempts ADD COLUMN attributed_points_share FLOAT",

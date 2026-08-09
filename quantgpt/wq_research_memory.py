@@ -11,6 +11,12 @@ from sqlalchemy import select
 from .db import _get_session_factory
 from .models import WQResearchCandidate, WQResearchTrial, WQSubmissionAttempt
 from .wq_failure_taxonomy import classify_research_failure
+from .wq_lineage import (
+    classify_family_from_metadata,
+    lineage_id_for,
+    parent_lineage_id_for,
+    recover_research_metadata,
+)
 from .wq_operator_registry import canonicalize_wq_expression
 
 
@@ -27,49 +33,8 @@ def normalize_wq_expression(expression: str) -> str:
 
 
 def classify_wq_family(expression: str) -> str:
-    """Classify an expression into a coarse signal family for budget allocation."""
-    expr = normalize_wq_expression(expression)
-    if not expr:
-        return "unknown"
-    if "analyst_" in expr or "revision" in expr:
-        return "analyst_revision"
-    if any(
-        token in expr
-        for token in (
-            "implied_volatility",
-            "historical_volatility",
-            "pcr_",
-            "open_interest",
-            "option",
-        )
-    ):
-        return "options_volatility"
-    if "snt_" in expr or "social" in expr or "sentiment" in expr:
-        return "sentiment"
-    if any(
-        token in expr
-        for token in (
-            "mdf_",
-            "cashflow",
-            "free_cash_flow",
-            "net_income",
-            "dividends",
-            "enterprise_value",
-            "market_cap",
-            "net_debt",
-            "assets",
-            "leverage",
-            "quality",
-        )
-    ):
-        return "fundamental_quality"
-    if any(token in expr for token in ("vwap", "volume", "adv20", "adv60", "turnover")):
-        return "price_volume"
-    if any(token in expr for token in ("ts_std", "std_dev", "volatility", "ts_arg_max", "ts_arg_min")):
-        return "volatility_structure"
-    if any(token in expr for token in ("returns", "close", "open", "high", "low")):
-        return "momentum_reversal"
-    return "other"
+    """Classify an expression using deterministic recovered field/operator evidence."""
+    return classify_family_from_metadata(expression)
 
 
 def _self_correlation_failed(item: dict[str, Any]) -> bool:
@@ -107,12 +72,17 @@ def _trial_from_item(
         return None
 
     metrics = item.get("is_metrics") or {}
-    meta = item.get("research_meta") or {}
+    raw_meta = item.get("research_meta") or {}
+    meta = recover_research_metadata(expression, raw_meta, platform_meta=item)
     mutation_targets = item.get("mutation_targets")
     if mutation_targets is None and status in {"invalid", "simulation_failed"}:
         error = str(item.get("error") or "").strip()
         mutation_targets = [f"{status}:{error}"] if error else [status]
     diagnostics = classify_research_failure(item, status=status)
+    lineage_id = str(meta.get("lineage_id") or "") or lineage_id_for(expression, settings=settings, metadata=meta)
+    parent_lineage_id = str(meta.get("parent_lineage_id") or "") or parent_lineage_id_for(
+        meta.get("parent_expression"), settings=settings
+    )
 
     return WQResearchTrial(
         account=account,
@@ -138,6 +108,14 @@ def _trial_from_item(
         settings=dict(item.get("settings") or settings or {}),
         data_fields=list(meta.get("data_fields") or []),
         dataset_id=str(meta.get("dataset_id") or "") or None,
+        lineage_id=lineage_id,
+        parent_lineage_id=parent_lineage_id,
+        operator_pattern=str(meta.get("operator_pattern") or "") or None,
+        operators=list(meta.get("operators") or []),
+        mutation_reason=str(meta.get("mutation_reason") or "") or None,
+        planner_strategy=str(meta.get("planner_strategy") or "") or None,
+        allocation_cell=str(meta.get("allocation_cell") or "") or None,
+        source_run_id=str(meta.get("source_run_id") or item.get("run_id") or item.get("task_id") or "") or None,
         tag=tag,
     )
 
@@ -205,8 +183,116 @@ async def record_research_trials(
     return len(rows)
 
 
+async def reconcile_research_metadata(account: str = "primary") -> int:
+    """Conservatively backfill lineage/metadata only when stored evidence is sufficient."""
+    factory = _get_session_factory()
+    updated = 0
+    async with factory() as session:
+        trial_result = await session.execute(select(WQResearchTrial).where(WQResearchTrial.account == account))
+        for row in trial_result.scalars().all():
+            recovered = recover_research_metadata(
+                row.expression,
+                {
+                    "family": row.family,
+                    "dataset_id": row.dataset_id,
+                    "data_fields": list(row.data_fields or []),
+                    "hypothesis": row.hypothesis,
+                    "parent_expression": row.parent_expression,
+                    "generation": row.generation,
+                    "mutation_type": row.mutation_type,
+                    "mutation_reason": row.mutation_reason,
+                    "planner_strategy": row.planner_strategy,
+                    "allocation_cell": row.allocation_cell,
+                    "parent_lineage_id": row.parent_lineage_id,
+                },
+            )
+            values = {
+                "family": recovered.get("family"),
+                "data_fields": list(recovered.get("data_fields") or []),
+                "lineage_id": row.lineage_id or lineage_id_for(row.expression, settings=dict(row.settings or {}), metadata=recovered),
+                "parent_lineage_id": row.parent_lineage_id
+                or parent_lineage_id_for(row.parent_expression, settings=dict(row.settings or {})),
+                "operator_pattern": row.operator_pattern or recovered.get("operator_pattern"),
+                "operators": list(row.operators or recovered.get("operators") or []),
+            }
+            changed = False
+            for key, value in values.items():
+                current = getattr(row, key)
+                if key == "family":
+                    if str(current or "unknown") not in {"", "unknown"}:
+                        continue
+                    if value not in (None, "", "unknown"):
+                        setattr(row, key, value)
+                        changed = True
+                    continue
+                if key == "data_fields" and current:
+                    continue
+                if current in (None, "", []) and value not in (None, "", []):
+                    setattr(row, key, value)
+                    changed = True
+            updated += int(changed)
+
+        candidate_result = await session.execute(
+            select(WQResearchCandidate).where(WQResearchCandidate.account == account)
+        )
+        for row in candidate_result.scalars().all():
+            settings = {
+                "region": row.region,
+                "universe": row.universe,
+                "delay": row.delay,
+                "decay": row.decay,
+                "neutralization": row.neutralization,
+                "truncation": row.truncation,
+            }
+            recovered = recover_research_metadata(
+                row.expression,
+                {
+                    "family": row.family,
+                    "dataset_id": row.dataset_id,
+                    "data_fields": list(row.data_fields or []),
+                    "hypothesis": row.hypothesis,
+                    "parent_expression": row.parent_expression,
+                    "generation": row.generation,
+                    "mutation_type": row.mutation_type,
+                    "mutation_reason": row.mutation_reason,
+                    "planner_strategy": row.planner_strategy,
+                    "allocation_cell": row.allocation_cell,
+                    "parent_lineage_id": row.parent_lineage_id,
+                },
+            )
+            values = {
+                "family": recovered.get("family"),
+                "data_fields": list(recovered.get("data_fields") or []),
+                "lineage_id": row.lineage_id or lineage_id_for(row.expression, settings=settings, metadata=recovered),
+                "parent_lineage_id": row.parent_lineage_id or parent_lineage_id_for(row.parent_expression, settings=settings),
+                "operator_pattern": row.operator_pattern or recovered.get("operator_pattern"),
+                "operators": list(row.operators or recovered.get("operators") or []),
+                "structure_signature": row.structure_signature or recovered.get("structure_signature"),
+            }
+            changed = False
+            for key, value in values.items():
+                current = getattr(row, key)
+                if key == "family":
+                    if str(current or "unknown") not in {"", "unknown"}:
+                        continue
+                    if value not in (None, "", "unknown"):
+                        setattr(row, key, value)
+                        changed = True
+                    continue
+                if key == "data_fields" and current:
+                    continue
+                if current in (None, "", []) and value not in (None, "", []):
+                    setattr(row, key, value)
+                    changed = True
+            updated += int(changed)
+        if updated:
+            await session.commit()
+    return updated
+
+
 async def load_research_memory(account: str = "primary", limit: int = 2000) -> dict[str, Any]:
     """Load a bounded summary used by the autonomous planner."""
+    await reconcile_research_metadata(account)
     factory = _get_session_factory()
     async with factory() as session:
         result = await session.execute(
@@ -250,6 +336,31 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
         failure_reason_family_counts.setdefault(reason, Counter())[str(row.family or "unknown")] += 1
         failure_reason_dataset_counts.setdefault(reason, Counter())[str(row.dataset_id or "unknown")] += 1
     normalized = {str(row.expression_normalized or "") for row in rows if row.expression_normalized}
+    metadata_fields = (
+        "lineage_id",
+        "family",
+        "data_fields",
+        "operator_pattern",
+    )
+    completeness_counts = {
+        field: sum(1 for row in rows if getattr(row, field, None) not in (None, "", [], "unknown"))
+        for field in metadata_fields
+    }
+    metadata_completeness = {
+        field: {
+            "present": count,
+            "missing": len(rows) - count,
+            "rate": round(count / max(1, len(rows)), 4),
+        }
+        for field, count in completeness_counts.items()
+    }
+    dataset_present = sum(1 for row in rows if row.dataset_id)
+    metadata_completeness["dataset_id"] = {
+        "present": dataset_present,
+        "missing": len(rows) - dataset_present,
+        "rate": round(dataset_present / max(1, len(rows)), 4),
+        "note": "unknown_is_valid_when_dataset_provenance_is_not_derivable",
+    }
     family_points_attribution: Counter[str] = Counter()
     family_points_feedback: Counter[str] = Counter()
     dataset_points_attribution: Counter[str] = Counter()
@@ -286,6 +397,14 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
             "mutation_targets": list(row.mutation_targets or []),
             "data_fields": list(row.data_fields or []),
             "dataset_id": row.dataset_id,
+            "lineage_id": row.lineage_id,
+            "parent_lineage_id": row.parent_lineage_id,
+            "operator_pattern": row.operator_pattern,
+            "operators": list(row.operators or []),
+            "mutation_reason": row.mutation_reason,
+            "planner_strategy": row.planner_strategy,
+            "allocation_cell": row.allocation_cell,
+            "source_run_id": row.source_run_id,
         }
         for row in rows[:200]
         if row.expression
@@ -305,6 +424,7 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
         "failure_reason_dataset_counts": {
             reason: dict(counts) for reason, counts in failure_reason_dataset_counts.items()
         },
+        "metadata_completeness": metadata_completeness,
         "family_points_attribution": dict(family_points_attribution),
         "family_points_feedback": dict(family_points_feedback),
         "dataset_points_attribution": dict(dataset_points_attribution),

@@ -22,6 +22,7 @@ from sqlalchemy import func, select
 from .db import _get_session_factory
 from .models import WQResearchCandidate, WQResearchTrial, WQSubmissionAttempt, WQSubmissionState
 from .wq_failure_taxonomy import classify_research_failure
+from .wq_lineage import lineage_id_for, parent_lineage_id_for, recover_research_metadata
 
 _DEFAULT_DAILY_BUDGET = 2
 _MAX_CONFIGURED_BUDGET = 5
@@ -170,7 +171,8 @@ async def record_research_candidates(
             )
             existing = existing_result.scalar_one_or_none()
             metrics = candidate.get("is_metrics") or {}
-            meta = candidate.get("research_meta") or {}
+            raw_meta = candidate.get("research_meta") or {}
+            meta = recover_research_metadata(expression, raw_meta, platform_meta=candidate)
             raw_validation = candidate.get("validation") or {}
             validation = raw_validation if isinstance(raw_validation, dict) else {}
             validation_status = str(validation.get("status") or "legacy_unvalidated")
@@ -197,7 +199,11 @@ async def record_research_candidates(
             novelty_score = _novelty_score(expression, [str(value) for value in peer_result.scalars().all() if value])
             candidate["novelty_score"] = novelty_score
             priority_score = _priority_score(candidate)
-            structure_signature = _structure_signature(expression)
+            structure_signature = str(meta.get("structure_signature") or _structure_signature(expression))
+            lineage_id = str(meta.get("lineage_id") or "") or lineage_id_for(expression, settings=settings, metadata=meta)
+            parent_lineage_id = str(meta.get("parent_lineage_id") or "") or parent_lineage_id_for(
+                meta.get("parent_expression"), settings=settings
+            )
             values = {
                 "alpha_id": alpha_id,
                 "expression": expression,
@@ -220,6 +226,14 @@ async def record_research_candidates(
                 "structure_signature": structure_signature,
                 "data_fields": list(meta.get("data_fields") or []),
                 "dataset_id": str(meta.get("dataset_id") or "") or None,
+                "lineage_id": lineage_id,
+                "parent_lineage_id": parent_lineage_id,
+                "operator_pattern": str(meta.get("operator_pattern") or "") or None,
+                "operators": list(meta.get("operators") or []),
+                "mutation_reason": str(meta.get("mutation_reason") or "") or None,
+                "planner_strategy": str(meta.get("planner_strategy") or "") or None,
+                "allocation_cell": str(meta.get("allocation_cell") or "") or None,
+                "source_run_id": str(meta.get("source_run_id") or candidate.get("run_id") or candidate.get("task_id") or "") or None,
                 "validation_status": validation_status,
                 "robustness_score": validation.get("robustness_score"),
                 "novelty_score": novelty_score,
@@ -313,10 +327,15 @@ async def record_platform_candidates(
                     "checks": [],
                 },
                 "research_meta": {
-                    "family": None,
+                    "family": alpha.get("family"),
+                    "dataset_id": alpha.get("dataset_id") or alpha.get("datasetId"),
+                    "data_fields": alpha.get("data_fields") or alpha.get("fields") or [],
                     "hypothesis": "recovered_from_platform_history",
                     "generation": 0,
                     "mutation_type": "platform_backfill",
+                    "mutation_reason": "platform_inventory_recovery",
+                    "planner_strategy": "platform_backfill",
+                    "source_run_id": alpha.get("task_id") or alpha.get("run_id"),
                 },
                 "validation": {"status": "platform_recheck"},
             }
