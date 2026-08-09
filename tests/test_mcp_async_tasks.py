@@ -265,7 +265,7 @@ class TestMCPBackgroundLifecycle(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(params["_singleflight_stale_seconds"], task_helper.MCP_SINGLEFLIGHT_STALE_SECONDS)
         self.assertIn("_heartbeat_at", params)
 
-    async def test_singleflight_preserves_recent_restart_lease(self):
+    async def test_singleflight_releases_recent_task_from_previous_process(self):
         persisted = {
             "task_id": "recent-research",
             "status": "researching",
@@ -291,9 +291,10 @@ class TestMCPBackgroundLifecycle(unittest.IsolatedAsyncioTestCase):
         ):
             active = await task_helper.get_active_mcp_task("wq_research")
 
-        assert active is not None
-        self.assertEqual(active["task_id"], "recent-research")
-        fail_persisted.assert_not_awaited()
+        self.assertIsNone(active)
+        fail_persisted.assert_awaited_once()
+        self.assertEqual(fail_persisted.await_args.args[0], "recent-research")
+        self.assertIn("previous QuantGPT process", fail_persisted.await_args.args[1])
         self.assertTrue(task_helper.is_mcp_singleflight_lease_fresh(persisted))
 
     async def test_singleflight_releases_orphaned_task_after_restart(self):

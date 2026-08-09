@@ -49,7 +49,6 @@ async def lifespan(app: FastAPI):
     logger.info("Database initialized")
 
     from .db import _get_session_factory as _sf
-    from .mcp_task_helper import is_mcp_singleflight_lease_fresh
 
     active_statuses = [
         "pending",
@@ -68,27 +67,16 @@ async def lifespan(app: FastAPI):
         result = await session.execute(select(TaskModel).where(TaskModel.status.in_(active_statuses)))
         active_tasks = result.scalars().all()
         cleaned = 0
-        preserved_singleflight = 0
         for task in active_tasks:
-            persisted = {
-                "params": task.params or {},
-                "created_at": task.created_at.isoformat() if task.created_at else None,
-                "updated_at": task.updated_at.isoformat() if task.updated_at else None,
-            }
-            if is_mcp_singleflight_lease_fresh(persisted):
-                preserved_singleflight += 1
-                continue
+            # All workers, heartbeats, and BRAIN polling loops are process-local.
+            # A task persisted by the previous server process cannot continue after
+            # restart, so retaining a "fresh" lease only blocks the Research Gate.
             task.status = "failed"
             task.error = "进程重启，任务中断"
             cleaned += 1
         if cleaned:
             await session.commit()
-            logger.info("Cleaned up %s stale running tasks", cleaned)
-        if preserved_singleflight:
-            logger.info(
-                "Preserved %s single-flight task leases across restart",
-                preserved_singleflight,
-            )
+            logger.info("Cleaned up %s interrupted running tasks after restart", cleaned)
 
     from .auth import _DEV_USER_ID
     from .db import _get_session_factory

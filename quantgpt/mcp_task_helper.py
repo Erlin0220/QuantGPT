@@ -192,15 +192,22 @@ async def get_active_mcp_task(
         or MCP_SINGLEFLIGHT_STALE_SECONDS
     )
     age_seconds = _persisted_task_age_seconds(persisted)
+    if owner_instance and owner_instance != _MCP_INSTANCE_ID:
+        # Background executors and polling threads are process-local. After a service
+        # restart the previous instance cannot continue the task, even if its last
+        # heartbeat is recent. Release the DB lease immediately instead of blocking
+        # the single-flight gate until the normal stale timeout.
+        reason = "Orphaned task from previous QuantGPT process instance"
+        await _fail_persisted_mcp_task(persisted["task_id"], reason)
+        return None
+
     if is_mcp_singleflight_lease_fresh(persisted, stale_after_seconds=stale_limit):
         return sanitize_task_response(dict(persisted))
 
-    if owner_instance and owner_instance != _MCP_INSTANCE_ID:
-        reason = f"Orphaned task heartbeat expired after QuantGPT restart ({int(age_seconds)}s > {stale_limit}s)"
-    elif not owner_instance:
-        reason = f"Legacy active task heartbeat expired ({int(age_seconds)}s > {stale_limit}s)"
+    if not owner_instance:
+        reason = f"Legacy active task heartbeat expired ({int(age_seconds or 0)}s > {stale_limit}s)"
     else:
-        reason = f"Stale single-flight heartbeat ({int(age_seconds)}s > {stale_limit}s)"
+        reason = f"Stale single-flight heartbeat ({int(age_seconds or 0)}s > {stale_limit}s)"
     await _fail_persisted_mcp_task(persisted["task_id"], reason)
     return None
 
