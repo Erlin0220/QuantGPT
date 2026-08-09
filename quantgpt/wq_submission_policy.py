@@ -27,6 +27,11 @@ from .wq_lineage import lineage_id_for, parent_lineage_id_for, recover_research_
 
 _DEFAULT_DAILY_BUDGET = 2
 _MAX_CONFIGURED_BUDGET = 5
+_TERMINAL_POSITIVE_STATUSES = {"ACTIVE"}
+_TERMINAL_NEGATIVE_STATUSES = {"SC_FAIL", "OTHER_FAIL"}
+_CONVERSION_PRIOR_ALPHA = 2.0
+_CONVERSION_PRIOR_BETA = 2.0
+_CONVERSION_GROUP_PRIOR_STRENGTH = 4.0
 _reservation_lock = threading.Lock()
 
 
@@ -132,6 +137,74 @@ def _priority_score(candidate: dict[str, Any]) -> float:
         - complexity_penalty
     )
     return score * correlation_priority_multiplier(candidate.get("local_correlation_proxy"))
+
+
+def _smoothed_rate(successes: int, samples: int, *, prior_rate: float, prior_strength: float) -> float:
+    return (float(successes) + float(prior_rate) * float(prior_strength)) / max(1.0, float(samples) + float(prior_strength))
+
+
+async def _load_conversion_feedback(session, account: str) -> dict[str, Any]:
+    """Load small-sample-safe ACTIVE conversion feedback used by research memory."""
+    terminal_statuses = sorted(_TERMINAL_POSITIVE_STATUSES | _TERMINAL_NEGATIVE_STATUSES)
+    attempts_result = await session.execute(
+        select(WQSubmissionAttempt).where(
+            WQSubmissionAttempt.account == account,
+            WQSubmissionAttempt.status.in_(terminal_statuses),
+        )
+    )
+    attempts = list(attempts_result.scalars().all())
+    positive = sum(1 for item in attempts if str(item.status or "").upper() in _TERMINAL_POSITIVE_STATUSES)
+    samples = len(attempts)
+    global_rate = _smoothed_rate(
+        positive,
+        samples,
+        prior_rate=_CONVERSION_PRIOR_ALPHA / (_CONVERSION_PRIOR_ALPHA + _CONVERSION_PRIOR_BETA),
+        prior_strength=_CONVERSION_PRIOR_ALPHA + _CONVERSION_PRIOR_BETA,
+    )
+    grouped_result = await session.execute(
+        select(WQSubmissionAttempt, WQResearchCandidate)
+        .join(
+            WQResearchCandidate,
+            (WQResearchCandidate.account == WQSubmissionAttempt.account)
+            & (WQResearchCandidate.alpha_id == WQSubmissionAttempt.alpha_id),
+        )
+        .where(
+            WQSubmissionAttempt.account == account,
+            WQSubmissionAttempt.status.in_(terminal_statuses),
+        )
+    )
+    family_counts: dict[str, list[int]] = {}
+    dataset_counts: dict[str, list[int]] = {}
+    for attempt, candidate in grouped_result.all():
+        is_positive = int(str(attempt.status or "").upper() in _TERMINAL_POSITIVE_STATUSES)
+        for mapping, key in (
+            (family_counts, str(candidate.family or "unknown")),
+            (dataset_counts, str(candidate.dataset_id or "unknown")),
+        ):
+            values = mapping.setdefault(key, [0, 0])
+            values[0] += is_positive
+            values[1] += 1
+
+    def summarize(mapping: dict[str, list[int]]) -> dict[str, dict[str, Any]]:
+        return {
+            key: {
+                "rate": round(
+                    _smoothed_rate(values[0], values[1], prior_rate=global_rate, prior_strength=_CONVERSION_GROUP_PRIOR_STRENGTH),
+                    4,
+                ),
+                "samples": values[1],
+                "active": values[0],
+                "failed": values[1] - values[0],
+            }
+            for key, values in mapping.items()
+        }
+
+    return {
+        "global": {"rate": round(global_rate, 4), "samples": samples, "active": positive, "failed": samples - positive},
+        "family": summarize(family_counts),
+        "dataset": summarize(dataset_counts),
+        "smoothing": {"global_prior": "beta(2,2)", "group_prior_strength": _CONVERSION_GROUP_PRIOR_STRENGTH},
+    }
 
 
 async def _get_or_create_state(session, account: str) -> WQSubmissionState:
