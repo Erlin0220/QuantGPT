@@ -9,6 +9,7 @@ from collections import Counter
 from typing import Any, Callable
 
 from .wq_brain_service import run_batch_simulation, run_list_alphas
+from .wq_mutation_policy import preferred_mutation_classes
 from .wq_operator_registry import validate_wq_expression
 from .wq_research_agent import run_research_batch
 from .wq_research_memory import classify_wq_family, normalize_wq_expression
@@ -543,6 +544,33 @@ def _narrow_windows(expression: str) -> str:
     return value
 
 
+def _alternate_family_seed(family: str, seen: set[str], *, stable_only: bool = False) -> tuple[str, str] | None:
+    preferred = ("fundamental_quality", "analyst_revision", "volatility_structure") if stable_only else tuple(FAMILY_SEEDS)
+    for alternate_family in preferred:
+        if alternate_family == family:
+            continue
+        for expression in FAMILY_SEEDS.get(alternate_family, ()):
+            normalized = normalize_wq_expression(expression)
+            if normalized and normalized not in seen:
+                return expression, alternate_family
+    return None
+
+
+def _violates_prevention_rules(item: dict[str, Any], rules: dict[str, Any] | None) -> bool:
+    rules = rules or {}
+    expression = normalize_wq_expression(str(item.get("expression") or ""))
+    if expression in set(rules.get("blocked_exact_expressions") or []):
+        return True
+    pattern = str(item.get("operator_pattern") or (item.get("research_meta") or {}).get("operator_pattern") or "")
+    if pattern and pattern in set(rules.get("blocked_operator_patterns") or []):
+        return True
+    fields = set(str(value) for value in (item.get("data_fields") or (item.get("research_meta") or {}).get("data_fields") or []))
+    for blocked in rules.get("blocked_operator_field_pairs") or []:
+        if pattern and pattern == str(blocked.get("operator_pattern") or "") and fields.intersection(blocked.get("data_fields") or []):
+            return True
+    return False
+
+
 def build_targeted_mutations(
     result: dict[str, Any],
     *,
@@ -561,28 +589,45 @@ def build_targeted_mutations(
     targets = list(result.get("mutation_targets") or [])
     metrics = result.get("is_metrics") or {}
     sharpe = _safe_metric(metrics.get("sharpe"))
-    variants: list[tuple[str, str]] = []
+    directives = preferred_mutation_classes(result)
+    variants: list[tuple[str, str, str, str | None]] = []
+    for directive in directives:
+        mutation_class = directive["mutation_class"]
+        rationale = directive["rationale"]
+        if mutation_class == "compile_prevention":
+            continue
+        if mutation_class in {"economic_reseed", "stable_data_reseed"}:
+            reseed = _alternate_family_seed(family, seen, stable_only=mutation_class == "stable_data_reseed")
+            if reseed:
+                variants.append((reseed[0], mutation_class, rationale, reseed[1]))
+        elif mutation_class == "widen_windows":
+            variants.append((_widen_windows(expression), mutation_class, rationale, None))
+        elif mutation_class in {"smooth_signal", "cost_reduction"}:
+            variants.append((f"rank(ts_mean(({expression}), 10))", mutation_class, rationale, None))
+        elif mutation_class == "conditional_execution":
+            variants.append((f"trade_when(volume > ts_mean(volume, 20), ({expression}), -1)", mutation_class, rationale, None))
+        elif mutation_class == "operator_family_switch":
+            variants.append((f"zscore({expression})", mutation_class, rationale, None))
+        elif mutation_class == "neutralization_shift":
+            variants.append((f"group_rank(({expression}), subindustry)", mutation_class, rationale, None))
+        elif mutation_class == "weight_control" and not expression.lstrip().startswith("rank("):
+            variants.append((f"rank({expression})", mutation_class, rationale, None))
+        elif mutation_class == "increase_responsiveness":
+            variants.append((_narrow_windows(expression), mutation_class, rationale, None))
+        elif mutation_class == "signal_quality":
+            if sharpe < 0:
+                variants.append((f"-1 * ({expression})", "invert_signal", rationale, None))
+            else:
+                variants.append((f"rank(ts_mean(({expression}), 10))", "smooth_signal", rationale, None))
 
-    if (
-        "reduce_turnover" in targets
-        or "improve_sub_universe_robustness" in targets
-        or "improve_cross_setting_robustness" in targets
-    ):
-        variants.append((_widen_windows(expression), "widen_windows"))
-    if "increase_turnover" in targets:
-        variants.append((_narrow_windows(expression), "narrow_windows"))
-    if "reduce_weight_concentration" in targets and not expression.lstrip().startswith("rank("):
-        variants.append((f"rank({expression})", "cross_sectional_rank"))
-    if "improve_signal_sharpe" in targets or "improve_fitness" in targets:
-        # A positive-but-insufficient signal should not waste a simulation on a
-        # deterministic sign flip that is likely to make Sharpe negative. Smooth
-        # it first; only invert genuinely negative signals.
-        if sharpe < 0:
-            variants.append((f"-1 * ({expression})", "invert_signal"))
-        variants.append((f"rank(ts_mean(({expression}), 10))", "smooth_signal"))
+    # Keep legacy diagnostic compatibility only when the normalized router has no
+    # structural expression available; correlation/robustness routes intentionally
+    # never fall back to cosmetic window-only changes.
+    if not variants and "increase_turnover" in targets:
+        variants.append((_narrow_windows(expression), "increase_responsiveness", "legacy turnover diagnostic", None))
 
     out: list[dict[str, Any]] = []
-    for variant, mutation_type in variants:
+    for variant, mutation_type, rationale, family_override in variants:
         normalized = normalize_wq_expression(variant)
         if not normalized or normalized in seen or normalized == normalize_wq_expression(expression):
             continue
@@ -590,11 +635,15 @@ def build_targeted_mutations(
         out.append(
             {
                 "expression": variant,
-                "family": family,
+                "family": family_override or family,
                 "generation": generation,
                 "hypothesis": hypothesis or str(meta.get("hypothesis") or ""),
                 "parent_expression": expression,
+                "parent_lineage_id": meta.get("lineage_id") or result.get("lineage_id"),
                 "mutation_type": mutation_type,
+                "mutation_reason": rationale,
+                "planner_strategy": "failure_directed",
+                "failure_trigger": sorted({entry["reason"] if isinstance(entry, dict) else str(entry) for entry in (result.get("failure_reasons") or [])} | ({str(result.get("failure_reason"))} if result.get("failure_reason") else set())),
             }
         )
         if len(out) >= limit:
@@ -647,10 +696,14 @@ def build_memory_mutation_plan(
                 "turnover": trial.get("turnover"),
             },
             "mutation_targets": targets,
+            "failure_reason": trial.get("failure_reason"),
+            "failure_reasons": list(trial.get("failure_reasons") or []),
+            "local_correlation_proxy": trial.get("local_correlation_proxy"),
             "research_meta": {
                 "family": trial.get("family") or classify_wq_family(str(trial.get("expression") or "")),
                 "generation": generation,
                 "hypothesis": trial.get("hypothesis") or hypothesis,
+                "lineage_id": trial.get("lineage_id"),
             },
         }
         variants = build_targeted_mutations(
@@ -873,7 +926,10 @@ def run_autonomous_research(
                 min_fitness=min_fitness,
             )
         )
-    first_plan = memory_plan + live_plan + llm_plan + seed_plan
+    first_plan = [
+        item for item in (memory_plan + live_plan + llm_plan + seed_plan)
+        if not _violates_prevention_rules(item, memory.get("prevention_rules"))
+    ]
     generation_results: list[dict[str, Any]] = []
     all_results: list[dict[str, Any]] = []
     all_candidates: list[dict[str, Any]] = []
@@ -956,7 +1012,7 @@ def run_autonomous_research(
             next_plan.extend(orthogonal)
             for item in orthogonal:
                 seen.add(normalize_wq_expression(item["expression"]))
-        plan = next_plan
+        plan = [item for item in next_plan if not _violates_prevention_rules(item, memory.get("prevention_rules"))]
 
     # A primary threshold pass is not enough to enter the submission-ready queue.
     # Validate at most the two strongest candidates across alternate universe / neutralization

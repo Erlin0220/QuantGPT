@@ -18,6 +18,7 @@ from .wq_lineage import (
     parent_lineage_id_for,
     recover_research_metadata,
 )
+from .wq_mutation_policy import compile_prevention_rules, summarize_mutation_outcomes
 from .wq_operator_registry import canonicalize_wq_expression
 
 
@@ -418,6 +419,21 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
         dataset_points_attribution[dataset_id] += share
         dataset_points_feedback[dataset_id] += weighted
 
+    mutation_rows = [
+        {
+            "expression": row.expression,
+            "status": row.status,
+            "mutation_type": row.mutation_type,
+            "failure_reason": row.failure_reason,
+            "failure_reasons": list(row.failure_reasons or []),
+            "operator_pattern": row.operator_pattern,
+            "data_fields": list(row.data_fields or []),
+        }
+        for row in rows
+    ]
+    prevention_rules = compile_prevention_rules(mutation_rows)
+    mutation_outcomes = summarize_mutation_outcomes(mutation_rows)
+
     recent_trials = [
         {
             "expression": row.expression,
@@ -484,6 +500,8 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
         "family_active_conversion": conversion_feedback.get("family", {}),
         "dataset_active_conversion": conversion_feedback.get("dataset", {}),
         "normalized_expressions": sorted(normalized),
+        "prevention_rules": prevention_rules,
+        "mutation_outcomes": mutation_outcomes,
         "recent_trials": recent_trials,
     }
 
