@@ -127,6 +127,14 @@ def _migrate_add_columns(connection):
         connection, inspector, "wq_research_trials", "dataset_id",
         "ALTER TABLE wq_research_trials ADD COLUMN dataset_id VARCHAR(100)",
     )
+    _add_column_if_missing(
+        connection, inspector, "wq_submission_attempts", "attributed_points_share",
+        "ALTER TABLE wq_submission_attempts ADD COLUMN attributed_points_share FLOAT",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_submission_attempts", "attribution_confidence",
+        "ALTER TABLE wq_submission_attempts ADD COLUMN attribution_confidence FLOAT",
+    )
 
 
 def _add_column_if_missing(connection, inspector, table, column, ddl):

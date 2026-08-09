@@ -4,6 +4,18 @@ from quantgpt import wq_autonomous_research as autonomous
 from quantgpt.wq_research_memory import normalize_wq_expression
 
 
+def test_family_selector_can_use_conservative_points_feedback():
+    family_counts = {family: 10 for family in autonomous.FAMILY_SEEDS}
+    memory = {
+        "family_counts": family_counts,
+        "family_points_feedback": {"price_volume": 1500.0},
+    }
+
+    selected = autonomous.select_research_families(memory, count=1)
+
+    assert selected == ["price_volume"]
+
+
 def test_family_selector_prefers_undercovered_family():
     memory = {
         "family_counts": {
@@ -100,6 +112,22 @@ def test_seed_plan_skips_fields_brain_reported_as_unknown():
     assert plan
     assert all("mdf_quality" not in item["expression"] for item in plan)
     assert all("mdf_bp" not in item["expression"] for item in plan)
+
+
+def test_live_dataset_selection_uses_points_feedback_as_weak_tiebreaker():
+    datasets = [
+        {"id": "news_a", "category": {"id": "news"}},
+        {"id": "news_b", "category": {"id": "news"}},
+        {"id": "pv1", "category": {"id": "pv"}},
+    ]
+    memory = {"dataset_points_feedback": {"news_b": 1500.0}}
+
+    selected = autonomous._select_live_datasets(datasets, memory, limit=2)
+
+    ids = [item["id"] for item in selected]
+    assert "news_b" in ids
+    assert "news_a" not in ids
+    assert "pv1" in ids
 
 
 def test_live_dataset_selection_spreads_across_categories_and_avoids_overused_dataset():

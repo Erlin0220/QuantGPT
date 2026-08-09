@@ -546,8 +546,16 @@ async def observe_account_status(account: str, status: dict[str, Any]) -> dict[s
                 if pending:
                     baseline = float(state.last_settled_points or 0.0)
                     delta = max(0.0, points_value - baseline)
+                    # BRAIN leaderboard points are batch-delayed, so when several
+                    # ACTIVE submissions settle together we cannot know the exact
+                    # per-Alpha contribution. Persist an equal-share attribution and
+                    # downweight its confidence by the batch size for planner feedback.
+                    attributed_share = delta / len(pending)
+                    attribution_confidence = 1.0 / len(pending)
                     for attempt in pending:
                         attempt.score_state = "SETTLED"
+                        attempt.attributed_points_share = attributed_share
+                        attempt.attribution_confidence = attribution_confidence
                     state.last_settled_delta = delta
                     state.last_settled_submission_count = len(pending)
                     # Only auto-calibrate within the conservative 1..2 range and

@@ -9,7 +9,7 @@ from typing import Any
 from sqlalchemy import select
 
 from .db import _get_session_factory
-from .models import WQResearchTrial
+from .models import WQResearchCandidate, WQResearchTrial, WQSubmissionAttempt
 from .wq_operator_registry import canonicalize_wq_expression
 
 
@@ -210,6 +210,20 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
             .limit(max(1, min(5000, int(limit))))
         )
         rows = list(result.scalars().all())
+        attribution_result = await session.execute(
+            select(WQSubmissionAttempt, WQResearchCandidate)
+            .join(
+                WQResearchCandidate,
+                (WQResearchCandidate.account == WQSubmissionAttempt.account)
+                & (WQResearchCandidate.alpha_id == WQSubmissionAttempt.alpha_id),
+            )
+            .where(
+                WQSubmissionAttempt.account == account,
+                WQSubmissionAttempt.score_state == "SETTLED",
+                WQSubmissionAttempt.attributed_points_share.is_not(None),
+            )
+        )
+        attribution_rows = list(attribution_result.all())
 
     family_counts = Counter(str(row.family or "unknown") for row in rows)
     status_counts = Counter(str(row.status or "unknown") for row in rows)
@@ -220,6 +234,21 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
         str(row.family or "unknown") for row in rows if bool(row.self_correlation_failed)
     )
     normalized = {str(row.expression_normalized or "") for row in rows if row.expression_normalized}
+    family_points_attribution: Counter[str] = Counter()
+    family_points_feedback: Counter[str] = Counter()
+    dataset_points_attribution: Counter[str] = Counter()
+    dataset_points_feedback: Counter[str] = Counter()
+    for attempt, candidate in attribution_rows:
+        share = float(attempt.attributed_points_share or 0.0)
+        confidence = max(0.0, min(1.0, float(attempt.attribution_confidence or 0.0)))
+        weighted = share * confidence
+        family = str(candidate.family or "unknown")
+        dataset_id = str(candidate.dataset_id or "unknown")
+        family_points_attribution[family] += share
+        family_points_feedback[family] += weighted
+        dataset_points_attribution[dataset_id] += share
+        dataset_points_feedback[dataset_id] += weighted
+
     recent_trials = [
         {
             "expression": row.expression,
@@ -248,6 +277,11 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
         "candidate_family_counts": dict(candidate_family_counts),
         "self_correlation_family_counts": dict(self_corr_family_counts),
         "status_counts": dict(status_counts),
+        "family_points_attribution": dict(family_points_attribution),
+        "family_points_feedback": dict(family_points_feedback),
+        "dataset_points_attribution": dict(dataset_points_attribution),
+        "dataset_points_feedback": dict(dataset_points_feedback),
+        "points_attribution_rule": "equal_share_confidence_weighted",
         "normalized_expressions": sorted(normalized),
         "recent_trials": recent_trials,
     }

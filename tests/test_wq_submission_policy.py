@@ -2,9 +2,10 @@
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from quantgpt.models import Base
+from quantgpt.models import Base, WQSubmissionAttempt
 from quantgpt.wq_research_memory import load_research_memory, record_research_trials
 from quantgpt.wq_submission_policy import (
     finalize_submission_attempt,
@@ -75,6 +76,53 @@ async def test_lagging_points_do_not_settle_until_leaderboard_is_current(policy_
     assert current["last_settled_delta"] == 2000
     assert current["last_settled_submission_count"] == 1
     assert current["daily_submission_budget"] == 1
+
+
+@pytest.mark.asyncio
+async def test_points_settlement_records_confidence_weighted_research_feedback(policy_db):
+    import quantgpt.db as db
+
+    await observe_account_status("primary", {"points": 1000, "points_status": "CURRENT"})
+    await record_research_candidates(
+        "primary",
+        [
+            {
+                "alpha_id": "points-a",
+                "expression": "rank(ts_mean(field_a, 20))",
+                "is_metrics": {"sharpe": 1.6, "fitness": 1.2, "returns": 0.07, "turnover": 0.2},
+                "research_meta": {"family": "family_a", "dataset_id": "dataset_a", "data_fields": ["field_a"]},
+            },
+            {
+                "alpha_id": "points-b",
+                "expression": "rank(ts_mean(field_b, 20))",
+                "is_metrics": {"sharpe": 1.7, "fitness": 1.3, "returns": 0.08, "turnover": 0.2},
+                "research_meta": {"family": "family_b", "dataset_id": "dataset_b", "data_fields": ["field_b"]},
+            },
+        ],
+    )
+    for alpha_id in ("points-a", "points-b"):
+        assert (await reserve_submission("primary", alpha_id))["allowed"] is True
+        await finalize_submission_attempt("primary", alpha_id, {"ok": True, "final_status": "ACTIVE"})
+
+    settled = await observe_account_status("primary", {"points": 3000, "points_status": "CURRENT"})
+    assert settled["last_settled_delta"] == 2000
+    assert settled["last_settled_submission_count"] == 2
+
+    factory = db._get_session_factory()
+    async with factory() as session:
+        result = await session.execute(
+            select(WQSubmissionAttempt).where(WQSubmissionAttempt.alpha_id.in_(["points-a", "points-b"]))
+        )
+        attempts = list(result.scalars().all())
+    assert len(attempts) == 2
+    assert {attempt.attributed_points_share for attempt in attempts} == {1000.0}
+    assert {attempt.attribution_confidence for attempt in attempts} == {0.5}
+
+    memory = await load_research_memory("primary")
+    assert memory["family_points_attribution"] == {"family_a": 1000.0, "family_b": 1000.0}
+    assert memory["family_points_feedback"] == {"family_a": 500.0, "family_b": 500.0}
+    assert memory["dataset_points_feedback"] == {"dataset_a": 500.0, "dataset_b": 500.0}
+    assert memory["points_attribution_rule"] == "equal_share_confidence_weighted"
 
 
 @pytest.mark.asyncio

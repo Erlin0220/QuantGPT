@@ -98,9 +98,12 @@ def _family_priority(memory: dict[str, Any], family: str) -> tuple[float, str]:
     promise = sum(top_promises) / len(top_promises) if top_promises else 0.0
     candidate_rate = candidates / max(1.0, trials)
     self_corr_rate = self_corr / max(1.0, trials)
+    points_feedback = max(0.0, float((memory.get("family_points_feedback") or {}).get(family, 0.0) or 0.0))
+    points_reward = min(1.0, math.log1p(points_feedback / 500.0) * 0.4)
     # Lower is better: retain exploration pressure while exploiting families that
-    # have produced candidates or several near-threshold trials.
-    score = math.log1p(trials) - candidate_rate * 8.0 - promise * 1.5 + self_corr_rate * 4.0
+    # have produced candidates, several near-threshold trials, or conservative
+    # confidence-weighted evidence of settled leaderboard Points.
+    score = math.log1p(trials) - candidate_rate * 8.0 - promise * 1.5 - points_reward + self_corr_rate * 4.0
     return score, family
 
 
@@ -173,17 +176,26 @@ def _dataset_category(dataset: dict[str, Any]) -> str:
 def _select_live_datasets(datasets: list[dict[str, Any]], memory: dict[str, Any], *, limit: int = 6) -> list[dict[str, Any]]:
     """Prefer underused datasets while spreading a research round across categories."""
     usage = Counter(str(item.get("dataset_id") or "") for item in (memory.get("recent_trials") or []))
+    points_feedback = {
+        str(key): max(0.0, float(value or 0.0))
+        for key, value in (memory.get("dataset_points_feedback") or {}).items()
+    }
     by_category: dict[str, list[dict[str, Any]]] = {}
     for dataset in datasets:
         dataset_id = str(dataset.get("id") or "").strip()
         if not dataset_id:
             continue
         by_category.setdefault(_dataset_category(dataset), []).append(dataset)
+    def dataset_rank(item: dict[str, Any]) -> tuple[float, str]:
+        dataset_id = str(item.get("id") or "")
+        feedback_reward = min(2.0, points_feedback.get(dataset_id, 0.0) / 1000.0)
+        return usage[dataset_id] - feedback_reward, dataset_id
+
     for values in by_category.values():
-        values.sort(key=lambda item: (usage[str(item.get("id") or "")], str(item.get("id") or "")))
+        values.sort(key=dataset_rank)
 
     selected: list[dict[str, Any]] = []
-    categories = sorted(by_category, key=lambda category: min(usage[str(item.get("id") or "")] for item in by_category[category]))
+    categories = sorted(by_category, key=lambda category: min(dataset_rank(item)[0] for item in by_category[category]))
     while len(selected) < max(1, int(limit)):
         added = False
         for category in categories:

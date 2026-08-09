@@ -1738,6 +1738,9 @@ async def wq_brain_account_status(account: str = "primary") -> str:
                 "candidate_family_counts": memory.get("candidate_family_counts", {}),
                 "self_correlation_family_counts": memory.get("self_correlation_family_counts", {}),
                 "status_counts": memory.get("status_counts", {}),
+                "family_points_feedback": memory.get("family_points_feedback", {}),
+                "dataset_points_feedback": memory.get("dataset_points_feedback", {}),
+                "points_attribution_rule": memory.get("points_attribution_rule"),
             }
         except Exception as exc:
             logger.warning("Failed to read WQ research gate: %s", exc)
