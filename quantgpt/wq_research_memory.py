@@ -9,7 +9,8 @@ from typing import Any
 from sqlalchemy import select
 
 from .db import _get_session_factory
-from .models import WQResearchCandidate, WQResearchTrial, WQSubmissionAttempt
+from .models import WQResearchCandidate, WQResearchStageEvent, WQResearchTrial, WQSubmissionAttempt
+from .wq_candidate_funnel import funnel_events_for_trial, summarize_funnel
 from .wq_failure_taxonomy import classify_research_failure
 from .wq_lineage import (
     classify_family_from_metadata,
@@ -136,6 +137,7 @@ async def record_research_trials(
     effective_tag = tag or result.get("tag")
     factory = _get_session_factory()
     rows: list[WQResearchTrial] = []
+    stage_events: list[WQResearchStageEvent] = []
 
     candidate_ids = {
         str(item.get("alpha_id"))
@@ -159,6 +161,20 @@ async def record_research_trials(
         )
         if row is not None:
             rows.append(row)
+            for event in funnel_events_for_trial(row, item):
+                stage_events.append(
+                    WQResearchStageEvent(
+                        account=account,
+                        lineage_id=str(row.lineage_id),
+                        parent_lineage_id=row.parent_lineage_id,
+                        source_run_id=row.source_run_id,
+                        stage=event["stage"],
+                        outcome=event["outcome"],
+                        failure_stage=row.failure_stage,
+                        failure_reason=event.get("failure_reason"),
+                        details=event.get("details"),
+                    )
+                )
 
     for status_key, status in (("failed", "simulation_failed"), ("invalid", "invalid")):
         for item in result.get(status_key) or []:
@@ -173,12 +189,27 @@ async def record_research_trials(
             )
             if row is not None:
                 rows.append(row)
+                for event in funnel_events_for_trial(row, item):
+                    stage_events.append(
+                        WQResearchStageEvent(
+                            account=account,
+                            lineage_id=str(row.lineage_id),
+                            parent_lineage_id=row.parent_lineage_id,
+                            source_run_id=row.source_run_id,
+                            stage=event["stage"],
+                            outcome=event["outcome"],
+                            failure_stage=row.failure_stage,
+                            failure_reason=event.get("failure_reason"),
+                            details=event.get("details"),
+                        )
+                    )
 
     if not rows:
         return 0
 
     async with factory() as session:
         session.add_all(rows)
+        session.add_all(stage_events)
         await session.commit()
     return len(rows)
 
@@ -302,6 +333,12 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
             .limit(max(1, min(5000, int(limit))))
         )
         rows = list(result.scalars().all())
+        funnel_result = await session.execute(
+            select(WQResearchStageEvent)
+            .where(WQResearchStageEvent.account == account)
+            .order_by(WQResearchStageEvent.created_at.desc())
+        )
+        funnel_events = list(funnel_result.scalars().all())
         attribution_result = await session.execute(
             select(WQSubmissionAttempt, WQResearchCandidate)
             .join(
@@ -316,7 +353,12 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
             )
         )
         attribution_rows = list(attribution_result.all())
+        from .wq_submission_policy import _load_conversion_feedback
 
+        conversion_feedback = await _load_conversion_feedback(session, account)
+
+    funnel_summary_all = summarize_funnel(funnel_events)
+    funnel_summary_recent = summarize_funnel(funnel_events[:500])
     family_counts = Counter(str(row.family or "unknown") for row in rows)
     status_counts = Counter(str(row.status or "unknown") for row in rows)
     candidate_family_counts = Counter(
@@ -425,11 +467,22 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
             reason: dict(counts) for reason, counts in failure_reason_dataset_counts.items()
         },
         "metadata_completeness": metadata_completeness,
+        "candidate_funnel": {
+            "all_time": funnel_summary_all,
+            "recent_500_events": funnel_summary_recent,
+            "dominant_bottleneck_stage": funnel_summary_recent.get("bottleneck_stage")
+            or funnel_summary_all.get("bottleneck_stage"),
+        },
         "family_points_attribution": dict(family_points_attribution),
         "family_points_feedback": dict(family_points_feedback),
         "dataset_points_attribution": dict(dataset_points_attribution),
         "dataset_points_feedback": dict(dataset_points_feedback),
         "points_attribution_rule": "equal_share_confidence_weighted",
+        "active_conversion": conversion_feedback,
+        "active_conversion_rate": (conversion_feedback.get("global") or {}).get("rate"),
+        "terminal_submission_samples": (conversion_feedback.get("global") or {}).get("samples", 0),
+        "family_active_conversion": conversion_feedback.get("family", {}),
+        "dataset_active_conversion": conversion_feedback.get("dataset", {}),
         "normalized_expressions": sorted(normalized),
         "recent_trials": recent_trials,
     }

@@ -272,6 +272,27 @@ class WQResearchTrial(Base):
     )
 
 
+class WQResearchStageEvent(Base):
+    __tablename__ = "wq_research_stage_events"
+
+    id = Column(Uuid, primary_key=True, default=uuid.uuid4)
+    account = Column(String(20), nullable=False, default="primary", index=True)
+    lineage_id = Column(String(40), nullable=False, index=True)
+    parent_lineage_id = Column(String(40), nullable=True, index=True)
+    source_run_id = Column(String(100), nullable=True, index=True)
+    stage = Column(String(40), nullable=False, index=True)
+    outcome = Column(String(20), nullable=False, index=True)
+    failure_stage = Column(String(30), nullable=True)
+    failure_reason = Column(String(60), nullable=True)
+    details = Column(JSON, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False, index=True)
+
+    __table_args__ = (
+        Index("ix_wq_stage_events_account_stage", "account", "stage", "outcome"),
+        Index("ix_wq_stage_events_lineage_stage", "lineage_id", "stage"),
+    )
+
+
 class WQSubmissionAttempt(Base):
     __tablename__ = "wq_submission_attempts"
 
