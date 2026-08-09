@@ -20,6 +20,7 @@ from .wq_brain_service import (
 )
 from .wq_correlation_proxy import daily_changes_from_pnl, portfolio_correlation_proxy
 from .wq_operator_registry import WQ_FALLBACK_OPERATORS, canonicalize_wq_expression, validate_wq_expression
+from .wq_overfitting import deflated_sharpe_evidence
 
 
 def _normalize(expression: str) -> str:
@@ -85,6 +86,33 @@ def _rank_key(item: dict) -> tuple[float, float, float]:
         _safe_number(metrics.get("sharpe"), -999.0),
         _safe_number(metrics.get("returns"), -999.0),
     )
+
+
+def _structure_family_key(expression: str) -> str:
+    return re.sub(r"(?<![a-z_])\d+(?:\.\d+)?", "#", _normalize(expression))
+
+
+def _attach_overfitting_evidence(client, candidates: list[dict], batch_expressions: list[str]) -> None:
+    if not candidates or not hasattr(client, "fetch_alpha_pnl"):
+        return
+    family_counts: dict[str, int] = {}
+    for expression in batch_expressions:
+        key = _structure_family_key(expression)
+        family_counts[key] = family_counts.get(key, 0) + 1
+    for candidate in candidates:
+        alpha_id = str(candidate.get("alpha_id") or "").strip()
+        if not alpha_id:
+            continue
+        metrics = candidate.get("is_metrics") or {}
+        changes = daily_changes_from_pnl(client.fetch_alpha_pnl(alpha_id))
+        evidence = deflated_sharpe_evidence(
+            list(changes.values()),
+            annualized_sharpe=_safe_number(metrics.get("sharpe")),
+            related_trials=family_counts.get(_structure_family_key(str(candidate.get("expression") or "")), 1),
+        )
+        validation = candidate.setdefault("validation", {})
+        if isinstance(validation, dict):
+            validation["overfitting_evidence"] = evidence
 
 
 def _attach_local_correlation_proxy(client, candidates: list[dict]) -> None:
@@ -239,6 +267,7 @@ def run_research_batch(
     results.sort(key=_rank_key, reverse=True)
     candidates = [item for item in results if item.get("passes_primary_thresholds")]
     _attach_local_correlation_proxy(client, candidates)
+    _attach_overfitting_evidence(client, candidates, to_simulate)
 
     sweeps: list[dict] = []
     if sweep_top_n > 0 and not cancelled:

@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
 from typing import Any
 
 from .wq_correlation_proxy import correlation_evidence_is_fresh, correlation_priority_multiplier
+from .wq_overfitting import overfitting_priority_multiplier
 from .wq_research_scheduler import research_cell_key
 
 
@@ -105,7 +105,14 @@ def quality_baseline(candidate: dict[str, Any]) -> dict[str, Any]:
         + components["complexity"] * 0.05
         + components["freshness"] * 0.06
     )
-    return {"score": round(_clamp01(score * local_multiplier), 6), "components": components, "hard_fail": None}
+    overfitting = validation.get("overfitting_evidence")
+    overfitting_multiplier = overfitting_priority_multiplier(overfitting)
+    components["overfitting_multiplier"] = overfitting_multiplier
+    return {
+        "score": round(_clamp01(score * local_multiplier * overfitting_multiplier), 6),
+        "components": components,
+        "hard_fail": None,
+    }
 
 
 def _feedback_choice(candidate: dict[str, Any], feedback: dict[str, Any]) -> tuple[float, int, str]:
@@ -128,7 +135,7 @@ def _feedback_choice(candidate: dict[str, Any], feedback: dict[str, Any]) -> tup
     group_support = 0
     family_feedback = (feedback.get("family") or {}).get(family)
     dataset_feedback = (feedback.get("dataset") or {}).get(dataset)
-    for label, item in (("family", family_feedback), ("dataset", dataset_feedback)):
+    for _label, item in (("family", family_feedback), ("dataset", dataset_feedback)):
         if item and int(item.get("samples") or 0) >= 2:
             group_rates.append(_safe_float(item.get("rate"), global_rate))
             group_support += int(item.get("samples") or 0)

@@ -25,6 +25,7 @@ from .wq_candidate_calibration import calibrate_active_probability, calibration_
 from .wq_correlation_proxy import correlation_priority_multiplier
 from .wq_failure_taxonomy import classify_research_failure
 from .wq_lineage import lineage_id_for, parent_lineage_id_for, recover_research_metadata
+from .wq_overfitting import overfitting_priority_multiplier
 from .wq_research_scheduler import research_cell_key
 
 _DEFAULT_DAILY_BUDGET = 2
@@ -146,7 +147,8 @@ def _priority_score(candidate: dict[str, Any]) -> float:
         - turnover_penalty
         - complexity_penalty
     )
-    return score * correlation_priority_multiplier(candidate.get("local_correlation_proxy"))
+    overfitting_multiplier = overfitting_priority_multiplier(validation.get("overfitting_evidence"))
+    return score * correlation_priority_multiplier(candidate.get("local_correlation_proxy")) * overfitting_multiplier
 
 
 def _smoothed_rate(successes: int, samples: int, *, prior_rate: float, prior_strength: float) -> float:

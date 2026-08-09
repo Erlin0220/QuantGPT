@@ -390,6 +390,13 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
         conversion_feedback = await _load_conversion_feedback(session, account)
 
     research_cells = summarize_research_cells(rows, candidate_rows, formal_rows)
+    overfitting_rows = []
+    for candidate in candidate_rows:
+        details = candidate.validation_details if isinstance(candidate.validation_details, dict) else {}
+        evidence = details.get("overfitting_evidence") if isinstance(details, dict) else None
+        if isinstance(evidence, dict):
+            overfitting_rows.append({"alpha_id": candidate.alpha_id, **evidence})
+    overfitting_available = [item for item in overfitting_rows if item.get("status") == "available"]
     funnel_summary_all = summarize_funnel(funnel_events)
     funnel_summary_recent = summarize_funnel(funnel_events[:500])
     family_counts = Counter(str(row.family or "unknown") for row in rows)
@@ -560,6 +567,17 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
         },
         "metadata_completeness": metadata_completeness,
         "research_cells": research_cells,
+        "overfitting_evidence": {
+            "available": len(overfitting_available),
+            "unavailable": len(overfitting_rows) - len(overfitting_available),
+            "mean_dsr_score": round(
+                sum(float(item.get("score") or 0.0) for item in overfitting_available) / max(1, len(overfitting_available)),
+                6,
+            ),
+            "recent": overfitting_rows[:20],
+            "official_platform_check": False,
+            "pbo_policy": "bounded_optional_for_coherent_variant_families",
+        },
         "candidate_funnel": {
             "all_time": funnel_summary_all,
             "recent_500_events": funnel_summary_recent,
