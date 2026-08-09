@@ -56,6 +56,34 @@ class TestWQMCPAsyncSurface(unittest.IsolatedAsyncioTestCase):
             with self.subTest(name=name):
                 await self._assert_enqueued(name, call)
 
+    async def test_research_reuses_existing_singleflight_task(self):
+        existing = {
+            "task_id": "research-active",
+            "status": "researching",
+            "task_type": "wq_research",
+        }
+        with (
+            patch.dict(
+                os.environ,
+                {"WQ_BRAIN_EMAIL": "test@example.com", "WQ_BRAIN_PASSWORD": "pw"},
+                clear=False,
+            ),
+            patch.object(
+                mcp_server,
+                "start_mcp_task",
+                new=AsyncMock(side_effect=task_helper.MCPTaskAlreadyRunningError(existing)),
+            ),
+            patch.object(mcp_server, "start_mcp_background_task") as start_background,
+        ):
+            payload = json.loads(await mcp_server.wq_brain_research(["rank(close/open)"]))
+
+        self.assertEqual(payload["task_id"], "research-active")
+        self.assertEqual(payload["status"], "researching")
+        self.assertTrue(payload["reused_existing"])
+        self.assertFalse(payload["new_task"])
+        self.assertEqual(payload["poll_with"], "get_task_status")
+        start_background.assert_not_called()
+
     async def test_legacy_check_alphas_path_reads_task_without_wq_request(self):
         snapshot = {
             "task_id": "abc123",
@@ -205,6 +233,98 @@ class TestMCPBackgroundLifecycle(unittest.IsolatedAsyncioTestCase):
         ):
             await task_helper.start_mcp_task("capacity", "x", {}, status="pending")
         self.assertIn(first_task_id, task_helper.tasks)
+
+    async def test_singleflight_blocks_second_active_task(self):
+        with patch.object(
+            task_helper,
+            "_get_persisted_active_mcp_task",
+            new=AsyncMock(return_value=None),
+        ) as get_persisted:
+            first_task_id = await task_helper.start_mcp_task(
+                "wq_research",
+                "rank(close)",
+                {},
+                status="pending",
+                singleflight=True,
+            )
+            self.task_ids.append(first_task_id)
+            with self.assertRaises(task_helper.MCPTaskAlreadyRunningError) as ctx:
+                await task_helper.start_mcp_task(
+                    "wq_research",
+                    "rank(open)",
+                    {},
+                    status="pending",
+                    singleflight=True,
+                )
+
+        self.assertEqual(ctx.exception.task["task_id"], first_task_id)
+        self.assertEqual(get_persisted.await_count, 1)
+        with task_helper.tasks_lock:
+            params = task_helper.tasks[first_task_id]["params"]
+        self.assertTrue(params["_singleflight"])
+        self.assertEqual(params["_singleflight_stale_seconds"], task_helper.MCP_SINGLEFLIGHT_STALE_SECONDS)
+        self.assertIn("_heartbeat_at", params)
+
+    async def test_singleflight_preserves_recent_restart_lease(self):
+        persisted = {
+            "task_id": "recent-research",
+            "status": "researching",
+            "task_type": "wq_research",
+            "params": {
+                "_singleflight": True,
+                "_mcp_instance_id": "old-process",
+                "_singleflight_stale_seconds": 900,
+                "_heartbeat_at": time.time() - 30,
+            },
+        }
+        with (
+            patch.object(
+                task_helper,
+                "_get_persisted_active_mcp_task",
+                new=AsyncMock(return_value=persisted),
+            ),
+            patch.object(
+                task_helper,
+                "_fail_persisted_mcp_task",
+                new=AsyncMock(),
+            ) as fail_persisted,
+        ):
+            active = await task_helper.get_active_mcp_task("wq_research")
+
+        assert active is not None
+        self.assertEqual(active["task_id"], "recent-research")
+        fail_persisted.assert_not_awaited()
+        self.assertTrue(task_helper.is_mcp_singleflight_lease_fresh(persisted))
+
+    async def test_singleflight_releases_orphaned_task_after_restart(self):
+        persisted = {
+            "task_id": "old-research",
+            "status": "researching",
+            "task_type": "wq_research",
+            "params": {
+                "_singleflight": True,
+                "_mcp_instance_id": "old-process",
+                "_singleflight_stale_seconds": 900,
+                "_heartbeat_at": time.time() - 1000,
+            },
+        }
+        with (
+            patch.object(
+                task_helper,
+                "_get_persisted_active_mcp_task",
+                new=AsyncMock(return_value=persisted),
+            ),
+            patch.object(
+                task_helper,
+                "_fail_persisted_mcp_task",
+                new=AsyncMock(),
+            ) as fail_persisted,
+        ):
+            active = await task_helper.get_active_mcp_task("wq_research")
+
+        self.assertIsNone(active)
+        fail_persisted.assert_awaited_once()
+        self.assertEqual(fail_persisted.await_args.args[0], "old-research")
 
     async def test_cancelled_background_worker_stays_cancelled(self):
         task_id = await self._new_task("smoke-cancel")

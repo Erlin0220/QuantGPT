@@ -68,7 +68,7 @@ def _passes_primary_thresholds(result: dict, min_sharpe: float, min_fitness: flo
     failed_checks = {
         str(check.get("name")) for check in metrics.get("checks", []) if str(check.get("result", "")).upper() == "FAIL"
     }
-    blocking_checks = failed_checks - {"SELF_CORRELATION"}
+    blocking_checks = failed_checks
     return (
         sharpe >= min_sharpe
         and fitness >= min_fitness

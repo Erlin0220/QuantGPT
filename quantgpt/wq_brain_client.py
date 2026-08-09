@@ -144,6 +144,16 @@ class WQBrainClient:
         r = self._get_session().get(f"{API_BASE}/users/self", timeout=HTTP_TIMEOUT)
         return r.json() if r.status_code == 200 else {}
 
+    def get_user_competitions(self, user_id: str) -> dict:
+        """Return competition/Challenge progress for the authenticated user."""
+        r = self._get_session().get(f"{API_BASE}/users/{user_id}/competitions", timeout=HTTP_TIMEOUT)
+        return r.json() if r.status_code == 200 else {}
+
+    def get_user_alpha_summary(self) -> dict:
+        """Return platform Alpha counts grouped by submission status."""
+        r = self._get_session().get(f"{API_BASE}/users/self/alphas/summary", timeout=HTTP_TIMEOUT)
+        return r.json() if r.status_code == 200 else {}
+
     def list_operators(self, refresh: bool = False) -> list[dict]:
         """Return the operator catalog currently exposed to this BRAIN account."""
         if self._operators_cache is not None and not refresh:

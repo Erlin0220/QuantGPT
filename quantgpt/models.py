@@ -176,6 +176,108 @@ class SubmittedAlpha(Base):
     )
 
 
+class WQResearchCandidate(Base):
+    __tablename__ = "wq_research_candidates"
+
+    id = Column(Uuid, primary_key=True, default=uuid.uuid4)
+    account = Column(String(20), nullable=False, default="primary", index=True)
+    alpha_id = Column(String(50), nullable=False, index=True)
+    expression = Column(Text, nullable=False)
+    region = Column(String(10), nullable=False, default="USA")
+    universe = Column(String(20), nullable=False, default="TOP3000")
+    delay = Column(Integer, nullable=False, default=1)
+    decay = Column(Integer, nullable=False, default=0)
+    neutralization = Column(String(30), nullable=False, default="SUBINDUSTRY")
+    truncation = Column(Float, nullable=False, default=0.08)
+    sharpe = Column(Float, nullable=True)
+    fitness = Column(Float, nullable=True)
+    returns = Column(Float, nullable=True)
+    turnover = Column(Float, nullable=True)
+    priority_score = Column(Float, nullable=False, default=0.0)
+    family = Column(String(50), nullable=True)
+    hypothesis = Column(Text, nullable=True)
+    parent_expression = Column(Text, nullable=True)
+    generation = Column(Integer, nullable=False, default=0)
+    mutation_type = Column(String(50), nullable=True)
+    structure_signature = Column(Text, nullable=True)
+    tag = Column(String(100), nullable=True)
+    status = Column(String(20), nullable=False, default="queued")
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_wq_candidates_account_alpha", "account", "alpha_id", unique=True),
+        Index("ix_wq_candidates_account_status_priority", "account", "status", "priority_score"),
+    )
+
+
+class WQResearchTrial(Base):
+    __tablename__ = "wq_research_trials"
+
+    id = Column(Uuid, primary_key=True, default=uuid.uuid4)
+    account = Column(String(20), nullable=False, default="primary", index=True)
+    alpha_id = Column(String(50), nullable=True, index=True)
+    expression = Column(Text, nullable=False)
+    expression_normalized = Column(Text, nullable=False)
+    family = Column(String(50), nullable=False, default="unknown", index=True)
+    hypothesis = Column(Text, nullable=True)
+    parent_expression = Column(Text, nullable=True)
+    generation = Column(Integer, nullable=False, default=0)
+    mutation_type = Column(String(50), nullable=True)
+    status = Column(String(30), nullable=False, default="researched", index=True)
+    sharpe = Column(Float, nullable=True)
+    fitness = Column(Float, nullable=True)
+    returns = Column(Float, nullable=True)
+    turnover = Column(Float, nullable=True)
+    self_correlation_failed = Column(Boolean, nullable=False, default=False)
+    mutation_targets = Column(JSON, nullable=True)
+    settings = Column(JSON, nullable=True)
+    tag = Column(String(100), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_wq_trials_account_family", "account", "family"),
+        Index("ix_wq_trials_account_expr", "account", "expression_normalized"),
+        Index("ix_wq_trials_account_status", "account", "status"),
+    )
+
+
+class WQSubmissionAttempt(Base):
+    __tablename__ = "wq_submission_attempts"
+
+    id = Column(Uuid, primary_key=True, default=uuid.uuid4)
+    account = Column(String(20), nullable=False, default="primary", index=True)
+    alpha_id = Column(String(50), nullable=False, index=True)
+    submission_day = Column(String(10), nullable=False, index=True)
+    status = Column(String(20), nullable=False, default="RESERVED")
+    score_state = Column(String(20), nullable=False, default="PENDING")
+    detail = Column(Text, nullable=True)
+    points_at_reservation = Column(Float, nullable=True)
+    points_status_at_reservation = Column(String(30), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_wq_attempts_account_day", "account", "submission_day"),
+        Index("ix_wq_attempts_account_alpha_day", "account", "alpha_id", "submission_day", unique=True),
+    )
+
+
+class WQSubmissionState(Base):
+    __tablename__ = "wq_submission_states"
+
+    id = Column(Uuid, primary_key=True, default=uuid.uuid4)
+    account = Column(String(20), nullable=False, unique=True, index=True)
+    daily_budget = Column(Integer, nullable=False, default=2)
+    last_observed_points = Column(Float, nullable=True)
+    last_points_status = Column(String(30), nullable=True)
+    last_settled_points = Column(Float, nullable=True)
+    last_settled_delta = Column(Float, nullable=True)
+    last_settled_submission_count = Column(Integer, nullable=False, default=0)
+    untracked_active_gap = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)
+
+
 class DailySummary(Base):
     __tablename__ = "daily_summaries"
 

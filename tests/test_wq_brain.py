@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from quantgpt.wq_brain_client import SUBMIT_THRESHOLDS, WQBrainClient, configured_accounts, get_client, is_configured
+from quantgpt.wq_brain_service import run_account_status, run_list_alphas
 
 pytestmark = pytest.mark.asyncio
 
@@ -108,6 +109,183 @@ class TestWQBrainClient:
         mock_session.post.return_value = mock_resp
         c._session = mock_session
         assert c.authenticate() is False
+
+    def test_account_metadata_endpoints(self):
+        c = WQBrainClient(email="a@b.com", password="pw")
+        mock_session = MagicMock()
+        competition_resp = MagicMock(status_code=200)
+        competition_resp.json.return_value = {"results": [{"id": "challenge"}]}
+        summary_resp = MagicMock(status_code=200)
+        summary_resp.json.return_value = {"active": 1, "unsubmitted": 2, "decommissioned": 0}
+        mock_session.get.side_effect = [competition_resp, summary_resp]
+        c._session = mock_session
+
+        assert c.get_user_competitions("U1")["results"][0]["id"] == "challenge"
+        assert c.get_user_alpha_summary()["active"] == 1
+        assert mock_session.get.call_args_list[0].args[0].endswith("/users/U1/competitions")
+        assert mock_session.get.call_args_list[1].args[0].endswith("/users/self/alphas/summary")
+
+
+class TestListAlphasService:
+    def test_status_filter_is_sent_to_platform_before_pagination(self):
+        client = MagicMock()
+        session = MagicMock()
+        client._get_session.return_value = session
+
+        def get_alphas(_url, *, params, timeout):
+            response = MagicMock(status_code=200)
+            if params.get("status") == "ACTIVE":
+                response.json.return_value = {
+                    "results": [{
+                        "id": "active-1",
+                        "status": "ACTIVE",
+                        "regular": {"code": "rank(close)"},
+                        "settings": {"neutralization": "INDUSTRY"},
+                        "is": {"fitness": 1.2, "sharpe": 1.8},
+                    }],
+                }
+            else:
+                response.json.return_value = {
+                    "results": [{
+                        "id": "recent-unsubmitted",
+                        "status": "UNSUBMITTED",
+                        "regular": {"code": "rank(volume)"},
+                        "settings": {"neutralization": "INDUSTRY"},
+                        "is": {"fitness": 0.5, "sharpe": 0.7},
+                    }],
+                }
+            return response
+
+        session.get.side_effect = get_alphas
+
+        result = run_list_alphas(client, limit=100, offset=0, status_filter="active")
+
+        assert result["ok"] is True
+        assert result["total"] == 1
+        assert result["alphas"][0]["alpha_id"] == "active-1"
+        assert session.get.call_args.kwargs["params"]["status"] == "ACTIVE"
+
+
+class TestAccountStatusService:
+    def test_maps_points_levels_and_alpha_counts(self):
+        client = MagicMock()
+        client.get_user_info.return_value = {
+            "id": "U1",
+            "geniusLevel": "BRONZE",
+            "level": "NONE",
+            "onboarding": None,
+        }
+        client.get_user_competitions.return_value = {
+            "results": [{
+                "id": "challenge",
+                "leaderboard": {"score": 1234.0, "level": "BRONZE"},
+                "progress": {"level": "SILVER", "score": {"remaining": 1766.0}},
+            }],
+        }
+        client.get_user_alpha_summary.return_value = {
+            "active": 4,
+            "unsubmitted": 12,
+            "decommissioned": 1,
+        }
+
+        result = run_account_status(client)
+
+        assert result["ok"] is True
+        assert result["points"] == 1234
+        assert result["points_source"] == "challenge.leaderboard.score"
+        assert result["genius_level"] == "BRONZE"
+        assert result["next_genius_level"] == "SILVER"
+        assert result["points_remaining"] == 8766
+        assert result["alpha_counts"] == {
+            "total": 17,
+            "submitted": 5,
+            "active": 4,
+            "unsubmitted": 12,
+            "decommissioned": 1,
+        }
+        assert result["goal_reached"] is False
+
+    def test_does_not_treat_next_level_as_current_level(self):
+        client = MagicMock()
+        client.get_user_info.return_value = {"id": "U1", "geniusLevel": None, "level": "NONE"}
+        client.get_user_competitions.return_value = {
+            "results": [{
+                "id": "challenge",
+                "leaderboard": {"score": 0.0, "level": None},
+                "progress": {"level": "BRONZE", "score": {"remaining": 1000.0}},
+            }],
+        }
+        client.get_user_alpha_summary.return_value = {
+            "active": 1,
+            "unsubmitted": 32,
+            "decommissioned": 0,
+        }
+
+        result = run_account_status(client)
+
+        assert result["points"] == 0
+        assert result["genius_level"] == "NONE"
+        assert result["next_genius_level"] == "BRONZE"
+        assert result["gold_reached"] is False
+        assert result["consultant_status"] == "NOT_CONSULTANT"
+
+    def test_marks_leaderboard_lag_when_active_alphas_are_not_counted(self):
+        client = MagicMock()
+        client.get_user_info.return_value = {"id": "U1", "geniusLevel": None, "level": "NONE"}
+        client.get_user_competitions.return_value = {
+            "results": [{
+                "id": "challenge",
+                "status": "ACCEPTED",
+                "signUpDate": "2026-04-11T12:04:42-04:00",
+                "submissions": False,
+                "leaderboard": {"rank": 129114, "score": 0.0, "alphas": 0, "level": None},
+                "progress": {"level": "BRONZE", "score": {"remaining": 1000.0}},
+            }],
+        }
+        client.get_user_alpha_summary.return_value = {
+            "active": 3,
+            "unsubmitted": 272,
+            "decommissioned": 0,
+        }
+
+        result = run_account_status(client)
+
+        assert result["points"] == 0
+        assert result["points_status"] == "LEADERBOARD_LAGGING"
+        assert result["leaderboard"]["rank"] == 129114
+        assert result["leaderboard"]["alpha_count"] == 0
+        assert result["leaderboard"]["active_alpha_gap"] == 3
+        assert result["challenge"]["status"] == "ACCEPTED"
+        assert result["challenge"]["submissions"] is False
+
+    @patch("quantgpt.wq_brain_service.run_list_alphas")
+    def test_falls_back_to_paginated_alpha_counts(self, mock_list_alphas):
+        client = MagicMock()
+        client.get_user_info.return_value = {"id": "U1", "geniusLevel": None, "level": "NONE"}
+        client.get_user_competitions.return_value = {
+            "results": [{"id": "challenge", "leaderboard": {"score": 0.0, "level": None}}],
+        }
+        client.get_user_alpha_summary.return_value = {}
+        mock_list_alphas.return_value = {
+            "ok": True,
+            "alphas": [
+                {"status": "ACTIVE"},
+                {"status": "UNSUBMITTED"},
+                {"status": "UNSUBMITTED"},
+                {"status": "DECOMMISSIONED"},
+            ],
+        }
+
+        result = run_account_status(client)
+
+        assert result["alpha_counts"] == {
+            "total": 4,
+            "submitted": 2,
+            "active": 1,
+            "unsubmitted": 2,
+            "decommissioned": 1,
+        }
+        mock_list_alphas.assert_called_once_with(client, limit=100, offset=0)
 
 
 class TestWQBrainStatusEndpoint:

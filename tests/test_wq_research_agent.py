@@ -50,3 +50,23 @@ def test_research_batch_canonicalizes_dedupes_ranks_and_never_submits():
     assert result["candidates"][0]["passes_primary_thresholds"] is True
     assert result["invalid"][0]["expression"] == "rank(tanh(close))"
     assert any("signed_power" in item["expression"] for item in result["results"])
+
+
+def test_self_correlation_failure_is_blocking():
+    class SelfCorrelationClient(FakeClient):
+        def simulate(self, expression, **_kwargs):
+            result = super().simulate(expression, **_kwargs)
+            result["is"]["sharpe"] = 1.8
+            result["is"]["fitness"] = 1.4
+            result["is"]["checks"].append({"name": "SELF_CORRELATION", "result": "FAIL"})
+            return result
+
+    result = run_research_batch(
+        SelfCorrelationClient(),
+        ["rank(-ts_delta(close, 10))"],
+        skip_existing=False,
+    )
+
+    assert result["summary"]["candidates"] == 0
+    assert result["results"][0]["passes_primary_thresholds"] is False
+    assert "reduce_self_correlation" in result["results"][0]["mutation_targets"]

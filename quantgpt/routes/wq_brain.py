@@ -1,5 +1,6 @@
 """WQ BRAIN API routes — submit expressions to WorldQuant BRAIN for real simulation."""
 
+import asyncio
 import logging
 import threading
 import time
@@ -7,21 +8,20 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..auth import get_current_user
 from ..db import get_db
 from ..models import User
 from ..task_store import (
+    MAX_ACTIVE_TASKS,
     active_task_count,
     check_rate_limit,
     persist_task_to_db,
     tasks,
     tasks_lock,
-    MAX_ACTIVE_TASKS,
 )
-from ..wq_brain_client import SUBMIT_THRESHOLDS, WQBrainClient, configured_accounts, get_client, is_configured
+from ..wq_brain_client import SUBMIT_THRESHOLDS, configured_accounts, get_client, is_configured
 from ..wq_brain_service import fitness_to_grade, run_list_alphas, run_single_simulation, safe_float
 
 logger = logging.getLogger(__name__)
@@ -48,6 +48,8 @@ class WQBrainSubmitRequest(BaseModel):
 
 
 def _run_wq_brain_task(task_id: str, req: WQBrainSubmitRequest, user_id: str):
+    from ..wq_submission_policy import finalize_submission_attempt_sync, reserve_submission_sync
+
     task = tasks.get(task_id)
     if not task:
         return
@@ -76,6 +78,8 @@ def _run_wq_brain_task(task_id: str, req: WQBrainSubmitRequest, user_id: str):
             auto_submit=req.auto_submit and account == "primary",
             user_id=user_id, tag=req.tag,
             progress_callback=on_progress,
+            submission_guard=lambda alpha_id: reserve_submission_sync(account, alpha_id),
+            submission_result_callback=lambda alpha_id, submit_result: finalize_submission_attempt_sync(account, alpha_id, submit_result),
         )
         client.close()
 
@@ -191,7 +195,8 @@ async def list_submitted_alphas(
     limit: int = 50,
     offset: int = 0,
 ):
-    from sqlalchemy import func, select as sa_select
+    from sqlalchemy import func
+    from sqlalchemy import select as sa_select
 
     from ..models import SubmittedAlpha
 
@@ -260,7 +265,15 @@ async def submit_alpha_from_task(
     if not client.authenticate():
         raise HTTPException(status_code=502, detail=f"WQ BRAIN 认证失败 (account={account})")
 
-    submit_result = client.submit_alpha(alpha_id)
+    from ..wq_submission_policy import finalize_submission_attempt_sync, reserve_submission_sync
+
+    decision = await asyncio.to_thread(reserve_submission_sync, account, alpha_id)
+    if not decision.get("allowed"):
+        client.close()
+        raise HTTPException(status_code=429, detail={"message": "达到本地 WQ 每日提交预算或 Alpha 已在提交中", "submission_policy": decision})
+
+    submit_result = await asyncio.to_thread(client.submit_alpha, alpha_id)
+    await asyncio.to_thread(finalize_submission_attempt_sync, account, alpha_id, submit_result)
     client.close()
     logger.info(f"[{task_id}] submit_alpha({alpha_id}) result: {submit_result}")
 
@@ -323,7 +336,15 @@ async def submit_alpha_by_id(
     client = get_client(account)
     if not client.authenticate():
         raise HTTPException(status_code=502, detail=f"WQ BRAIN 认证失败 (account={account})")
-    result = client.submit_alpha(alpha_id)
+    from ..wq_submission_policy import finalize_submission_attempt_sync, reserve_submission_sync
+
+    decision = await asyncio.to_thread(reserve_submission_sync, account, alpha_id)
+    if not decision.get("allowed"):
+        client.close()
+        raise HTTPException(status_code=429, detail={"message": "达到本地 WQ 每日提交预算或 Alpha 已在提交中", "submission_policy": decision})
+
+    result = await asyncio.to_thread(client.submit_alpha, alpha_id)
+    await asyncio.to_thread(finalize_submission_attempt_sync, account, alpha_id, result)
     client.close()
     logger.info(f"submit-by-id {alpha_id}: {result}")
     return result

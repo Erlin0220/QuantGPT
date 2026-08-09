@@ -32,9 +32,11 @@ from .expression_parser import parse_expression
 from .fundamental_data import ALL_FUNDAMENTAL_NAMES
 from .market_data import BENCHMARK_CODES, UNIVERSES, MarketDataFetcher, fetch_benchmark_returns, get_universe
 from .mcp_task_helper import (
+    MCPTaskAlreadyRunningError,
     MCPTaskCapacityError,
     cancel_mcp_task,
     complete_mcp_task,
+    get_active_mcp_task,
     get_mcp_task_snapshot,
     is_mcp_task_cancelled,
     start_mcp_background_task,
@@ -43,8 +45,10 @@ from .mcp_task_helper import (
 )
 from .report import generate_report
 from .task_executor import _run_backtest_in_process, get_executor
+from .wq_autonomous_research import run_autonomous_research
 from .wq_brain_service import (
     prepare_wq_expression,
+    run_account_status,
     run_batch_simulation,
     run_check_alphas,
     run_list_alphas,
@@ -64,6 +68,10 @@ _MCP_ALLOWED_HOSTS = [
     for host in os.environ.get("QUANTGPT_MCP_ALLOWED_HOSTS", _DEFAULT_MCP_ALLOWED_HOSTS).split(",")
     if host.strip()
 ]
+_WQ_RESEARCH_STALE_SECONDS = max(
+    120,
+    int(os.environ.get("QUANTGPT_WQ_RESEARCH_STALE_SECONDS", "900")),
+)
 
 mcp = FastMCP(
     "quantgpt",
@@ -109,11 +117,39 @@ async def _enqueue_mcp_tool(
     worker,
     *,
     legacy_wq_poll: bool = False,
+    singleflight: bool = False,
+    stale_after_seconds: int | None = None,
     **response_extra,
 ) -> str:
     """Atomically accept a bounded background task and return its polling contract."""
     try:
-        task_id = await start_mcp_task(task_type, expression, params, status="pending")
+        task_id = await start_mcp_task(
+            task_type,
+            expression,
+            params,
+            status="pending",
+            singleflight=singleflight,
+            stale_after_seconds=stale_after_seconds,
+        )
+    except MCPTaskAlreadyRunningError as exc:
+        task = exc.task
+        response = {
+            "task_id": task.get("task_id"),
+            "status": task.get("status", "running"),
+            "async": True,
+            "new_task": False,
+            "reused_existing": True,
+            "message": "已有同类研究任务正在执行，本次未创建重复任务",
+            "poll_with": "get_task_status",
+            "poll_after_seconds": 10,
+            **response_extra,
+        }
+        if legacy_wq_poll:
+            response["legacy_poll"] = {
+                "tool": "wq_brain_check_alphas",
+                "alpha_ids": [f"task:{task.get('task_id')}"],
+            }
+        return json.dumps(response, ensure_ascii=False)
     except MCPTaskCapacityError as exc:
         return json.dumps({"error": str(exc), "retryable": True}, ensure_ascii=False)
 
@@ -883,6 +919,7 @@ async def run_rolling_validation(
 
 def _run_wq_single_mcp_task(task_id: str, params: dict) -> dict:
     from .wq_brain_client import get_client
+    from .wq_submission_policy import finalize_submission_attempt_sync, reserve_submission_sync
 
     client = get_client("primary")
     try:
@@ -910,6 +947,8 @@ def _run_wq_single_mcp_task(task_id: str, params: dict) -> dict:
             tag=params["tag"],
             progress_callback=on_progress,
             check_cancelled=lambda: is_mcp_task_cancelled(task_id),
+            submission_guard=lambda alpha_id: reserve_submission_sync("primary", alpha_id),
+            submission_result_callback=lambda alpha_id, result: finalize_submission_attempt_sync("primary", alpha_id, result),
         )
     finally:
         client.close()
@@ -917,6 +956,7 @@ def _run_wq_single_mcp_task(task_id: str, params: dict) -> dict:
 
 def _run_wq_batch_mcp_task(task_id: str, params: dict) -> dict:
     from .wq_brain_client import get_client
+    from .wq_submission_policy import finalize_submission_attempt_sync, reserve_submission_sync
 
     client = get_client("primary")
     try:
@@ -951,6 +991,8 @@ def _run_wq_batch_mcp_task(task_id: str, params: dict) -> dict:
             tag=params["tag"],
             on_progress=on_progress,
             check_cancelled=lambda: is_mcp_task_cancelled(task_id),
+            submission_guard=lambda alpha_id: reserve_submission_sync("primary", alpha_id),
+            submission_result_callback=lambda alpha_id, result: finalize_submission_attempt_sync("primary", alpha_id, result),
         )
     finally:
         client.close()
@@ -979,7 +1021,7 @@ def _run_wq_research_mcp_task(task_id: str, params: dict) -> dict:
                 progress_message=f"研究进度 {current}/{total}: {stage[:160]}",
             )
 
-        return run_research_batch(
+        result = run_research_batch(
             client,
             params["expressions"],
             goal=params["goal"],
@@ -1000,12 +1042,115 @@ def _run_wq_research_mcp_task(task_id: str, params: dict) -> dict:
             on_progress=on_progress,
             check_cancelled=lambda: is_mcp_task_cancelled(task_id),
         )
+        try:
+            from .wq_research_memory import record_research_trials_sync
+
+            result["research_trials_saved"] = record_research_trials_sync(
+                "primary",
+                result,
+                default_family="",
+                hypothesis=params["goal"],
+                tag=result.get("tag"),
+            )
+        except Exception as exc:
+            logger.warning("Failed to persist WQ research memory: %s", exc)
+            result["research_trials_saved"] = 0
+        try:
+            from .wq_submission_policy import record_research_candidates_sync
+
+            result["candidate_queue_saved"] = record_research_candidates_sync(
+                "primary",
+                result.get("candidates", []),
+                settings=result.get("settings", {}),
+                tag=result.get("tag"),
+            )
+        except Exception as exc:
+            logger.warning("Failed to persist WQ research candidates: %s", exc)
+            result["candidate_queue_saved"] = 0
+        return result
+    finally:
+        client.close()
+
+
+def _run_wq_autonomous_research_mcp_task(task_id: str, params: dict) -> dict:
+    from .wq_brain_client import get_client
+    from .wq_research_memory import load_research_memory_sync, record_research_trials_sync
+    from .wq_submission_policy import record_research_candidates_sync
+
+    client = get_client("primary")
+    try:
+        update_mcp_task(task_id, status="authenticating", progress=0, progress_message="认证 WQ BRAIN", persist=True)
+        if not client.authenticate():
+            return {"ok": False, "error": "WQ BRAIN 认证失败"}
+
+        update_mcp_task(
+            task_id,
+            status="researching",
+            progress=0,
+            progress_message="读取研究记忆并规划低覆盖 Alpha 家族",
+            persist=True,
+        )
+        memory = load_research_memory_sync("primary")
+
+        def on_progress(current: int, total: int, stage: str) -> None:
+            pct = int(current * 100 / total) if total else 0
+            update_mcp_task(
+                task_id,
+                status="researching",
+                progress=min(99, pct),
+                progress_current=current,
+                progress_total=total,
+                progress_message=f"自主研究 {current}/{total}: {stage[:160]}",
+            )
+
+        result = run_autonomous_research(
+            client,
+            memory=memory,
+            goal=params["goal"],
+            tag=params["tag"],
+            region=params["region"],
+            universe=params["universe"],
+            delay=params["delay"],
+            decay=params["decay"],
+            neutralization=params["neutralization"],
+            truncation=params["truncation"],
+            max_simulations=params["max_simulations"],
+            generations=params["generations"],
+            family_count=params["family_count"],
+            min_sharpe=params["min_sharpe"],
+            min_fitness=params["min_fitness"],
+            on_progress=on_progress,
+            check_cancelled=lambda: is_mcp_task_cancelled(task_id),
+        )
+        try:
+            result["research_trials_saved"] = record_research_trials_sync(
+                "primary",
+                result,
+                default_family="",
+                hypothesis=params["goal"],
+                tag=result.get("tag"),
+            )
+        except Exception as exc:
+            logger.warning("Failed to persist autonomous WQ research memory: %s", exc)
+            result["research_trials_saved"] = 0
+        try:
+            result["candidate_queue_saved"] = record_research_candidates_sync(
+                "primary",
+                result.get("candidates", []),
+                settings=result.get("settings", {}),
+                tag=result.get("tag"),
+            )
+        except Exception as exc:
+            logger.warning("Failed to persist autonomous WQ candidates: %s", exc)
+            result["candidate_queue_saved"] = 0
+        return result
     finally:
         client.close()
 
 
 def _run_wq_submit_by_ids_mcp_task(task_id: str, params: dict) -> dict:
     from .wq_brain_client import get_client
+    from .wq_submission_policy import finalize_submission_attempt_sync, reserve_submission_sync
 
     client = get_client(params["account"])
     try:
@@ -1030,6 +1175,8 @@ def _run_wq_submit_by_ids_mcp_task(task_id: str, params: dict) -> dict:
             params["alpha_ids"],
             on_progress=on_progress,
             check_cancelled=lambda: is_mcp_task_cancelled(task_id),
+            submission_guard=lambda alpha_id: reserve_submission_sync(params["account"], alpha_id),
+            submission_result_callback=lambda alpha_id, entry: finalize_submission_attempt_sync(params["account"], alpha_id, entry),
         )
         return {"ok": True, **result}
     finally:
@@ -1303,7 +1450,75 @@ async def wq_brain_research(
         params,
         _run_wq_research_mcp_task,
         legacy_wq_poll=True,
+        singleflight=True,
+        stale_after_seconds=_WQ_RESEARCH_STALE_SECONDS,
         requested=len(params["expressions"]),
+    )
+
+
+@mcp.tool()
+async def wq_brain_autonomous_research(
+    goal: str = "maximize robust low-correlation WorldQuant candidates",
+    tag: str = "wq-autonomous",
+    region: str = "USA",
+    universe: str = "TOP3000",
+    delay: int = 1,
+    decay: int = 0,
+    neutralization: str = "SUBINDUSTRY",
+    truncation: float = 0.08,
+    max_simulations: int = 20,
+    generations: int = 2,
+    family_count: int = 3,
+    min_sharpe: float = 1.25,
+    min_fitness: float = 1.0,
+) -> str:
+    """自主规划并研究 WQ Alpha，不需要调用方手工提供 expressions。
+
+    自动读取持久化研究记忆与近期 BRAIN Alpha，优先探索低覆盖信号家族，执行真实
+    Simulation，并依据 LOW_SHARPE / LOW_FITNESS / TURNOVER /
+    SELF_CORRELATION 等诊断做有限代定向变异。合格 Alpha 自动进入 Candidate Queue，
+    但本工具永远不会正式提交 Alpha，正式提交仍由 Submission Gate 控制。
+
+    Returns:
+        JSON with task_id. Uses the same single-flight ``wq_research`` gate as manual research.
+    """
+    from .wq_brain_client import is_configured as _wq_configured
+
+    if not _wq_configured("primary"):
+        return json.dumps({"error": "WQ BRAIN 未配置 — 请设置 WQ_BRAIN_EMAIL 和 WQ_BRAIN_PASSWORD"})
+    if max_simulations < 4 or max_simulations > 40:
+        return json.dumps({"error": "max_simulations 必须在 4~40 之间"})
+    if generations < 1 or generations > 3:
+        return json.dumps({"error": "generations 必须在 1~3 之间"})
+    if family_count < 1 or family_count > 4:
+        return json.dumps({"error": "family_count 必须在 1~4 之间"})
+
+    params = {
+        "goal": goal,
+        "tag": tag,
+        "region": region,
+        "universe": universe,
+        "delay": delay,
+        "decay": decay,
+        "neutralization": neutralization,
+        "truncation": truncation,
+        "max_simulations": max_simulations,
+        "generations": generations,
+        "family_count": family_count,
+        "min_sharpe": min_sharpe,
+        "min_fitness": min_fitness,
+    }
+    return await _enqueue_mcp_tool(
+        "wq_research",
+        None,
+        params,
+        _run_wq_autonomous_research_mcp_task,
+        legacy_wq_poll=True,
+        singleflight=True,
+        stale_after_seconds=_WQ_RESEARCH_STALE_SECONDS,
+        autonomous=True,
+        max_simulations=max_simulations,
+        generations=generations,
     )
 
 
@@ -1342,6 +1557,105 @@ async def wq_brain_submit_by_ids(
         legacy_wq_poll=True,
         total=len(alpha_ids),
     )
+
+
+@mcp.tool()
+async def wq_brain_account_status(account: str = "primary") -> str:
+    """读取当前 WorldQuant BRAIN 账号的 Points、等级和 Alpha 数量。
+
+    这是 Autonomous WQ Research 的停止条件/进度工具。Points 优先使用 BRAIN Challenge
+    leaderboard score；Gold 使用平台实际 genius level，progress.level 仅表示下一目标等级。
+
+    Args:
+        account: WQ 账号 ('primary' 或 'alt')
+
+    Returns:
+        JSON with points, target_points=10000, genius_level, consultant status,
+        goal_reached and platform Alpha counts.
+    """
+    from .wq_brain_client import get_client
+    from .wq_brain_client import is_configured as _wq_configured
+
+    if not _wq_configured(account):
+        return json.dumps({"error": f"WQ BRAIN 未配置 (account={account})"})
+
+    client = get_client(account)
+    platform_candidate_backfill = None
+    try:
+        authenticated = await asyncio.to_thread(client.authenticate)
+        if not authenticated:
+            return json.dumps({"error": "WQ BRAIN 认证失败"})
+        result = await asyncio.to_thread(run_account_status, client)
+        if account == "primary" and result.get("ok"):
+            platform_candidate_backfill = await asyncio.to_thread(
+                run_list_alphas,
+                client,
+                limit=100,
+                offset=0,
+                min_fitness=1.0,
+                status_filter="UNSUBMITTED",
+            )
+    finally:
+        await asyncio.to_thread(client.close)
+
+    if not result.get("ok"):
+        return json.dumps({"error": result.get("error", "unknown")}, ensure_ascii=False)
+    result["account"] = account
+    try:
+        from .wq_submission_policy import observe_account_status, record_platform_candidates
+
+        if platform_candidate_backfill and platform_candidate_backfill.get("ok"):
+            result["platform_candidates_recovered"] = await record_platform_candidates(
+                account,
+                platform_candidate_backfill.get("alphas", []),
+            )
+        result["submission_policy"] = await observe_account_status(account, result)
+    except Exception as exc:
+        logger.warning("Failed to reconcile WQ submission policy: %s", exc)
+        result["submission_policy"] = {"error": str(exc)}
+
+    if account == "primary":
+        try:
+            active_research = await get_active_mcp_task(
+                "wq_research",
+                stale_after_seconds=_WQ_RESEARCH_STALE_SECONDS,
+            )
+            active_summary = None
+            if active_research:
+                active_summary = {
+                    key: active_research.get(key)
+                    for key in (
+                        "task_id",
+                        "status",
+                        "created_at",
+                        "updated_at",
+                        "progress",
+                        "progress_current",
+                        "progress_total",
+                        "progress_message",
+                    )
+                    if active_research.get(key) is not None
+                }
+            result["research_gate"] = {
+                "mode": "singleflight",
+                "can_start_new": active_summary is None,
+                "active_task": active_summary,
+                "stale_after_seconds": _WQ_RESEARCH_STALE_SECONDS,
+            }
+            from .wq_research_memory import load_research_memory
+
+            memory = await load_research_memory(account, limit=2000)
+            result["research_memory"] = {
+                "trials": memory.get("trials", 0),
+                "family_counts": memory.get("family_counts", {}),
+                "candidate_family_counts": memory.get("candidate_family_counts", {}),
+                "self_correlation_family_counts": memory.get("self_correlation_family_counts", {}),
+                "status_counts": memory.get("status_counts", {}),
+            }
+        except Exception as exc:
+            logger.warning("Failed to read WQ research gate: %s", exc)
+            result["research_gate"] = {"error": str(exc)}
+    return json.dumps(result, ensure_ascii=False, indent=2, default=str)
 
 
 @mcp.tool()
@@ -1436,6 +1750,17 @@ async def wq_brain_check_alphas(
 
     result = await asyncio.to_thread(run_check_alphas, client, alpha_ids)
     await asyncio.to_thread(client.close)
+
+    try:
+        from .wq_submission_policy import reconcile_candidate_platform_statuses
+
+        result["candidate_queue_reconciled"] = await reconcile_candidate_platform_statuses(
+            account,
+            result.get("alphas") or {},
+        )
+    except Exception as exc:
+        logger.warning("Failed to reconcile WQ candidate queue from platform checks: %s", exc)
+        result["candidate_queue_reconciled"] = 0
 
     return json.dumps(result, ensure_ascii=False, indent=2, default=str)
 

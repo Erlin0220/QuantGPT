@@ -67,6 +67,34 @@ def _migrate_add_columns(connection):
         connection, inspector, "submitted_alphas", "tag",
         "ALTER TABLE submitted_alphas ADD COLUMN tag VARCHAR(100)",
     )
+    _add_column_if_missing(
+        connection, inspector, "wq_submission_states", "untracked_active_gap",
+        "ALTER TABLE wq_submission_states ADD COLUMN untracked_active_gap INTEGER NOT NULL DEFAULT 0",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "family",
+        "ALTER TABLE wq_research_candidates ADD COLUMN family VARCHAR(50)",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "hypothesis",
+        "ALTER TABLE wq_research_candidates ADD COLUMN hypothesis TEXT",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "parent_expression",
+        "ALTER TABLE wq_research_candidates ADD COLUMN parent_expression TEXT",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "generation",
+        "ALTER TABLE wq_research_candidates ADD COLUMN generation INTEGER NOT NULL DEFAULT 0",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "mutation_type",
+        "ALTER TABLE wq_research_candidates ADD COLUMN mutation_type VARCHAR(50)",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "structure_signature",
+        "ALTER TABLE wq_research_candidates ADD COLUMN structure_signature TEXT",
+    )
 
 
 def _add_column_if_missing(connection, inspector, table, column, ddl):

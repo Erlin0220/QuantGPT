@@ -26,7 +26,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select, update
+from sqlalchemy import select
 
 from . import task_store
 from .db import close_db, init_db
@@ -49,32 +49,46 @@ async def lifespan(app: FastAPI):
     logger.info("Database initialized")
 
     from .db import _get_session_factory as _sf
+    from .mcp_task_helper import is_mcp_singleflight_lease_fresh
 
+    active_statuses = [
+        "pending",
+        "running",
+        "authenticating",
+        "simulating",
+        "researching",
+        "submitting",
+        "finalizing",
+        "generating_expression",
+        "validating",
+        "fetching_data",
+        "backtesting",
+    ]
     async with _sf()() as session:
-        result = await session.execute(
-            update(TaskModel)
-            .where(
-                TaskModel.status.in_(
-                    [
-                        "pending",
-                        "running",
-                        "authenticating",
-                        "simulating",
-                        "researching",
-                        "submitting",
-                        "finalizing",
-                        "generating_expression",
-                        "validating",
-                        "fetching_data",
-                        "backtesting",
-                    ]
-                )
-            )
-            .values(status="failed", error="进程重启，任务中断")
-        )
-        if result.rowcount:
+        result = await session.execute(select(TaskModel).where(TaskModel.status.in_(active_statuses)))
+        active_tasks = result.scalars().all()
+        cleaned = 0
+        preserved_singleflight = 0
+        for task in active_tasks:
+            persisted = {
+                "params": task.params or {},
+                "created_at": task.created_at.isoformat() if task.created_at else None,
+                "updated_at": task.updated_at.isoformat() if task.updated_at else None,
+            }
+            if is_mcp_singleflight_lease_fresh(persisted):
+                preserved_singleflight += 1
+                continue
+            task.status = "failed"
+            task.error = "进程重启，任务中断"
+            cleaned += 1
+        if cleaned:
             await session.commit()
-            logger.info(f"Cleaned up {result.rowcount} stale running tasks")
+            logger.info("Cleaned up %s stale running tasks", cleaned)
+        if preserved_singleflight:
+            logger.info(
+                "Preserved %s single-flight task leases across restart",
+                preserved_singleflight,
+            )
 
     from .auth import _DEV_USER_ID
     from .db import _get_session_factory

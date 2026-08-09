@@ -282,6 +282,8 @@ def run_single_simulation(
     tag: str | None = None,
     progress_callback: Callable[[int, str], None] | None = None,
     check_cancelled: Callable[[], bool] | None = None,
+    submission_guard: Callable[[str], dict | bool] | None = None,
+    submission_result_callback: Callable[[str, dict], None] | None = None,
 ) -> dict:
     """Simulate one expression and optionally auto-submit. Returns result dict."""
     canonical_expression, validation_error, operator_catalog_source = prepare_wq_expression(client, expression)
@@ -321,9 +323,17 @@ def run_single_simulation(
     grade = fitness_to_grade(m["fitness"])
 
     submitted = False
+    submission_blocked: dict | None = None
     if auto_submit and alpha_id and grade == "A":
-        submit_result = client.submit_alpha(alpha_id)
-        submitted = submit_result.get("ok", False)
+        decision = submission_guard(alpha_id) if submission_guard else {"allowed": True}
+        allowed = decision if isinstance(decision, bool) else bool(decision.get("allowed"))
+        if allowed:
+            submit_result = client.submit_alpha(alpha_id)
+            submitted = submit_result.get("ok", False)
+            if submission_result_callback:
+                submission_result_callback(alpha_id, submit_result)
+        else:
+            submission_blocked = decision if isinstance(decision, dict) else {"allowed": False, "reason": "submission_guard_blocked"}
 
     if submitted and alpha_id and user_id:
         _track_alpha(
@@ -348,6 +358,7 @@ def run_single_simulation(
         "oos_metrics": result.get("oos", {}),
         "settings": result.get("settings", {}),
         "submitted": submitted,
+        "submission_blocked": submission_blocked,
         "simulation_id": result.get("simulation_id"),
         "operator_catalog_source": operator_catalog_source,
     }
@@ -369,6 +380,8 @@ def run_batch_simulation(
     tag: str | None = None,
     on_progress: Callable[[int, int, str], None] | None = None,
     check_cancelled: Callable[[], bool] | None = None,
+    submission_guard: Callable[[str], dict | bool] | None = None,
+    submission_result_callback: Callable[[str, dict], None] | None = None,
 ) -> dict:
     """Sweep expression over region×delay×universe×neutralization grid. Returns result dict."""
     canonical_expression, validation_error, _operator_catalog_source = prepare_wq_expression(client, expression)
@@ -416,9 +429,17 @@ def run_batch_simulation(
         grade = fitness_to_grade(m["fitness"])
 
         submitted = False
+        submission_blocked: dict | None = None
         if auto_submit and alpha_id and grade == "A":
-            submit_result = worker_client.submit_alpha(alpha_id)
-            submitted = submit_result.get("ok", False)
+            decision = submission_guard(alpha_id) if submission_guard else {"allowed": True}
+            allowed = decision if isinstance(decision, bool) else bool(decision.get("allowed"))
+            if allowed:
+                submit_result = worker_client.submit_alpha(alpha_id)
+                submitted = submit_result.get("ok", False)
+                if submission_result_callback:
+                    submission_result_callback(alpha_id, submit_result)
+            else:
+                submission_blocked = decision if isinstance(decision, dict) else {"allowed": False, "reason": "submission_guard_blocked"}
 
         if submitted and alpha_id and user_id:
             _track_alpha(
@@ -448,6 +469,7 @@ def run_batch_simulation(
             "returns": m["returns"],
             "turnover": m["turnover"],
             "submitted": submitted,
+            "submission_blocked": submission_blocked,
             "rating": grade,
         }
 
@@ -477,20 +499,37 @@ def run_submit_by_ids(
     on_progress: Callable[[int, int, str], None] | None = None,
     check_cancelled: Callable[[], bool] | None = None,
     on_each_done: Callable[[str, dict], None] | None = None,
+    submission_guard: Callable[[str], dict | bool] | None = None,
+    submission_result_callback: Callable[[str, dict], None] | None = None,
 ) -> dict:
     """Submit a list of already-simulated alphas. Returns summary dict."""
     results: dict[str, dict] = {}
-    active = sc_fail = timeout = 0
+    active = sc_fail = timeout = blocked = 0
 
     for i, alpha_id in enumerate(alpha_ids):
         if check_cancelled and check_cancelled():
             break
 
-        if i > 0:
-            time.sleep(5)
-
         if on_progress:
             on_progress(i + 1, len(alpha_ids), alpha_id)
+
+        decision = submission_guard(alpha_id) if submission_guard else {"allowed": True}
+        allowed = decision if isinstance(decision, bool) else bool(decision.get("allowed"))
+        if not allowed:
+            blocked += 1
+            entry = {
+                "ok": False,
+                "final_status": "POLICY_BLOCKED",
+                "detail": "submission blocked by local daily policy",
+                "submission_policy": decision if isinstance(decision, dict) else {"allowed": False},
+            }
+            results[alpha_id] = entry
+            if on_each_done:
+                on_each_done(alpha_id, entry)
+            continue
+
+        if i > 0:
+            time.sleep(5)
 
         result = client.submit_alpha(alpha_id)
         entry: dict[str, Any] = {
@@ -517,6 +556,9 @@ def run_submit_by_ids(
 
         results[alpha_id] = entry
 
+        if submission_result_callback:
+            submission_result_callback(alpha_id, entry)
+
         if on_each_done:
             on_each_done(alpha_id, entry)
 
@@ -525,7 +567,168 @@ def run_submit_by_ids(
         "active": active,
         "sc_fail": sc_fail,
         "timeout": timeout,
+        "blocked": blocked,
         "results": results,
+    }
+
+
+def _normalize_level(value: Any) -> str | None:
+    if isinstance(value, str):
+        value = value.strip()
+        return value.upper() if value else None
+    if isinstance(value, dict):
+        for key in ("level", "name", "id", "value"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip().upper()
+    return None
+
+
+def run_account_status(client) -> dict:
+    """Return the BRAIN account progress needed by autonomous research loops."""
+    user_info = client.get_user_info()
+    if not user_info:
+        return {"ok": False, "error": "Failed to fetch BRAIN user info"}
+
+    user_id = str(user_info.get("id") or "").strip()
+    competitions = client.get_user_competitions(user_id) if user_id else {}
+    alpha_summary = client.get_user_alpha_summary()
+    if not any(key in alpha_summary for key in ("active", "unsubmitted", "decommissioned")):
+        fallback_counts = {"active": 0, "unsubmitted": 0, "decommissioned": 0}
+        offset = 0
+        for _ in range(100):
+            page = run_list_alphas(client, limit=100, offset=offset)
+            if not page.get("ok"):
+                fallback_counts = {}
+                break
+            alphas = page.get("alphas", [])
+            for alpha in alphas:
+                status = str(alpha.get("status") or "").lower()
+                if status in fallback_counts:
+                    fallback_counts[status] += 1
+            if len(alphas) < 100:
+                break
+            offset += 100
+        alpha_summary = fallback_counts
+
+    challenge = next(
+        (
+            item
+            for item in competitions.get("results", [])
+            if isinstance(item, dict) and str(item.get("id", "")).lower() == "challenge"
+        ),
+        {},
+    )
+    leaderboard = challenge.get("leaderboard") if isinstance(challenge.get("leaderboard"), dict) else {}
+    progress = challenge.get("progress") if isinstance(challenge.get("progress"), dict) else {}
+    progress_score = progress.get("score") if isinstance(progress.get("score"), dict) else {}
+
+    points = safe_float(leaderboard.get("score"))
+    points_source = "challenge.leaderboard.score" if points is not None else None
+    if points is None:
+        genius_data = user_info.get("geniusLevel")
+        if isinstance(genius_data, dict):
+            for key in ("points", "score"):
+                points = safe_float(genius_data.get(key))
+                if points is not None:
+                    points_source = f"users.self.geniusLevel.{key}"
+                    break
+
+    genius_level = (
+        _normalize_level(user_info.get("geniusLevel"))
+        or _normalize_level(leaderboard.get("level"))
+        or "NONE"
+    )
+    next_genius_level = _normalize_level(progress.get("level"))
+    consultant_level = _normalize_level(user_info.get("level")) or "NONE"
+    onboarding = user_info.get("onboarding")
+    if consultant_level != "NONE":
+        consultant_status = "ACTIVE"
+    elif onboarding:
+        consultant_status = "ONBOARDING"
+    else:
+        consultant_status = "NOT_CONSULTANT"
+
+    def count(name: str) -> int | None:
+        value = alpha_summary.get(name)
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    active = count("active")
+    unsubmitted = count("unsubmitted")
+    decommissioned = count("decommissioned")
+    submitted = None if active is None or decommissioned is None else active + decommissioned
+
+    leaderboard_alpha_count = safe_float(leaderboard.get("alphas"))
+    if leaderboard_alpha_count is not None and float(leaderboard_alpha_count).is_integer():
+        leaderboard_alpha_count = int(leaderboard_alpha_count)
+    leaderboard_rank = safe_float(leaderboard.get("rank"))
+    if leaderboard_rank is not None and float(leaderboard_rank).is_integer():
+        leaderboard_rank = int(leaderboard_rank)
+    active_alpha_gap = None
+    if active is not None and leaderboard_alpha_count is not None:
+        active_alpha_gap = max(0, active - leaderboard_alpha_count)
+    total_alphas = None
+    if active is not None and unsubmitted is not None and decommissioned is not None:
+        total_alphas = active + unsubmitted + decommissioned
+
+    target_points = 10_000
+    points_value = int(points) if points is not None and float(points).is_integer() else points
+    points_remaining = None if points is None else max(0, target_points - points)
+    if points_remaining is not None and float(points_remaining).is_integer():
+        points_remaining = int(points_remaining)
+    gold_reached = genius_level == "GOLD"
+    if points is None:
+        points_status = "UNAVAILABLE"
+    elif active_alpha_gap:
+        points_status = "LEADERBOARD_LAGGING"
+    else:
+        points_status = "CURRENT"
+
+    goal_reached = bool(
+        points is not None
+        and points >= target_points
+        and (gold_reached or consultant_status in {"ONBOARDING", "ACTIVE"})
+    )
+
+    return {
+        "ok": True,
+        "points": points_value,
+        "points_source": points_source,
+        "points_status": points_status,
+        "target_points": target_points,
+        "points_remaining": points_remaining,
+        "genius_level": genius_level,
+        "next_genius_level": next_genius_level,
+        "next_level_points_remaining": safe_float(progress_score.get("remaining")),
+        "gold_reached": gold_reached,
+        "consultant_status": consultant_status,
+        "consultant_level": consultant_level,
+        "goal_reached": goal_reached,
+        "challenge": {
+            "status": challenge.get("status"),
+            "scoring": challenge.get("scoring"),
+            "sign_up_date": challenge.get("signUpDate"),
+            "submissions": challenge.get("submissions"),
+        },
+        "leaderboard": {
+            "rank": leaderboard_rank,
+            "score": points_value,
+            "level": _normalize_level(leaderboard.get("level")),
+            "alpha_count": leaderboard_alpha_count,
+            "active_alpha_gap": active_alpha_gap,
+        },
+        "alpha_counts": {
+            "total": total_alphas,
+            "submitted": submitted,
+            "active": active,
+            "unsubmitted": unsubmitted,
+            "decommissioned": decommissioned,
+        },
     }
 
 
@@ -575,9 +778,14 @@ def run_list_alphas(
 ) -> dict:
     """List alphas from the platform with optional filtering."""
     s = client._get_session()
+    params = {"limit": min(limit, 100), "offset": offset, "order": "-dateCreated"}
+    normalized_status = str(status_filter or "").strip().upper()
+    if normalized_status:
+        params["status"] = normalized_status
+
     r = s.get(
         "https://api.worldquantbrain.com/users/self/alphas",
-        params={"limit": min(limit, 100), "offset": offset, "order": "-dateCreated"},
+        params=params,
         timeout=HTTP_TIMEOUT,
     )
     if r.status_code != 200:
@@ -597,7 +805,7 @@ def run_list_alphas(
 
         if min_fitness is not None and (fitness is None or fitness < min_fitness):
             continue
-        if status_filter and alpha_status.upper() != status_filter.upper():
+        if normalized_status and alpha_status.upper() != normalized_status:
             continue
 
         alphas.append(
