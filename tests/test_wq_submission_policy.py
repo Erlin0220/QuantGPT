@@ -318,6 +318,35 @@ async def test_platform_active_reconciles_stale_candidate_queue_entry(policy_db)
 
 
 @pytest.mark.asyncio
+async def test_platform_sc_value_updates_queued_candidate_and_priority(policy_db):
+    await record_research_candidates(
+        "primary",
+        [
+            {
+                "alpha_id": "sc-valued",
+                "expression": "rank(close)",
+                "is_metrics": {"sharpe": 1.8, "fitness": 1.3, "returns": 0.1, "turnover": 0.2},
+            }
+        ],
+    )
+    before = await get_submission_policy_status("primary")
+    before_item = before["candidate_queue_top"][0]
+    before_priority = before_item["priority_score"]
+
+    updated = await reconcile_candidate_platform_statuses(
+        "primary",
+        {"sc-valued": {"status": "UNSUBMITTED", "sc_result": "PASS", "sc_value": 0.58}},
+    )
+
+    assert updated == 1
+    after = await get_submission_policy_status("primary")
+    item = after["candidate_queue_top"][0]
+    assert item["sc_status"] == "PASS"
+    assert item["self_correlation"] == 0.58
+    assert item["priority_score"] < before_priority
+
+
+@pytest.mark.asyncio
 async def test_nearby_parameter_variants_keep_only_stronger_queue_candidate(policy_db):
     base = {
         "expression": "rank(ts_mean(returns, 10))",

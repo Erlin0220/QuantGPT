@@ -120,6 +120,14 @@ def _migrate_add_columns(connection):
         "ALTER TABLE wq_research_candidates ADD COLUMN validation_details JSON",
     )
     _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "self_correlation",
+        "ALTER TABLE wq_research_candidates ADD COLUMN self_correlation FLOAT",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "sc_status",
+        "ALTER TABLE wq_research_candidates ADD COLUMN sc_status VARCHAR(20)",
+    )
+    _add_column_if_missing(
         connection, inspector, "wq_research_trials", "data_fields",
         "ALTER TABLE wq_research_trials ADD COLUMN data_fields JSON",
     )

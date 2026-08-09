@@ -205,6 +205,8 @@ class WQResearchCandidate(Base):
     validation_status = Column(String(30), nullable=False, default="research_pass")
     robustness_score = Column(Float, nullable=True)
     novelty_score = Column(Float, nullable=True)
+    self_correlation = Column(Float, nullable=True)
+    sc_status = Column(String(20), nullable=True)
     validation_details = Column(JSON, nullable=True)
     tag = Column(String(100), nullable=True)
     status = Column(String(20), nullable=False, default="queued")

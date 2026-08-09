@@ -86,12 +86,18 @@ def _priority_score(candidate: dict[str, Any]) -> float:
         except (TypeError, ValueError):
             return 0.0
 
+    raw_checks = list(metrics.get("checks") or [])
     checks = {
         str(check.get("name") or "").upper(): str(check.get("result") or "").upper()
-        for check in metrics.get("checks") or []
+        for check in raw_checks
     }
+    sc_check = next((check for check in raw_checks if str(check.get("name") or "").upper() == "SELF_CORRELATION"), None)
     if checks.get("SELF_CORRELATION") == "FAIL":
         return -10000.0
+    try:
+        self_correlation = float((sc_check or {}).get("value"))
+    except (TypeError, ValueError):
+        self_correlation = 0.0
 
     turnover = number("turnover")
     turnover_penalty = 0.0
@@ -118,6 +124,7 @@ def _priority_score(candidate: dict[str, Any]) -> float:
         + number("returns") * 50.0
         + robustness * 20.0
         + novelty * 10.0
+        - max(0.0, self_correlation) * 20.0
         - turnover_penalty
         - complexity_penalty
     )
@@ -166,6 +173,19 @@ async def record_research_candidates(
             raw_validation = candidate.get("validation") or {}
             validation = raw_validation if isinstance(raw_validation, dict) else {}
             validation_status = str(validation.get("status") or "legacy_unvalidated")
+            sc_check = next(
+                (
+                    check
+                    for check in (metrics.get("checks") or [])
+                    if str(check.get("name") or "").upper() == "SELF_CORRELATION"
+                ),
+                None,
+            )
+            try:
+                self_correlation = float((sc_check or {}).get("value"))
+            except (TypeError, ValueError):
+                self_correlation = None
+            sc_status = str((sc_check or {}).get("result") or "").upper() or None
             peer_result = await session.execute(
                 select(WQResearchCandidate.expression).where(
                     WQResearchCandidate.account == account,
@@ -202,6 +222,8 @@ async def record_research_candidates(
                 "validation_status": validation_status,
                 "robustness_score": validation.get("robustness_score"),
                 "novelty_score": novelty_score,
+                "self_correlation": self_correlation,
+                "sc_status": sc_status,
                 "validation_details": dict(validation),
                 "tag": tag,
             }
@@ -320,25 +342,53 @@ async def reconcile_candidate_platform_statuses(
         for alpha_id, info in platform_alphas.items():
             platform_status = str((info or {}).get("status") or "").upper()
             sc_result = str((info or {}).get("sc_result") or "").upper()
+            try:
+                sc_value = float((info or {}).get("sc_value"))
+            except (TypeError, ValueError):
+                sc_value = None
             if platform_status == "ACTIVE":
                 target_status = "submitted"
             elif sc_result == "FAIL":
                 target_status = "sc_fail"
             elif platform_status == "UNSUBMITTED":
-                continue
+                target_status = None
             else:
-                continue
+                target_status = None
 
             result = await session.execute(
                 select(WQResearchCandidate).where(
                     WQResearchCandidate.account == account,
                     WQResearchCandidate.alpha_id == str(alpha_id),
-                    WQResearchCandidate.status.in_(["queued", "reserved"]),
+                    WQResearchCandidate.status.in_(["queued", "reserved", "validation_pending", "robustness_fail"]),
                 )
             )
             candidate = result.scalar_one_or_none()
             if candidate is not None:
-                candidate.status = target_status
+                if target_status is not None:
+                    candidate.status = target_status
+                candidate.sc_status = sc_result or candidate.sc_status
+                if sc_value is not None:
+                    candidate.self_correlation = sc_value
+                candidate.priority_score = _priority_score(
+                    {
+                        "expression": candidate.expression,
+                        "is_metrics": {
+                            "fitness": candidate.fitness,
+                            "sharpe": candidate.sharpe,
+                            "returns": candidate.returns,
+                            "turnover": candidate.turnover,
+                            "checks": [
+                                {
+                                    "name": "SELF_CORRELATION",
+                                    "result": candidate.sc_status,
+                                    "value": candidate.self_correlation,
+                                }
+                            ],
+                        },
+                        "validation": {"robustness_score": candidate.robustness_score},
+                        "novelty_score": candidate.novelty_score,
+                    }
+                )
                 updated += 1
         await session.commit()
     return updated
@@ -630,6 +680,8 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
                 "validation_status": item.validation_status,
                 "robustness_score": item.robustness_score,
                 "novelty_score": item.novelty_score,
+                "self_correlation": item.self_correlation,
+                "sc_status": item.sc_status,
                 "data_fields": list(item.data_fields or []),
                 "dataset_id": item.dataset_id,
                 "tag": item.tag,
