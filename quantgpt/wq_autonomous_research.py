@@ -990,13 +990,7 @@ def _knowledge_execution_refinement_eligible(
     min_sharpe: float = 1.25,
     min_fitness: float = 1.0,
 ) -> bool:
-    """Allow exactly one extra generation for a near-threshold knowledge Alpha.
-
-    This is intentionally narrow: only a generation-3 knowledge-linked parent
-    with Sharpe already above target, Fitness within 70% of target, and turnover
-    already inside the normal WQ band qualifies.  The extra generation is for
-    execution refinement, not for reopening broad hypothesis search.
-    """
+    """Allow exactly one extra generation for a near-threshold knowledge Alpha."""
     return bool(
         knowledge_card_ids
         and generation == 3
@@ -1842,7 +1836,13 @@ def run_autonomous_research(
         limit=structural_budget,
         hypothesis=goal,
     )
-    llm_budget = min(4, max(0, exploration_budget - len(knowledge_plan) - len(live_plan) - len(structural_plan)))
+    remaining_after_deterministic = max(0, exploration_budget - len(knowledge_plan) - len(live_plan) - len(structural_plan))
+    # Inventory replenishment must not depend on an external LLM provider. A
+    # transient OpenCode/DeepSeek 5xx used to stall the whole research round
+    # before BRAIN simulation started. Deterministic ACTIVE/near-miss/live-field
+    # paths are sufficient for replenishment; LLM exploration remains available
+    # in NORMAL/EXPLORATION modes where latency is less critical.
+    llm_budget = 0 if inventory_mode == "REPLENISHMENT" else min(4, remaining_after_deterministic)
     llm_plan = build_llm_live_plan(
         client,
         live_fields,

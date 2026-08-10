@@ -609,7 +609,7 @@ def test_knowledge_decay_parent_steps_decay_without_changing_signal_lookbacks():
     assert all(item["knowledge_card_ids"] == [card_id] for item in mutations)
 
 
-def test_generation_three_knowledge_parent_gets_one_bounded_execution_refinement():
+def test_generation_three_knowledge_parent_is_capped_and_defers_to_native_parameter_rescue():
     card_id = "ab65eb3e-ec5e-4c94-ac8c-6aff83566112"
     expression = "rank(ts_decay_linear((-1 * ts_delta(close, 1) / ts_std_dev(close, 20)), 10))"
     result = {
@@ -627,11 +627,8 @@ def test_generation_three_knowledge_parent_gets_one_bounded_execution_refinement
 
     mutations = autonomous.build_targeted_mutations(result, seen=set(), limit=2)
 
-    assert mutations
-    assert mutations[0]["generation"] == 4
-    assert mutations[0]["mutation_type"] == "knowledge_decay_step"
-    assert mutations[0]["expression"] == "rank(ts_decay_linear((-1 * ts_delta(close, 1) / ts_std_dev(close, 20)), 20))"
-    assert all(item["knowledge_card_ids"] == [card_id] for item in mutations)
+    assert mutations == []
+    assert result["mutation_route_terminal_reason"] == "mutation_generation_budget_exhausted"
 
 
 def test_native_decay_rescue_selects_best_knowledge_parent_and_skips_tested_values():
