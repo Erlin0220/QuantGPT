@@ -649,7 +649,9 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
 
     recent_trials = [
         {
+            "alpha_id": row.alpha_id,
             "expression": row.expression,
+            "settings": dict(row.settings or {}),
             "family": row.family,
             "hypothesis": row.hypothesis,
             "parent_expression": row.parent_expression,

@@ -66,6 +66,21 @@ def test_cell_feedback_wins_when_specific_support_is_sufficient():
     assert result["empirical_rate"] == 0.8
 
 
+def test_active_reference_is_a_small_probability_tiebreaker():
+    feedback = {"global": {"rate": 0.5, "samples": 0}, "family": {}, "dataset": {}, "cell": {}}
+    low = calibrate_active_probability(_candidate(active_prior_score=0.1), feedback)
+    high = calibrate_active_probability(_candidate(active_prior_score=0.9), feedback)
+
+    assert high["probability"] > low["probability"]
+    assert high["baseline"]["components"]["active_reference"] == 0.9
+    assert low["baseline"]["components"]["active_reference"] == 0.1
+
+
+def test_missing_active_reference_is_neutral_for_legacy_candidates():
+    result = calibrate_active_probability(_candidate(), {"global": {"rate": 0.5, "samples": 0}})
+    assert result["baseline"]["components"]["active_reference"] == 0.5
+
+
 def test_sparse_cell_falls_back_to_family_dataset_groups():
     feedback = {
         "global": {"rate": 0.4, "samples": 20},

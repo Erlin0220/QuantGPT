@@ -8,11 +8,11 @@ import re
 from collections import Counter
 from typing import Any, Callable
 
-from .wq_brain_service import run_batch_simulation, run_list_alphas
+from .wq_brain_service import run_batch_simulation, run_list_alphas, run_single_simulation
 from .wq_lineage import extract_expression_metadata
 from .wq_mutation_policy import preferred_mutation_classes
 from .wq_operator_registry import validate_wq_expression
-from .wq_research_agent import run_research_batch
+from .wq_research_agent import diagnose_wq_result, run_research_batch
 from .wq_research_memory import classify_wq_family, normalize_wq_expression
 from .wq_research_scheduler import allocate_research_cells
 from .wq_submission_evidence import configured_submission_evidence_policy, submission_evidence_blockers
@@ -348,21 +348,16 @@ def _live_field_templates(field_id: str) -> list[str]:
     ]
 
 
-def build_live_field_plan(
+def _build_live_field_plan_from_fields(
     client,
-    memory: dict[str, Any] | None,
+    fields: list[dict[str, Any]],
     *,
     seen: set[str],
     limit: int,
-    region: str,
-    universe: str,
-    delay: int,
     hypothesis: str,
-) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
-    memory = memory or {}
-    fields, catalog = _live_field_candidates(client, memory, region=region, universe=universe, delay=delay, limit=limit)
+) -> list[dict[str, Any]]:
     if not fields or limit <= 0:
-        return [], catalog, fields
+        return []
     try:
         supported = client.list_operator_names()
     except Exception:
@@ -402,8 +397,155 @@ def build_live_field_plan(
                 }
             )
             if len(plan) >= limit:
-                return plan, catalog, fields
+                return plan
+    return plan
+
+
+def build_live_field_plan(
+    client,
+    memory: dict[str, Any] | None,
+    *,
+    seen: set[str],
+    limit: int,
+    region: str,
+    universe: str,
+    delay: int,
+    hypothesis: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
+    memory = memory or {}
+    fields, catalog = _live_field_candidates(client, memory, region=region, universe=universe, delay=delay, limit=limit)
+    plan = _build_live_field_plan_from_fields(client, fields, seen=seen, limit=limit, hypothesis=hypothesis)
     return plan, catalog, fields
+
+
+def _active_motif_names(active_alphas: list[dict[str, Any]]) -> list[str]:
+    """Extract only broad motifs that have already survived BRAIN formal submission."""
+    motifs: list[str] = []
+    expressions = [str(alpha.get("expression") or "").lower() for alpha in active_alphas]
+    if any("ts_decay_linear" in expression and "rank(-returns)" in expression for expression in expressions):
+        motifs.append("slow_field_x_reversal")
+    if any("ts_std_dev(ts_backfill" in expression and "/" in expression for expression in expressions):
+        motifs.append("field_stability_ratio")
+    if any("rank(-ts_mean(ts_backfill" in expression or "-rank(ts_mean(ts_backfill" in expression for expression in expressions):
+        motifs.append("slow_negative_field")
+    if any("ts_mean(ts_backfill" in expression for expression in expressions):
+        motifs.append("slow_ranked_field")
+    return motifs
+
+
+def _active_reference_profile(active_alphas: list[dict[str, Any]]) -> dict[str, float]:
+    """Build a robust median metric profile from platform-authoritative ACTIVE alphas."""
+    profile: dict[str, float] = {}
+    for key in ("sharpe", "fitness", "returns", "turnover"):
+        values = sorted(
+            _safe_metric(alpha.get(key), math.nan)
+            for alpha in active_alphas
+            if math.isfinite(_safe_metric(alpha.get(key), math.nan))
+        )
+        if values:
+            middle = len(values) // 2
+            profile[key] = values[middle] if len(values) % 2 else (values[middle - 1] + values[middle]) / 2.0
+    return profile
+
+
+def _active_reference_score(item: dict[str, Any], profile: dict[str, float]) -> float:
+    """Score candidate quality against real ACTIVE outcomes without requiring many labels."""
+    if not profile:
+        return 0.0
+    metrics = item.get("is_metrics") or item
+    sharpe = _safe_metric(metrics.get("sharpe"))
+    fitness = _safe_metric(metrics.get("fitness"))
+    returns = _safe_metric(metrics.get("returns"))
+    turnover = _safe_metric(metrics.get("turnover"))
+
+    def progress(value: float, target: float) -> float:
+        if target <= 0:
+            return 0.0
+        return max(0.0, min(1.0, value / target))
+
+    turnover_component = 1.0 if 0.03 <= turnover <= 0.5 else max(0.0, 1.0 - abs(turnover - profile.get("turnover", 0.2)) / 0.7)
+    return round(
+        progress(fitness, profile.get("fitness", 1.0)) * 0.45
+        + progress(sharpe, profile.get("sharpe", 1.5)) * 0.30
+        + progress(returns, profile.get("returns", 0.10)) * 0.10
+        + turnover_component * 0.15,
+        4,
+    )
+
+
+def build_active_motif_plan(
+    client,
+    active_alphas: list[dict[str, Any]],
+    fields: list[dict[str, Any]],
+    *,
+    seen: set[str],
+    limit: int,
+    hypothesis: str,
+) -> list[dict[str, Any]]:
+    """Transfer proven ACTIVE operator motifs onto different live fields.
+
+    This deliberately avoids cloning the ACTIVE expression itself: the successful
+    transformation shape is reused while the information source changes, reducing
+    the chance that exploitation simply creates a self-correlation failure.
+    """
+    if limit <= 0 or not active_alphas or not fields:
+        return []
+    motifs = _active_motif_names(active_alphas)
+    if not motifs:
+        return []
+    try:
+        supported = client.list_operator_names()
+    except Exception:
+        supported = set()
+
+    plan: list[dict[str, Any]] = []
+    active_expressions = [str(alpha.get("expression") or "") for alpha in active_alphas]
+    active_fields = set().union(*(set(extract_expression_metadata(expression).get("data_fields") or []) for expression in active_expressions))
+    for motif in motifs:
+        for field in fields:
+            field_id = _live_field_id(field)
+            if not field_id or field_id in active_fields:
+                continue
+            base = f"ts_backfill({field_id}, 60)"
+            if motif == "slow_field_x_reversal":
+                expression = f"ts_decay_linear(rank(ts_mean({base}, 20)) * rank(-returns), 5)"
+            elif motif == "field_stability_ratio":
+                expression = f"rank(ts_mean({base}, 20) / (ts_std_dev({base}, 60) + 0.001))"
+            elif motif == "slow_negative_field":
+                expression = f"rank(-ts_mean({base}, 20))"
+            else:
+                expression = f"rank(ts_mean({base}, 20))"
+            validation = validate_wq_expression(expression, supported) if supported else None
+            if validation is not None and not validation.ok:
+                continue
+            expression = validation.expression if validation is not None else expression
+            normalized = normalize_wq_expression(expression)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            dataset = field.get("dataset") or {}
+            dataset_id = dataset.get("id") if isinstance(dataset, dict) else dataset
+            dataset_category = _dataset_category(dataset) if isinstance(dataset, dict) else None
+            plan.append(
+                {
+                    "expression": expression,
+                    "family": _classify_live_field(field),
+                    "generation": 1,
+                    "hypothesis": hypothesis,
+                    "parent_expression": None,
+                    "mutation_type": "active_motif_transfer",
+                    "mutation_reason": f"transfer proven ACTIVE motif {motif} onto a different live field",
+                    "planner_strategy": "active_motif_transfer",
+                    "data_fields": [field_id],
+                    "dataset_id": dataset_id,
+                    "dataset_category": dataset_category,
+                    "provenance_state": "resolved" if dataset_id else "unresolved",
+                    "provenance_reason": "active_motif_live_field_transfer",
+                }
+            )
+            if len(plan) >= limit:
+                return plan
+    return plan
 
 
 def build_structural_live_plan(
@@ -1190,6 +1332,86 @@ def build_memory_mutation_plan(
     return plan
 
 
+def build_platform_near_miss_plan(
+    alphas: list[dict[str, Any]],
+    *,
+    seen: set[str],
+    limit: int,
+    hypothesis: str,
+    min_sharpe: float = 1.25,
+    min_fitness: float = 1.0,
+) -> list[dict[str, Any]]:
+    """Exploit strong UNSUBMITTED near-misses before spending budget on fresh random seeds."""
+    if limit <= 0:
+        return []
+    parents: list[tuple[float, dict[str, Any]]] = []
+    for alpha in alphas or []:
+        if str(alpha.get("status") or "").upper() != "UNSUBMITTED":
+            continue
+        expression = str(alpha.get("expression") or "").strip()
+        sharpe = _safe_metric(alpha.get("sharpe"), -999.0)
+        fitness = _safe_metric(alpha.get("fitness"), -999.0)
+        turnover = _safe_metric(alpha.get("turnover"), 0.0)
+        returns = _safe_metric(alpha.get("returns"), -999.0)
+        if not expression or sharpe < min_sharpe * 0.88 or not (min_fitness * 0.65 <= fitness < min_fitness):
+            continue
+        if returns <= 0 or not 0.01 <= turnover <= 1.2:
+            continue
+        turnover_score = 1.0 if turnover <= 0.5 else max(0.0, 1.0 - (turnover - 0.5) / 0.7)
+        promise = min(1.25, sharpe / max(0.01, min_sharpe)) * 0.35 + min(1.0, fitness / max(0.01, min_fitness)) * 0.5 + turnover_score * 0.15
+        parents.append((promise, alpha))
+    parents.sort(key=lambda item: (item[0], str(item[1].get("alpha_id") or "")), reverse=True)
+
+    plan: list[dict[str, Any]] = []
+    # One child per parent first; only then allow a second child from the best
+    # parent. This keeps near-miss exploitation diversified instead of parameter
+    # sweeping a single Alpha lineage.
+    for per_parent_limit in (1, 2):
+        for _promise, alpha in parents:
+            expression = str(alpha.get("expression") or "")
+            turnover = _safe_metric(alpha.get("turnover"), 0.0)
+            targets = ["improve_fitness"]
+            if turnover > 0.5:
+                targets.insert(0, "reduce_turnover")
+            synthetic = {
+                "expression": expression,
+                "alpha_id": alpha.get("alpha_id"),
+                "is_metrics": {
+                    "sharpe": alpha.get("sharpe"),
+                    "fitness": alpha.get("fitness"),
+                    "returns": alpha.get("returns"),
+                    "turnover": alpha.get("turnover"),
+                    "checks": [],
+                },
+                "mutation_targets": targets,
+                "failure_reason": "low_fitness",
+                "research_meta": {
+                    "family": classify_wq_family(expression),
+                    "generation": 1,
+                    "hypothesis": hypothesis,
+                    "mutation_type": "platform_near_miss_parent",
+                    "planner_strategy": "platform_near_miss",
+                    "source_run_id": str(alpha.get("alpha_id") or ""),
+                },
+            }
+            variants = build_targeted_mutations(
+                synthetic,
+                seen=seen,
+                limit=min(per_parent_limit, limit - len(plan)),
+                hypothesis=hypothesis,
+            )
+            for variant in variants:
+                variant["planner_strategy"] = "platform_near_miss"
+                variant["mutation_reason"] = (
+                    f"repair platform near-miss {alpha.get('alpha_id')}: "
+                    + str(variant.get("mutation_reason") or "directed mutation")
+                )
+                plan.append(variant)
+                if len(plan) >= limit:
+                    return plan
+    return plan
+
+
 def _build_next_generation_plan(
     ranked: list[dict[str, Any]],
     *,
@@ -1330,14 +1552,153 @@ def _merge_candidate_validation(
     return validation
 
 
-def _rank_result(item: dict[str, Any]) -> tuple[float, float, float]:
+def _rank_result(item: dict[str, Any]) -> tuple[float, float, float, float]:
     metrics = item.get("is_metrics") or {}
     def num(key: str) -> float:
         try:
             return float(metrics.get(key) or -999.0)
         except (TypeError, ValueError):
             return -999.0
-    return num("fitness"), num("sharpe"), num("returns")
+    active_prior = _safe_metric(item.get("active_prior_score"), 0.0)
+    # ACTIVE similarity is a weak tiebreaker, not a replacement for raw Fitness.
+    # This ensures real platform outcomes influence scarce robustness-validation
+    # slots without turning the search into cloning historical Alphas.
+    return num("fitness") + active_prior * 0.12, num("sharpe"), num("returns"), active_prior
+
+
+def _select_native_decay_rescue_parent(
+    memory: dict[str, Any],
+    *,
+    min_sharpe: float,
+    min_fitness: float,
+    current_decay: int,
+) -> tuple[dict[str, Any] | None, list[int]]:
+    """Select one near-threshold knowledge trial for a tiny native-decay sweep."""
+    if int(current_decay) != 0:
+        return None, []
+    recent = list(memory.get("recent_trials") or [])
+    tested_by_expression: dict[str, set[int]] = {}
+    for trial in recent:
+        norm = normalize_wq_expression(str(trial.get("expression") or ""))
+        settings = trial.get("settings") or {}
+        if not norm or not isinstance(settings, dict):
+            continue
+        try:
+            tested_by_expression.setdefault(norm, set()).add(int(settings.get("decay", 0) or 0))
+        except (TypeError, ValueError):
+            continue
+
+    eligible: list[dict[str, Any]] = []
+    for trial in recent:
+        if not list(trial.get("knowledge_card_ids") or []):
+            continue
+        sharpe = _safe_metric(trial.get("sharpe"))
+        fitness = _safe_metric(trial.get("fitness"))
+        turnover = _safe_metric(trial.get("turnover"))
+        returns = _safe_metric(trial.get("returns"))
+        if (
+            sharpe >= min_sharpe
+            and min_fitness * 0.7 <= fitness < min_fitness
+            and 0.01 <= turnover <= 0.8
+            and returns > 0
+        ):
+            eligible.append(trial)
+    if not eligible:
+        return None, []
+    eligible.sort(
+        key=lambda item: (
+            _safe_metric(item.get("fitness")),
+            _safe_metric(item.get("sharpe")),
+            -abs(_safe_metric(item.get("turnover")) - 0.5),
+        ),
+        reverse=True,
+    )
+    parent = eligible[0]
+    norm = normalize_wq_expression(str(parent.get("expression") or ""))
+    tested = tested_by_expression.get(norm, {0})
+    return parent, [value for value in (2, 4) if value not in tested][:2]
+
+
+def _run_native_decay_rescue(
+    client,
+    parent: dict[str, Any],
+    decay_values: list[int],
+    *,
+    goal: str,
+    tag: str,
+    region: str,
+    universe: str,
+    delay: int,
+    neutralization: str,
+    truncation: float,
+    min_sharpe: float,
+    min_fitness: float,
+    check_cancelled: Callable[[], bool] | None = None,
+) -> list[dict[str, Any]]:
+    expression = str(parent.get("expression") or "").strip()
+    if not expression or not decay_values:
+        return []
+    base_meta = {
+        "family": parent.get("family") or classify_wq_family(expression),
+        "generation": int(parent.get("generation") or 0),
+        "hypothesis": parent.get("hypothesis") or goal,
+        "parent_expression": expression,
+        "parent_alpha_id": parent.get("alpha_id"),
+        "mutation_type": "native_decay_rescue",
+        "mutation_reason": "near-threshold knowledge Alpha: bounded BRAIN-native decay before deeper FASTEXPR mutation",
+        "planner_strategy": "knowledge_native_parameter_rescue",
+        "knowledge_card_ids": list(parent.get("knowledge_card_ids") or []),
+        "data_fields": list(parent.get("data_fields") or []),
+        "dataset_id": parent.get("dataset_id"),
+        "dataset_category": parent.get("dataset_category"),
+        "provenance_state": parent.get("provenance_state"),
+        "provenance_reason": parent.get("provenance_reason"),
+    }
+    out: list[dict[str, Any]] = []
+    for native_decay in decay_values[:2]:
+        if check_cancelled and check_cancelled():
+            break
+        result = run_single_simulation(
+            client,
+            expression,
+            region=region,
+            universe=universe,
+            delay=delay,
+            decay=int(native_decay),
+            neutralization=neutralization,
+            truncation=truncation,
+            auto_submit=False,
+            tag=f"{tag}-native-decay-{native_decay}",
+            check_cancelled=check_cancelled,
+        )
+        if not result.get("ok"):
+            continue
+        metrics = result.get("is_metrics") or {}
+        sharpe = _safe_metric(metrics.get("sharpe"))
+        fitness = _safe_metric(metrics.get("fitness"))
+        turnover = _safe_metric(metrics.get("turnover"))
+        failed_checks = {
+            str(item.get("name"))
+            for item in (metrics.get("checks") or [])
+            if str(item.get("result") or "").upper() == "FAIL"
+        }
+        result["passes_primary_thresholds"] = bool(
+            sharpe >= min_sharpe
+            and fitness >= min_fitness
+            and 0.01 <= turnover <= 0.7
+            and not failed_checks
+        )
+        result["mutation_targets"] = diagnose_wq_result(result, min_sharpe, min_fitness)
+        result["research_meta"] = dict(base_meta)
+        result["research_meta"]["native_decay"] = int(native_decay)
+        result["parameter_rescue"] = {
+            "type": "brain_native_decay",
+            "parent_alpha_id": parent.get("alpha_id"),
+            "parent_expression": expression,
+            "decay": int(native_decay),
+        }
+        out.append(result)
+    return out
 
 
 def run_autonomous_research(
@@ -1370,8 +1731,11 @@ def run_autonomous_research(
     # Seed the persistent memory with recent platform research so the first autonomous
     # run does not simply rediscover the last externally-created expressions.
     recent = run_list_alphas(client, limit=100)
+    recent_alphas = list(recent.get("alphas") or []) if recent.get("ok") else []
+    active_alphas = [alpha for alpha in recent_alphas if str(alpha.get("status") or "").upper() == "ACTIVE"]
+    active_reference_profile = _active_reference_profile(active_alphas)
     if recent.get("ok"):
-        for alpha in recent.get("alphas") or []:
+        for alpha in recent_alphas:
             expression = str(alpha.get("expression") or "")
             norm = normalize_wq_expression(expression)
             if norm:
@@ -1398,22 +1762,57 @@ def run_autonomous_research(
     memory["adaptive_allocation"] = adaptive_allocation
     seen = set(normalized)
 
-    # Reserve most first-generation budget for genuinely new hypotheses. In
-    # replenishment mode, repeated failed parents are capped aggressively so the
-    # search does not spend another round in the same low-yield local optimum.
-    memory_parent_budget = min(
-        first_budget,
-        max(0, math.ceil(first_budget * (0.25 if inventory_mode == "REPLENISHMENT" else 0.30))),
-    )
-    memory_plan = build_memory_mutation_plan(
-        memory,
+    # In inventory replenishment, exploit two sources that are much closer to
+    # ACTIVE than random seeds: motifs from actual platform ACTIVE alphas and
+    # strong UNSUBMITTED near-misses. Any unused quota automatically flows back
+    # to fresh exploration, so sparse platform history never starves discovery.
+    if inventory_mode == "REPLENISHMENT":
+        active_share, near_miss_share, memory_share = 0.45, 0.30, 0.10
+    elif inventory_mode == "NORMAL":
+        active_share, near_miss_share, memory_share = 0.25, 0.20, 0.20
+    else:
+        active_share, near_miss_share, memory_share = 0.15, 0.15, 0.20
+
+    active_motif_budget = max(0, math.ceil(first_budget * active_share))
+    near_miss_budget = max(0, math.ceil(first_budget * near_miss_share))
+    memory_parent_budget = max(0, math.ceil(first_budget * memory_share))
+
+    near_miss_plan = build_platform_near_miss_plan(
+        recent_alphas,
         seen=seen,
-        limit=memory_parent_budget,
+        limit=min(first_budget, near_miss_budget),
         hypothesis=goal,
         min_sharpe=min_sharpe,
         min_fitness=min_fitness,
     )
-    exploration_budget = max(0, first_budget - len(memory_plan))
+    memory_plan = build_memory_mutation_plan(
+        memory,
+        seen=seen,
+        limit=min(max(0, first_budget - len(near_miss_plan)), memory_parent_budget),
+        hypothesis=goal,
+        min_sharpe=min_sharpe,
+        min_fitness=min_fitness,
+    )
+
+    field_probe_budget = max(3, min(first_budget, max(active_motif_budget, math.ceil(first_budget * 0.20))))
+    live_fields, live_catalog = _live_field_candidates(
+        client,
+        memory,
+        region=region,
+        universe=universe,
+        delay=delay,
+        limit=field_probe_budget,
+    )
+    active_motif_plan = build_active_motif_plan(
+        client,
+        active_alphas,
+        live_fields,
+        seen=seen,
+        limit=min(max(0, first_budget - len(near_miss_plan) - len(memory_plan)), active_motif_budget),
+        hypothesis=goal,
+    )
+
+    exploration_budget = max(0, first_budget - len(active_motif_plan) - len(near_miss_plan) - len(memory_plan))
     knowledge_budget = min(6, exploration_budget, max(0, math.ceil(exploration_budget * 0.25)))
     knowledge_plan = build_knowledge_seed_plan(
         client,
@@ -1425,14 +1824,11 @@ def run_autonomous_research(
     )
     live_remaining = max(0, exploration_budget - len(knowledge_plan))
     live_budget = min(live_remaining, max(0, math.ceil(exploration_budget * 0.35)))
-    live_plan, live_catalog, live_fields = build_live_field_plan(
+    live_plan = _build_live_field_plan_from_fields(
         client,
-        memory,
+        live_fields,
         seen=seen,
         limit=live_budget,
-        region=region,
-        universe=universe,
-        delay=delay,
         hypothesis=goal,
     )
     structural_budget = min(
@@ -1467,7 +1863,16 @@ def run_autonomous_research(
     for item in seed_plan:
         seen.add(normalize_wq_expression(item["expression"]))
 
-    planned_count = len(memory_plan) + len(knowledge_plan) + len(live_plan) + len(structural_plan) + len(llm_plan) + len(seed_plan)
+    planned_count = (
+        len(active_motif_plan)
+        + len(near_miss_plan)
+        + len(memory_plan)
+        + len(knowledge_plan)
+        + len(live_plan)
+        + len(structural_plan)
+        + len(llm_plan)
+        + len(seed_plan)
+    )
     if planned_count < first_budget:
         memory_plan.extend(
             build_memory_mutation_plan(
@@ -1480,7 +1885,17 @@ def run_autonomous_research(
             )
         )
     first_plan = [
-        item for item in (memory_plan + knowledge_plan + live_plan + structural_plan + llm_plan + seed_plan)
+        item
+        for item in (
+            active_motif_plan
+            + near_miss_plan
+            + memory_plan
+            + knowledge_plan
+            + live_plan
+            + structural_plan
+            + llm_plan
+            + seed_plan
+        )
         if not _violates_prevention_rules(item, memory.get("prevention_rules"))
     ]
     generation_results: list[dict[str, Any]] = []
@@ -1498,6 +1913,13 @@ def run_autonomous_research(
     validation_candidates_used = 0
     validation_simulations = 0
     robustness_feedback_failures = 0
+    native_decay_parent, native_decay_values = _select_native_decay_rescue_parent(
+        memory,
+        min_sharpe=min_sharpe,
+        min_fitness=min_fitness,
+        current_decay=decay,
+    )
+    native_decay_results: list[dict[str, Any]] = []
     remaining = max_simulations
     plan = first_plan
     for item in first_plan:
@@ -1535,6 +1957,10 @@ def run_autonomous_research(
             check_cancelled=check_cancelled,
         )
         _annotate_batch(batch, plan)
+        for result_item in batch.get("results") or []:
+            result_item["active_prior_score"] = _active_reference_score(result_item, active_reference_profile)
+        for candidate_item in batch.get("candidates") or []:
+            candidate_item["active_prior_score"] = _active_reference_score(candidate_item, active_reference_profile)
         batch["generation"] = generation_index
         generation_results.append(batch)
         all_results.extend(batch.get("results") or [])
@@ -1612,6 +2038,54 @@ def run_autonomous_research(
                 seen.add(normalize_wq_expression(item["expression"]))
         plan = [item for item in next_plan if not _violates_prevention_rules(item, memory.get("prevention_rules"))]
 
+    # A near-threshold literature-backed Alpha gets one tiny settings sweep after
+    # the primary expression budget. This reuses the proven hypothesis and avoids
+    # consuming more FASTEXPR generations merely to fix implementation turnover.
+    if native_decay_parent and native_decay_values and not (check_cancelled and check_cancelled()):
+        native_decay_results = _run_native_decay_rescue(
+            client,
+            native_decay_parent,
+            native_decay_values,
+            goal=goal,
+            tag=tag,
+            region=region,
+            universe=universe,
+            delay=delay,
+            neutralization=neutralization,
+            truncation=truncation,
+            min_sharpe=min_sharpe,
+            min_fitness=min_fitness,
+            check_cancelled=check_cancelled,
+        )
+        for result_item in native_decay_results:
+            result_item["active_prior_score"] = _active_reference_score(result_item, active_reference_profile)
+        all_results.extend(native_decay_results)
+        rescue_candidates = [item for item in native_decay_results if item.get("passes_primary_thresholds")]
+        for candidate in rescue_candidates:
+            if validation_candidates_used < validation_cap and not (check_cancelled and check_cancelled()):
+                validation = validate_candidate_robustness(
+                    client,
+                    candidate,
+                    region=region,
+                    universe=universe,
+                    delay=delay,
+                    decay=int(((candidate.get("settings") or {}).get("decay")) or 0),
+                    neutralization=neutralization,
+                    truncation=truncation,
+                    check_cancelled=check_cancelled,
+                )
+                validation_candidates_used += 1
+            else:
+                validation = {
+                    "status": "validation_pending",
+                    "robustness_score": None,
+                    "validation_simulations": 0,
+                    "reason": f"per-round validation cap:{validation_cap}",
+                }
+            _merge_candidate_validation(candidate, validation)
+            validation_simulations += int(validation.get("validation_simulations") or 0)
+        all_candidates.extend(rescue_candidates)
+
     # All primary candidates were validated (or explicitly marked pending) as
     # they emerged, so no terminal-only robustness pass is needed here.
     ranked_primary_candidates = sorted(all_candidates, key=_rank_result, reverse=True)
@@ -1645,6 +2119,7 @@ def run_autonomous_research(
         "research_memory_guidance": memory.get("research_memory_guidance") or {},
         "knowledge_guidance": memory.get("knowledge_guidance") or {},
         "inventory_mode": inventory_mode,
+        "active_reference_profile": active_reference_profile,
         "live_catalog": live_catalog,
         "memory_before": {
             "trials": int(memory.get("trials") or 0),
@@ -1656,6 +2131,12 @@ def run_autonomous_research(
             "generations_completed": len(generation_results),
             "primary_simulation_budget": max_simulations,
             "primary_simulation_budget_scope": "research_generations_only",
+            "native_decay_rescue_parent": (native_decay_parent or {}).get("alpha_id") if native_decay_parent else None,
+            "native_decay_rescue_values": list(native_decay_values),
+            "native_decay_rescue_simulations": len(native_decay_results),
+            "active_reference_alphas": len(active_alphas),
+            "active_motif_expressions": len(active_motif_plan),
+            "platform_near_miss_expressions": len(near_miss_plan),
             "memory_parent_mutations": len(memory_plan),
             "knowledge_seed_expressions": len(knowledge_plan),
             "live_field_expressions": len(live_plan),
@@ -1671,9 +2152,10 @@ def run_autonomous_research(
             "validation_simulations": validation_simulations,
             "validation_cap": validation_cap,
             "validation_simulation_budget_upper_bound": validation_cap * 2,
-            "total_simulation_budget_upper_bound": max_simulations + validation_cap * 2,
-            "total_simulations": sum(int((item.get("summary") or {}).get("simulated") or 0) for item in generation_results) + validation_simulations,
-            "simulation_budget_note": "max_simulations is the primary-generation budget; robustness validation is separately bounded and both budgets are explicit",
+            "native_decay_rescue_budget_upper_bound": 2,
+            "total_simulation_budget_upper_bound": max_simulations + validation_cap * 2 + 2,
+            "total_simulations": sum(int((item.get("summary") or {}).get("simulated") or 0) for item in generation_results) + validation_simulations + len(native_decay_results),
+            "simulation_budget_note": "max_simulations is the primary-generation budget; robustness validation and a max-2 knowledge native-decay rescue are separately bounded and explicit",
             "directed_mutation_routes": sum(1 for item in all_results if item.get("directed_mutation_routed")),
             "simulation_failed": len(all_failed),
             "invalid": len(all_invalid),

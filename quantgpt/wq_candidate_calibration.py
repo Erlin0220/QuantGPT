@@ -82,6 +82,8 @@ def quality_baseline(candidate: dict[str, Any]) -> dict[str, Any]:
         turnover_component = 0.0
     expression = str(candidate.get("expression") or "")
     complexity = _clamp01(1.0 - max(0, expression.count("(") - 4) / 12.0)
+    raw_active_prior = candidate.get("active_prior_score")
+    active_reference = 0.5 if raw_active_prior is None else _clamp01(_safe_float(raw_active_prior, 0.5))
     validation_ready = str(validation.get("status") or "").lower() == "ready"
     freshness = 1.0 if validation_ready else 0.7
     if local_proxy.get("status") == "available":
@@ -98,17 +100,19 @@ def quality_baseline(candidate: dict[str, Any]) -> dict[str, Any]:
         "turnover": turnover_component,
         "complexity": complexity,
         "freshness": freshness,
+        "active_reference": active_reference,
     }
     score = (
-        components["fitness"] * 0.24
-        + components["sharpe"] * 0.19
+        components["fitness"] * 0.21
+        + components["sharpe"] * 0.17
         + components["returns"] * 0.07
-        + components["robustness"] * 0.14
+        + components["robustness"] * 0.13
         + components["novelty"] * 0.08
         + components["official_correlation"] * 0.10
         + components["turnover"] * 0.07
         + components["complexity"] * 0.05
-        + components["freshness"] * 0.06
+        + components["freshness"] * 0.04
+        + components["active_reference"] * 0.08
     )
     overfitting = validation.get("overfitting_evidence")
     overfitting_multiplier = overfitting_priority_multiplier(overfitting)

@@ -129,6 +129,88 @@ def test_seed_plan_skips_fields_brain_reported_as_unknown():
     assert all("mdf_bp" not in item["expression"] for item in plan)
 
 
+def test_active_motif_plan_transfers_proven_structure_to_different_live_field():
+    class FakeClient:
+        pass
+
+    active = [
+        {
+            "alpha_id": "active-1",
+            "status": "ACTIVE",
+            "expression": "ts_decay_linear(rank(ts_mean(ts_backfill(old_signal, 60), 20)) * rank(-returns), 5)",
+            "sharpe": 1.9,
+            "fitness": 1.3,
+            "returns": 0.12,
+            "turnover": 0.2,
+        }
+    ]
+    fields = [
+        {"id": "fresh_signal", "type": "MATRIX", "dataset": {"id": "news12", "category": {"id": "news"}}}
+    ]
+    seen = {normalize_wq_expression(active[0]["expression"])}
+
+    plan = autonomous.build_active_motif_plan(
+        FakeClient(),
+        active,
+        fields,
+        seen=seen,
+        limit=2,
+        hypothesis="replenish",
+    )
+
+    assert plan
+    assert all(item["planner_strategy"] == "active_motif_transfer" for item in plan)
+    assert all("fresh_signal" in item["expression"] for item in plan)
+    assert all("old_signal" not in item["expression"] for item in plan)
+
+
+def test_platform_near_miss_plan_prioritizes_repairable_alpha_and_skips_weak_trials():
+    near = {
+        "alpha_id": "near-1",
+        "status": "UNSUBMITTED",
+        "expression": "-1 * ts_mean(ts_delta(close, 1), 3) / ts_std_dev(close, 20)",
+        "sharpe": 1.63,
+        "fitness": 0.85,
+        "returns": 0.14,
+        "turnover": 0.72,
+    }
+    weak = {
+        "alpha_id": "weak-1",
+        "status": "UNSUBMITTED",
+        "expression": "rank(ts_mean(volume, 20))",
+        "sharpe": 0.5,
+        "fitness": 0.2,
+        "returns": 0.01,
+        "turnover": 0.2,
+    }
+    seen = {normalize_wq_expression(near["expression"]), normalize_wq_expression(weak["expression"])}
+
+    plan = autonomous.build_platform_near_miss_plan(
+        [near, weak],
+        seen=seen,
+        limit=2,
+        hypothesis="repair near misses",
+    )
+
+    assert plan
+    assert all(item["planner_strategy"] == "platform_near_miss" for item in plan)
+    assert all(item["parent_expression"] == near["expression"] for item in plan)
+    assert all("near-1" in item["mutation_reason"] for item in plan)
+
+
+def test_active_reference_score_prefers_candidate_near_real_active_quality():
+    profile = autonomous._active_reference_profile(
+        [
+            {"sharpe": 1.9, "fitness": 1.3, "returns": 0.12, "turnover": 0.2},
+            {"sharpe": 1.6, "fitness": 1.2, "returns": 0.10, "turnover": 0.15},
+        ]
+    )
+    strong = {"is_metrics": {"sharpe": 1.8, "fitness": 1.25, "returns": 0.11, "turnover": 0.2}}
+    weak = {"is_metrics": {"sharpe": 1.1, "fitness": 0.8, "returns": 0.03, "turnover": 0.9}}
+
+    assert autonomous._active_reference_score(strong, profile) > autonomous._active_reference_score(weak, profile)
+
+
 def test_live_dataset_selection_uses_points_feedback_as_weak_tiebreaker():
     datasets = [
         {"id": "news_a", "category": {"id": "news"}},
@@ -550,6 +632,109 @@ def test_generation_three_knowledge_parent_gets_one_bounded_execution_refinement
     assert mutations[0]["mutation_type"] == "knowledge_decay_step"
     assert mutations[0]["expression"] == "rank(ts_decay_linear((-1 * ts_delta(close, 1) / ts_std_dev(close, 20)), 20))"
     assert all(item["knowledge_card_ids"] == [card_id] for item in mutations)
+
+
+def test_native_decay_rescue_selects_best_knowledge_parent_and_skips_tested_values():
+    expression = "rank(ts_decay_linear((-1 * ts_delta(close, 1) / ts_std_dev(close, 20)), 5))"
+    memory = {
+        "recent_trials": [
+            {
+                "alpha_id": "base-0",
+                "expression": expression,
+                "settings": {"decay": 0},
+                "family": "momentum_reversal",
+                "sharpe": 1.84,
+                "fitness": 0.85,
+                "returns": 0.15,
+                "turnover": 0.7267,
+                "knowledge_card_ids": ["card-1"],
+            },
+            {
+                "alpha_id": "base-2",
+                "expression": expression,
+                "settings": {"decay": 2},
+                "family": "momentum_reversal",
+                "sharpe": 1.74,
+                "fitness": 0.88,
+                "returns": 0.149,
+                "turnover": 0.5821,
+                "knowledge_card_ids": ["card-1"],
+            },
+            {
+                "alpha_id": "generic",
+                "expression": "rank(close)",
+                "settings": {"decay": 0},
+                "sharpe": 2.0,
+                "fitness": 0.95,
+                "returns": 0.2,
+                "turnover": 0.2,
+                "knowledge_card_ids": [],
+            },
+        ]
+    }
+
+    parent, pending = autonomous._select_native_decay_rescue_parent(
+        memory,
+        min_sharpe=1.25,
+        min_fitness=1.0,
+        current_decay=0,
+    )
+
+    assert parent is not None
+    assert parent["alpha_id"] == "base-2"
+    assert pending == [4]
+
+
+def test_native_decay_rescue_preserves_knowledge_lineage_and_diagnoses_result():
+    class FakeClient:
+        def list_operator_names(self):
+            return {"rank", "ts_decay_linear", "ts_delta", "ts_std_dev"}
+
+        def simulate(self, expression, **kwargs):
+            decay = int(kwargs["decay"])
+            return {
+                "ok": True,
+                "alpha_id": f"alpha-d{decay}",
+                "is": {
+                    "sharpe": 1.7,
+                    "fitness": 0.9 if decay == 2 else 0.8,
+                    "returns": 0.14,
+                    "turnover": 0.58 if decay == 2 else 0.46,
+                    "checks": [{"name": "LOW_FITNESS", "result": "FAIL"}],
+                },
+                "oos": {},
+                "settings": {"decay": decay},
+                "simulation_id": f"sim-d{decay}",
+            }
+
+    parent = {
+        "alpha_id": "parent-alpha",
+        "expression": "rank(ts_decay_linear((-1 * ts_delta(close, 1) / ts_std_dev(close, 20)), 5))",
+        "family": "momentum_reversal",
+        "generation": 2,
+        "knowledge_card_ids": ["card-1"],
+    }
+
+    results = autonomous._run_native_decay_rescue(
+        FakeClient(),
+        parent,
+        [2, 4],
+        goal="rescue",
+        tag="test",
+        region="USA",
+        universe="TOP3000",
+        delay=1,
+        neutralization="SUBINDUSTRY",
+        truncation=0.08,
+        min_sharpe=1.25,
+        min_fitness=1.0,
+    )
+
+    assert [item["settings"]["decay"] for item in results] == [2, 4]
+    assert all(item["research_meta"]["knowledge_card_ids"] == ["card-1"] for item in results)
+    assert all(item["research_meta"]["planner_strategy"] == "knowledge_native_parameter_rescue" for item in results)
+    assert all(item["mutation_targets"] == ["improve_fitness"] for item in results)
+    assert all(item["passes_primary_thresholds"] is False for item in results)
 
 
 def test_generation_three_generic_parent_remains_capped():
