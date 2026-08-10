@@ -838,6 +838,35 @@ def _step_knowledge_decay_window(expression: str) -> str | None:
     return f"rank(ts_decay_linear(({match.group(1)}), {next_window}))"
 
 
+def _knowledge_execution_refinement_eligible(
+    *,
+    knowledge_card_ids: list[str],
+    generation: int,
+    sharpe: float | None,
+    fitness: float | None,
+    turnover: float | None,
+    min_sharpe: float = 1.25,
+    min_fitness: float = 1.0,
+) -> bool:
+    """Allow exactly one extra generation for a near-threshold knowledge Alpha.
+
+    This is intentionally narrow: only a generation-3 knowledge-linked parent
+    with Sharpe already above target, Fitness within 70% of target, and turnover
+    already inside the normal WQ band qualifies.  The extra generation is for
+    execution refinement, not for reopening broad hypothesis search.
+    """
+    return bool(
+        knowledge_card_ids
+        and generation == 3
+        and sharpe is not None
+        and sharpe >= min_sharpe
+        and fitness is not None
+        and min_fitness * 0.7 <= fitness < min_fitness
+        and turnover is not None
+        and 0.01 <= turnover <= 0.7
+    )
+
+
 def _alternate_family_seed(family: str, seen: set[str], *, stable_only: bool = False) -> tuple[str, str] | None:
     preferred = ("fundamental_quality", "analyst_revision", "volatility_structure") if stable_only else tuple(FAMILY_SEEDS)
     for alternate_family in preferred:
@@ -888,14 +917,26 @@ def build_targeted_mutations(
 
     meta = result.get("research_meta") or {}
     family = str(meta.get("family") or classify_wq_family(expression))
-    generation = int(meta.get("generation") or 1) + 1
-    if generation > max_generation:
-        result["mutation_route_terminal_reason"] = "mutation_generation_budget_exhausted"
-        return []
     targets = list(result.get("mutation_targets") or [])
     metrics = result.get("is_metrics") or {}
     sharpe = _safe_metric(metrics.get("sharpe"))
+    fitness = _safe_metric(metrics.get("fitness"))
     turnover = _safe_metric(metrics.get("turnover"))
+    knowledge_card_ids = [str(value) for value in (meta.get("knowledge_card_ids") or []) if value]
+    parent_generation = int(meta.get("generation") or 1)
+    generation = parent_generation + 1
+    effective_max_generation = max_generation
+    if _knowledge_execution_refinement_eligible(
+        knowledge_card_ids=knowledge_card_ids,
+        generation=parent_generation,
+        sharpe=sharpe,
+        fitness=fitness,
+        turnover=turnover,
+    ):
+        effective_max_generation = max(effective_max_generation, 4)
+    if generation > effective_max_generation:
+        result["mutation_route_terminal_reason"] = "mutation_generation_budget_exhausted"
+        return []
     directives = preferred_mutation_classes(result)
     variants: list[tuple[str, str, str, str | None]] = []
 
@@ -904,12 +945,26 @@ def build_targeted_mutations(
     # a strong raw Sharpe can be economically real while still being unusable
     # because the naive expression trades too aggressively.  Keep the economic
     # hypothesis/card lineage, but slow position changes first.
-    knowledge_card_ids = list(meta.get("knowledge_card_ids") or [])
     knowledge_strategies = [str(value) for value in (meta.get("knowledge_mutation_strategies") or []) if value]
-    if knowledge_card_ids and turnover is not None and turnover > 0.7:
+    stepped_decay = _step_knowledge_decay_window(expression)
+    knowledge_cost_refinement = bool(
+        knowledge_card_ids
+        and turnover is not None
+        and (
+            turnover > 0.7
+            or (
+                stepped_decay
+                and sharpe is not None
+                and sharpe >= 1.25
+                and fitness is not None
+                and 0.7 <= fitness < 1.0
+                and 0.01 <= turnover <= 0.7
+            )
+        )
+    )
+    if knowledge_cost_refinement:
         strategy_hint = "; ".join(knowledge_strategies[:2])
         suffix = f"; knowledge guidance: {strategy_hint}" if strategy_hint else ""
-        stepped_decay = _step_knowledge_decay_window(expression)
         if stepped_decay:
             variants.append(
                 (
@@ -1063,7 +1118,18 @@ def build_memory_mutation_plan(
     plan: list[dict[str, Any]] = []
     for trial in recent:
         generation = int(trial.get("generation") or 0)
-        if generation >= 3:
+        trial_card_ids = [str(value) for value in (trial.get("knowledge_card_ids") or []) if value]
+        linked_cards = [knowledge_cards_by_id[value] for value in trial_card_ids if value in knowledge_cards_by_id]
+        refinement_eligible = _knowledge_execution_refinement_eligible(
+            knowledge_card_ids=[str(card.get("id")) for card in linked_cards if card.get("id")],
+            generation=generation,
+            sharpe=_safe_metric(trial.get("sharpe")),
+            fitness=_safe_metric(trial.get("fitness")),
+            turnover=_safe_metric(trial.get("turnover")),
+            min_sharpe=min_sharpe,
+            min_fitness=min_fitness,
+        )
+        if generation >= 3 and not refinement_eligible:
             continue
         targets = list(trial.get("mutation_targets") or [])
         if not targets or targets == ["candidate_passes_primary_thresholds"]:
@@ -1071,8 +1137,6 @@ def build_memory_mutation_plan(
         promise = _trial_promise_score(trial, min_sharpe=min_sharpe, min_fitness=min_fitness)
         if promise < min_parent_promise:
             continue
-        trial_card_ids = [str(value) for value in (trial.get("knowledge_card_ids") or []) if value]
-        linked_cards = [knowledge_cards_by_id[value] for value in trial_card_ids if value in knowledge_cards_by_id]
         knowledge_failure_modes = [
             str(value)
             for card in linked_cards

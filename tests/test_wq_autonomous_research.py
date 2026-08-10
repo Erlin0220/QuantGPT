@@ -527,6 +527,45 @@ def test_knowledge_decay_parent_steps_decay_without_changing_signal_lookbacks():
     assert all(item["knowledge_card_ids"] == [card_id] for item in mutations)
 
 
+def test_generation_three_knowledge_parent_gets_one_bounded_execution_refinement():
+    card_id = "ab65eb3e-ec5e-4c94-ac8c-6aff83566112"
+    expression = "rank(ts_decay_linear((-1 * ts_delta(close, 1) / ts_std_dev(close, 20)), 10))"
+    result = {
+        "expression": expression,
+        "is_metrics": {"sharpe": 1.59, "fitness": 0.81, "turnover": 0.5295},
+        "mutation_targets": ["improve_fitness"],
+        "failure_reason": "low_fitness",
+        "research_meta": {
+            "family": "momentum_reversal",
+            "generation": 3,
+            "knowledge_card_ids": [card_id],
+            "knowledge_mutation_strategies": ["Reduce trading intensity while preserving the hypothesis."],
+        },
+    }
+
+    mutations = autonomous.build_targeted_mutations(result, seen=set(), limit=2)
+
+    assert mutations
+    assert mutations[0]["generation"] == 4
+    assert mutations[0]["mutation_type"] == "knowledge_decay_step"
+    assert mutations[0]["expression"] == "rank(ts_decay_linear((-1 * ts_delta(close, 1) / ts_std_dev(close, 20)), 20))"
+    assert all(item["knowledge_card_ids"] == [card_id] for item in mutations)
+
+
+def test_generation_three_generic_parent_remains_capped():
+    result = {
+        "expression": "rank(ts_mean(returns, 10))",
+        "is_metrics": {"sharpe": 1.4, "fitness": 0.85, "turnover": 0.3},
+        "mutation_targets": ["improve_fitness"],
+        "research_meta": {"family": "momentum_reversal", "generation": 3},
+    }
+
+    mutations = autonomous.build_targeted_mutations(result, seen=set(), limit=2)
+
+    assert mutations == []
+    assert result["mutation_route_terminal_reason"] == "mutation_generation_budget_exhausted"
+
+
 def test_positive_weak_signal_is_smoothed_not_inverted():
     result = {
         "expression": "rank(ts_mean(returns, 10))",
