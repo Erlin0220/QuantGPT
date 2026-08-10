@@ -107,9 +107,12 @@ def test_control_tower_exposes_learning_loop_and_safeguards():
     assert snapshot["overfitting"]["official_platform_check"] is False
     assert snapshot["correlation"]["official_platform_check"] is False
     assert snapshot["safeguards"]["daily_submission_budget"] == 2
-    assert snapshot["safeguards"]["local_correlation_is_predictive_only"] is False
-    assert snapshot["safeguards"]["fresh_high_local_correlation_blocks_submission"] is True
-    assert snapshot["safeguards"]["weak_available_overfitting_evidence_blocks_submission"] is True
+    assert snapshot["safeguards"]["local_correlation_is_predictive_only"] is True
+    assert snapshot["safeguards"]["fresh_high_local_correlation_blocks_submission"] is False
+    assert snapshot["safeguards"]["weak_available_overfitting_evidence_blocks_submission"] is False
+    assert snapshot["safeguards"]["local_robustness_failure_blocks_target_fill"] is False
+    assert snapshot["safeguards"]["local_risk_signals_deprioritize_candidates"] is True
+    assert snapshot["safeguards"]["official_brain_eligibility_blocks_submission"] is True
     assert snapshot["safeguards"]["official_sc_pending_blocks_first_submission"] is False
     assert snapshot["safeguards"]["research_gate_mode"] == "singleflight"
     assert snapshot["safeguards"]["async_mcp_tasks_required"] is True

@@ -3,7 +3,6 @@
 import asyncio
 import json
 import logging
-import os
 import threading
 import time
 import traceback
@@ -23,15 +22,6 @@ from ..auth import GUEST_USER_ID, get_current_user, get_optional_user
 from ..db import get_db
 from ..expression_parser import parse_expression
 from ..iteration import compute_factor_score
-from ..llm_service import (
-    call_deepseek as _call_deepseek,
-)
-from ..llm_service import (
-    call_fix_expression as _call_fix_expression,
-)
-from ..llm_service import (
-    call_interpret_factor as _call_interpret_factor,
-)
 from ..llm_service import (
     looks_like_expression as _looks_like_expression,
 )
@@ -145,15 +135,12 @@ def _run_backtest_task(task_id: str, req: AutoBacktestRequest, user_id: str):
                 pass
 
         if expression is None:
-            if not os.environ.get("DEEPSEEK_API_KEY"):
-                task["status"] = "failed"
-                task["error"] = (
-                    "未配置 LLM API Key，无法解析自然语言。"
-                    "请直接输入因子表达式（如 rank(close/ts_mean(close,20))），"
-                    "或设置 DEEPSEEK_API_KEY 环境变量启用自然语言输入。"
-                )
-                return
-            expression = _call_deepseek(req.prompt)
+            task["status"] = "failed"
+            task["error"] = (
+                "服务端已移除 LLM 自然语言解析。请先由当前 ChatGPT 生成合法因子表达式，"
+                "再把表达式作为 prompt 提交（如 rank(close/ts_mean(close,20))）。"
+            )
+            return
         task["expression"] = expression
         logger.info(f"[{task_id}] expression: {expression}")
 
@@ -170,36 +157,17 @@ def _run_backtest_task(task_id: str, req: AutoBacktestRequest, user_id: str):
 
         paren_err = _validate_parentheses(expression)
         if paren_err:
-            if os.environ.get("DEEPSEEK_API_KEY"):
-                logger.warning(f"[{task_id}] parentheses error, attempting fix: {paren_err}")
-                expression = _call_fix_expression(expression, paren_err, req.prompt)
-                task["expression"] = expression
-            else:
-                task["status"] = "failed"
-                task["error"] = f"表达式语法错误: {paren_err}"
-                return
+            task["status"] = "failed"
+            task["error"] = f"表达式语法错误: {paren_err}；请由 ChatGPT 修正后重新提交。"
+            return
 
         try:
             func_ = parse_expression(expression)
             func_(dummy)
         except Exception as e:
-            if os.environ.get("DEEPSEEK_API_KEY"):
-                logger.warning(f"[{task_id}] validation failed, attempting fix: {e}")
-                try:
-                    fixed = _call_fix_expression(expression, str(e), req.prompt)
-                    func_ = parse_expression(fixed)
-                    func_(dummy)
-                    expression = fixed
-                    task["expression"] = expression
-                    logger.info(f"[{task_id}] expression fixed: {expression}")
-                except Exception as e2:
-                    task["status"] = "failed"
-                    task["error"] = f"因子表达式无效: {e2}"
-                    return
-            else:
-                task["status"] = "failed"
-                task["error"] = f"因子表达式无效: {e}"
-                return
+            task["status"] = "failed"
+            task["error"] = f"因子表达式无效: {e}；请由 ChatGPT 修正后重新提交。"
+            return
 
         check_cancelled(task_id)
         task["status"] = "fetching_data"
@@ -277,21 +245,10 @@ def _run_backtest_task(task_id: str, req: AutoBacktestRequest, user_id: str):
         )
         report_filename = Path(report_result["report_path"]).name
 
-        interpretation = {}
-        try:
-            interpretation = _call_interpret_factor(
-                expression=expression,
-                prompt=req.prompt,
-                metrics=report_result["metrics"],
-                backtest_summary={
-                    "ic_mean": result.get("ic_mean", 0),
-                    "rank_ic_mean": result.get("rank_ic_mean", 0),
-                    "monotonicity_score": result["monotonicity_score"],
-                    "turnover": result.get("turnover", 0),
-                },
-            )
-        except Exception as e:
-            logger.warning(f"[{task_id}] interpretation failed: {e}")
+        interpretation = {
+            "source": "chatgpt_client",
+            "status": "not_generated_server_side",
+        }
 
         ao_score_val = anti_overfit_result.get("score") if anti_overfit_result else None
         factor_df = result.get("_factor_df")

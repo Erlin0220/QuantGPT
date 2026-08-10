@@ -812,10 +812,12 @@ async def kb_distill_sources(
     concept: str,
     family: str = "unknown",
     research_goal: str = "WorldQuant BRAIN Alpha research",
+    chatgpt_card: dict | None = None,
 ) -> str:
-    """把至少两个已存来源交叉蒸馏为一张证据约束的 Alpha Knowledge Card。
+    """由当前 ChatGPT 对至少两个已存来源交叉蒸馏，并把知识卡写入 QuantGPT。
 
-    蒸馏只允许使用指定来源内容，必须保留相互冲突的证据，并输出 WQ operator / expression template / failure / mutation 信息。
+    首次调用不传 ``chatgpt_card`` 时，只返回受约束的来源材料与蒸馏规则，不调用服务端 LLM；
+    ChatGPT 完成推理后再次调用并传入知识卡，QuantGPT 校验证据来源并持久化。
     """
     from .wq_knowledge import cross_distill_sources
 
@@ -825,6 +827,7 @@ async def kb_distill_sources(
             concept=concept,
             family=family,
             research_goal=research_goal,
+            chatgpt_card=chatgpt_card,
         )
         return json.dumps(result, ensure_ascii=False, indent=2, default=str)
     except Exception as exc:
@@ -1332,6 +1335,7 @@ def _run_wq_autonomous_research_mcp_task(task_id: str, params: dict) -> dict:
         result = run_autonomous_research(
             client,
             memory=memory,
+            chatgpt_expressions=params.get("chatgpt_expressions") or [],
             goal=params["goal"],
             tag=params["tag"],
             region=params["region"],
@@ -1800,6 +1804,7 @@ async def wq_brain_research(
 
 @mcp.tool()
 async def wq_brain_autonomous_research(
+    chatgpt_expressions: list[str] | None = None,
     goal: str = "maximize robust low-correlation WorldQuant candidates",
     tag: str = "wq-autonomous",
     region: str = "USA",
@@ -1814,11 +1819,12 @@ async def wq_brain_autonomous_research(
     min_sharpe: float = 1.25,
     min_fitness: float = 1.0,
 ) -> str:
-    """自主规划并研究 WQ Alpha，不需要调用方手工提供 expressions。
+    """自主规划并研究 WQ Alpha；生成式推理由当前 ChatGPT 客户端负责。
 
-    自动读取 Research Memory、近期 BRAIN Alpha 和账号实时 Data Explorer 字段；在可用时
-    使用现有 DeepSeek/OpenAI-compatible provider 生成少量结构创新 FASTEXPR，并以真实
-    BRAIN Simulation 验证。``max_simulations`` 是主研究 generations 的 Simulation 预算；
+    推荐 ChatGPT 先调用 ``list_wq_operators`` 与 ``wq_brain_data_catalog``，结合账号研究记忆生成
+    FASTEXPR，再通过 ``chatgpt_expressions`` 注入本工具。QuantGPT 服务端不调用任何 LLM；未提供
+    ChatGPT 候选时仍可使用 ACTIVE/near-miss/knowledge/live-field 等确定性路径补充库存。
+    ``max_simulations`` 是主研究 generations 的 Simulation 预算；
     Robustness Validation 使用独立、显式上报的有界预算。Primary Pass 还会经过有限的跨
     Universe/Neutralization Robustness Funnel，只有 READY Candidate 才进入正式候选库存。工具永远不会正式提交
     Alpha，正式提交仍由 Submission Gate 控制。
@@ -1838,6 +1844,7 @@ async def wq_brain_autonomous_research(
         return json.dumps({"error": "family_count 必须在 1~4 之间"})
 
     params = {
+        "chatgpt_expressions": list(chatgpt_expressions or [])[:40],
         "goal": goal,
         "tag": tag,
         "region": region,

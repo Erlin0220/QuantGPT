@@ -7,7 +7,6 @@ source of empirical feedback and can calibrate card usefulness over time.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import re
@@ -482,32 +481,13 @@ async def fetch_arxiv_sources(query: str, *, limit: int = 10, ingest: bool = Fal
     return {"query": query, "count": len(items), "ingested": ingest, "sources": items}
 
 
-def _extract_json_object(text: str) -> dict[str, Any]:
-    value = str(text or "").strip()
-    if value.startswith("```"):
-        value = re.sub(r"^```(?:json)?\s*", "", value, flags=re.IGNORECASE)
-        value = re.sub(r"\s*```$", "", value)
-    try:
-        parsed = json.loads(value)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
-    start = value.find("{")
-    end = value.rfind("}")
-    if start >= 0 and end > start:
-        parsed = json.loads(value[start : end + 1])
-        if isinstance(parsed, dict):
-            return parsed
-    raise ValueError("LLM did not return a JSON object")
-
-
 async def cross_distill_sources(
     source_keys: list[str],
     *,
     concept: str,
     family: str,
     research_goal: str = "WorldQuant BRAIN Alpha research",
+    chatgpt_card: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     keys = _string_list(source_keys, limit=12)
     if len(keys) < 2:
@@ -526,40 +506,41 @@ async def cross_distill_sources(
             f"SOURCE_KEY={row.source_key}\nTYPE={row.source_type}\nTITLE={row.title}\nACCESS={row.access_scope or 'unknown'}\nCONTENT:\n{content}"
         )
     source_blob = "\n\n--- SOURCE BREAK ---\n\n".join(excerpts)
-    from .iteration import _call_llm
-
-    system_prompt = (
-        "You are an evidence-constrained quantitative research distiller. Produce one JSON knowledge card only. "
+    instructions = (
         "Use ONLY the supplied sources; do not add outside facts. Preserve disagreements instead of reconciling them by invention. "
-        "Every evidence item must cite an exact SOURCE_KEY from the input. Prefer simple WorldQuant FASTEXPR mappings and mark uncertainty."
+        "Return one knowledge-card object with exactly these keys: concept, family, hypothesis, mechanism, scope, evidence, "
+        "operators, expression_templates, failure_modes, mutation_strategies, confidence. Every evidence item must cite an exact "
+        "SOURCE_KEY. Use WorldQuant-style operators only when justified; do not invent data fields."
     )
-    user_prompt = f"""Research goal: {research_goal}
-Concept: {concept}
-Family: {family}
+    if chatgpt_card is None:
+        return {
+            "requires_chatgpt": True,
+            "research_goal": research_goal,
+            "concept": concept,
+            "family": family,
+            "instructions": instructions,
+            "source_material": source_blob,
+            "source_keys": [row.source_key for row in rows],
+        }
 
-Return JSON with exactly these keys:
-concept, family, hypothesis, mechanism, scope, evidence, operators, expression_templates, failure_modes, mutation_strategies, confidence.
-- evidence: list of source_key/support(positive|negative|mixed|neutral)/claim/location/content_scope
-- operators: WorldQuant-style operator names only when justified by the evidence/mechanism
-- expression_templates: simple generic FASTEXPR hypotheses, no invented data fields
-- confidence: 0..1 and should decrease when sources conflict or only abstracts are available
-
-SOURCES:
-{source_blob}
-"""
-    raw = await asyncio.to_thread(
-        _call_llm,
-        system_prompt,
-        user_prompt,
-        temperature=0.2,
-        max_tokens=4096,
-        clean_output=False,
-    )
-    card = _extract_json_object(raw)
+    card = dict(chatgpt_card)
     card["concept"] = card.get("concept") or concept
     card["family"] = card.get("family") or family
+    allowed_source_keys = {row.source_key for row in rows}
+    cited_source_keys = {
+        str(item.get("source_key") or "")
+        for item in (card.get("evidence") or [])
+        if isinstance(item, dict)
+    }
+    unexpected = sorted(key for key in cited_source_keys if key and key not in allowed_source_keys)
+    if unexpected:
+        raise ValueError(f"chatgpt_card cites sources outside requested set: {unexpected}")
     stored = await upsert_knowledge_card(card)
-    return {"stored": stored, "source_keys": [row.source_key for row in rows]}
+    return {
+        "stored": stored,
+        "source_keys": [row.source_key for row in rows],
+        "distilled_by": "chatgpt_client",
+    }
 
 
 async def explain_alpha_knowledge(*, account: str = "primary", alpha_id: str | None = None, expression: str | None = None) -> dict[str, Any]:

@@ -336,6 +336,46 @@ async def test_pending_robustness_can_fill_daily_active_target_as_fallback(polic
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("alpha_id", "metrics", "checks", "expected_blocker"),
+    [
+        ("low-sharpe", {"sharpe": 1.24, "fitness": 1.2, "turnover": 0.2}, [], "sharpe_below_threshold"),
+        ("low-fitness", {"sharpe": 1.5, "fitness": 0.99, "turnover": 0.2}, [], "fitness_below_threshold"),
+        ("high-turnover", {"sharpe": 1.5, "fitness": 1.2, "turnover": 0.71}, [], "turnover_out_of_range"),
+        (
+            "official-sc-fail",
+            {"sharpe": 1.5, "fitness": 1.2, "turnover": 0.2},
+            [{"name": "SELF_CORRELATION", "result": "FAIL", "value": 0.8}],
+            "official_self_correlation_fail",
+        ),
+    ],
+)
+async def test_daily_active_fallback_keeps_official_brain_eligibility_hard(
+    policy_db,
+    alpha_id,
+    metrics,
+    checks,
+    expected_blocker,
+):
+    await record_research_candidates(
+        "primary",
+        [
+            {
+                "alpha_id": alpha_id,
+                "expression": f"rank(ts_mean(field_{alpha_id.replace('-', '_')}, 20))",
+                "is_metrics": {**metrics, "returns": 0.05, "checks": checks},
+                "validation": {"status": "ready", "robustness_score": 1.0},
+            }
+        ],
+    )
+
+    decision = await reserve_submission("primary", alpha_id)
+    assert decision["allowed"] is False
+    assert decision["reason"] == "candidate_not_ready"
+    assert expected_blocker in decision["blockers"]
+
+
+@pytest.mark.asyncio
 async def test_ready_candidate_persists_robustness_novelty_and_live_fields(policy_db):
     await record_research_candidates(
         "primary",
@@ -468,7 +508,7 @@ async def test_platform_preflight_allows_missing_robustness_as_active_target_fal
 
 
 @pytest.mark.asyncio
-async def test_explicit_robustness_fail_remains_hard_blocker(policy_db):
+async def test_explicit_local_robustness_fail_can_fill_daily_active_target_as_fallback(policy_db):
     await record_research_candidates(
         "primary",
         [
@@ -480,10 +520,15 @@ async def test_explicit_robustness_fail_remains_hard_blocker(policy_db):
             }
         ],
     )
+    status = await get_submission_policy_status("primary")
+    assert status["candidate_queue_count"] == 0
+    assert status["submission_candidate_top"][0]["alpha_id"] == "robustness-failed"
+    assert status["submission_candidate_top"][0]["submission_mode"] == "active_target_fallback"
+
     decision = await reserve_submission("primary", "robustness-failed")
-    assert decision["allowed"] is False
-    assert decision["reason"] == "candidate_not_ready"
-    assert "explicit_robustness_fail" in decision["blockers"]
+    assert decision["allowed"] is True
+    assert decision["submission_mode"] == "active_target_fallback"
+    assert "validation_not_ready" in decision["soft_blockers_waived"]
 
 
 @pytest.mark.asyncio
@@ -706,7 +751,7 @@ async def test_untracked_alpha_cannot_consume_submission_slot(policy_db):
 
 
 @pytest.mark.asyncio
-async def test_high_local_correlation_is_blocked_before_submission(policy_db):
+async def test_high_local_correlation_is_softened_for_daily_active_target_fallback(policy_db):
     now = datetime.now(timezone.utc).isoformat()
     await _seed_ready_candidate(
         "corr-risk",
@@ -721,14 +766,15 @@ async def test_high_local_correlation_is_blocked_before_submission(policy_db):
 
     status = await get_submission_policy_status("primary")
     assert status["candidate_queue_count"] == 0
+    assert status["submission_candidate_top"][0]["alpha_id"] == "corr-risk"
     decision = await reserve_submission("primary", "corr-risk")
-    assert decision["allowed"] is False
-    assert "local_correlation_high" in decision["blockers"]
-    assert status["used_submission_slots"] == 0
+    assert decision["allowed"] is True
+    assert decision["submission_mode"] == "active_target_fallback"
+    assert "local_correlation_high" in decision["soft_blockers_waived"]
 
 
 @pytest.mark.asyncio
-async def test_weak_overfitting_evidence_is_blocked_before_submission(policy_db):
+async def test_weak_overfitting_evidence_is_softened_for_daily_active_target_fallback(policy_db):
     await _seed_ready_candidate(
         "overfit-risk",
         validation={
@@ -740,10 +786,11 @@ async def test_weak_overfitting_evidence_is_blocked_before_submission(policy_db)
 
     status = await get_submission_policy_status("primary")
     assert status["candidate_queue_count"] == 0
+    assert status["submission_candidate_top"][0]["alpha_id"] == "overfit-risk"
     decision = await reserve_submission("primary", "overfit-risk")
-    assert decision["allowed"] is False
-    assert "overfitting_evidence_weak" in decision["blockers"]
-    assert status["used_submission_slots"] == 0
+    assert decision["allowed"] is True
+    assert decision["submission_mode"] == "active_target_fallback"
+    assert "overfitting_evidence_weak" in decision["soft_blockers_waived"]
 
 
 @pytest.mark.asyncio

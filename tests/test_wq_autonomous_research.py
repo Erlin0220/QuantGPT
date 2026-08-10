@@ -164,6 +164,63 @@ def test_active_motif_plan_transfers_proven_structure_to_different_live_field():
     assert all("old_signal" not in item["expression"] for item in plan)
 
 
+def test_active_dataset_sibling_fields_prioritize_proven_active_datasets():
+    class FakeClient:
+        def list_data_fields(self, *, region, universe, delay, dataset_id=None, search=None, limit=100):
+            if search == "implied_volatility_mean_skew_30":
+                return [
+                    {
+                        "id": "implied_volatility_mean_skew_30",
+                        "type": "MATRIX",
+                        "dataset": {"id": "option8", "name": "Volatility Data"},
+                    }
+                ]
+            if dataset_id == "option8":
+                return [
+                    {
+                        "id": "implied_volatility_mean_skew_30",
+                        "type": "MATRIX",
+                        "dataset": {"id": "option8", "name": "Volatility Data"},
+                    },
+                    {
+                        "id": "implied_volatility_mean_skew_60",
+                        "type": "MATRIX",
+                        "dataset": {"id": "option8", "name": "Volatility Data"},
+                    },
+                    {
+                        "id": "implied_volatility_call_30",
+                        "type": "MATRIX",
+                        "dataset": {"id": "option8", "name": "Volatility Data"},
+                    },
+                ]
+            return []
+
+    active = [
+        {
+            "status": "ACTIVE",
+            "expression": "ts_decay_linear(rank(ts_mean(ts_backfill(implied_volatility_mean_skew_30, 60), 20)) * rank(-returns), 5)",
+            "fitness": 1.4,
+            "sharpe": 1.44,
+        }
+    ]
+
+    fields, meta = autonomous._active_dataset_sibling_fields(
+        FakeClient(),
+        active,
+        region="USA",
+        universe="TOP3000",
+        delay=1,
+        limit=4,
+    )
+
+    assert [item["id"] for item in fields] == [
+        "implied_volatility_mean_skew_60",
+        "implied_volatility_call_30",
+    ]
+    assert meta["dataset_ids"] == ["option8"]
+    assert meta["source_fields"] == ["implied_volatility_mean_skew_30"]
+
+
 def test_platform_near_miss_plan_prioritizes_repairable_alpha_and_skips_weak_trials():
     near = {
         "alpha_id": "near-1",
@@ -372,20 +429,23 @@ def test_robustness_failure_reduces_cross_run_parent_promise():
     assert autonomous._trial_promise_score(robust_failure) < autonomous._trial_promise_score(base)
 
 
-def test_llm_live_plan_rejects_invented_fields_and_keeps_catalog_expression(monkeypatch):
-    from quantgpt import iteration
-
+def test_chatgpt_plan_rejects_invented_fields_and_keeps_catalog_expression():
     class FakeClient:
         def list_operator_names(self):
             return {"rank", "ts_mean", "ts_backfill"}
 
-    fields = [{"id": "real_field", "type": "MATRIX", "description": "analyst revision signal"}]
-    generated = iter(["rank(fake_field)", "rank(ts_mean(ts_backfill(real_field, 60), 20))"])
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
-    monkeypatch.setattr(iteration, "_call_llm", lambda *_args, **_kwargs: next(generated))
+    fields = [
+        {
+            "id": "real_field",
+            "type": "MATRIX",
+            "description": "analyst revision signal",
+            "dataset": {"id": "analyst4", "category": {"id": "analyst"}},
+        }
+    ]
 
-    plan = autonomous.build_llm_live_plan(
+    plan = autonomous.build_chatgpt_plan(
         FakeClient(),
+        ["rank(fake_field)", "rank(ts_mean(ts_backfill(real_field, 60), 20))"],
         fields,
         seen=set(),
         limit=2,
@@ -394,36 +454,30 @@ def test_llm_live_plan_rejects_invented_fields_and_keeps_catalog_expression(monk
 
     assert len(plan) == 1
     assert "real_field" in plan[0]["expression"]
-    assert plan[0]["mutation_type"] == "llm_live_field_seed"
+    assert plan[0]["mutation_type"] == "chatgpt_seed"
+    assert plan[0]["planner_strategy"] == "chatgpt_client"
     assert plan[0]["data_fields"] == ["real_field"]
+    assert plan[0]["dataset_id"] == "analyst4"
 
 
-def test_llm_live_plan_receives_bounded_positive_negative_memory(monkeypatch):
-    from quantgpt import iteration
-
+def test_chatgpt_plan_accepts_core_fields_without_live_catalog_fields():
     class FakeClient:
         def list_operator_names(self):
-            return {"rank"}
+            return {"rank", "ts_mean"}
 
-    prompts = []
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
-    monkeypatch.setattr(iteration, "_call_llm", lambda _system, user, **_kwargs: prompts.append(user) or "rank(real_field)")
-    memory = {
-        "research_memory_guidance": {
-            "positive": [{"family": "analyst_revision", "dataset_id": "analyst4", "operator_pattern": "rank>ts_mean"}],
-            "negative": [{"family": "price_volume", "dataset_id": "pv1", "operator_pattern": "rank>ts_decay_linear", "failure_reason": "low_fitness", "count": 20}],
-            "overused_structures": [{"operator_pattern": "rank>ts_decay_linear", "trials": 80}],
-        }
-    }
-    fields = [{"id": "real_field", "type": "MATRIX", "dataset": {"id": "analyst4", "category": {"id": "analyst"}}}]
-
-    plan = autonomous.build_llm_live_plan(FakeClient(), fields, seen=set(), limit=1, hypothesis="memory-guided", memory=memory)
+    plan = autonomous.build_chatgpt_plan(
+        FakeClient(),
+        ["rank(ts_mean(returns, 20))"],
+        [],
+        seen=set(),
+        limit=1,
+        hypothesis="core-field hypothesis",
+    )
 
     assert len(plan) == 1
-    assert "analyst_revision|analyst4|rank>ts_mean" in prompts[0]
-    assert "price_volume|pv1|rank>ts_decay_linear|low_fitness" in prompts[0]
-    assert plan[0]["dataset_id"] == "analyst4"
-    assert plan[0]["provenance_state"] == "resolved"
+    assert plan[0]["expression"] == "rank(ts_mean(returns, 20))"
+    assert plan[0]["data_fields"] == []
+    assert plan[0]["provenance_state"] == "unresolved"
 
 
 def test_memory_mutation_plan_reuses_recent_failure_across_runs():
@@ -860,6 +914,127 @@ def test_candidate_robustness_failure_is_explicit(monkeypatch):
     assert result["robustness_score"] == 0.0
 
 
+def test_platform_alpha_history_scans_beyond_first_page(monkeypatch):
+    calls = []
+
+    def fake_list(_client, *, limit=100, offset=0, **_kwargs):
+        calls.append((limit, offset))
+        if offset == 0:
+            return {"ok": True, "alphas": [{"alpha_id": f"recent-{i}"} for i in range(100)]}
+        if offset == 100:
+            return {
+                "ok": True,
+                "alphas": [
+                    {
+                        "alpha_id": "best-old-near-miss",
+                        "status": "UNSUBMITTED",
+                        "expression": "rank(ts_mean(close, 5))",
+                        "sharpe": 1.46,
+                        "fitness": 0.97,
+                        "returns": 0.1,
+                        "turnover": 0.24,
+                    }
+                ],
+            }
+        return {"ok": True, "alphas": []}
+
+    monkeypatch.setattr(autonomous, "run_list_alphas", fake_list)
+    result = autonomous._load_platform_alpha_history(object(), limit=300)
+
+    assert calls[:2] == [(100, 0), (100, 100)]
+    assert any(item.get("alpha_id") == "best-old-near-miss" for item in result["alphas"])
+
+
+def test_active_target_prefers_platform_near_miss_for_native_decay_rescue():
+    parent, decays = autonomous._select_active_target_native_decay_rescue_parent(
+        [
+            {
+                "alpha_id": "weak",
+                "status": "UNSUBMITTED",
+                "expression": "rank(close)",
+                "sharpe": 1.5,
+                "fitness": 0.72,
+                "returns": 0.08,
+                "turnover": 0.2,
+            },
+            {
+                "alpha_id": "best-near-miss",
+                "status": "UNSUBMITTED",
+                "expression": "rank(ts_mean(close, 5))",
+                "sharpe": 1.33,
+                "fitness": 0.92,
+                "returns": 0.06,
+                "turnover": 0.13,
+                "neutralization": "SUBINDUSTRY",
+            },
+        ],
+        min_sharpe=1.25,
+        min_fitness=1.0,
+        current_decay=0,
+    )
+
+    assert parent is not None
+    assert parent["alpha_id"] == "best-near-miss"
+    assert parent["parameter_rescue_source"] == "platform_near_miss"
+    assert decays == [2, 4]
+
+
+def test_active_target_mode_defers_robustness_to_official_submission_gate(monkeypatch):
+    monkeypatch.setattr(autonomous, "run_list_alphas", lambda *_args, **_kwargs: {"ok": True, "alphas": []})
+    monkeypatch.setattr(
+        autonomous,
+        "validate_candidate_robustness",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("robustness should be deferred")),
+    )
+
+    def fake_research_batch(_client, expressions, **kwargs):
+        expression = expressions[0]
+        item = {
+            "ok": True,
+            "alpha_id": "daily-target-1",
+            "expression": expression,
+            "is_metrics": {
+                "sharpe": 1.6,
+                "fitness": 1.2,
+                "returns": 0.1,
+                "turnover": 0.2,
+                "checks": [],
+            },
+            "passes_primary_thresholds": True,
+            "mutation_targets": ["candidate_passes_primary_thresholds"],
+        }
+        return {
+            "ok": True,
+            "tag": kwargs["tag"],
+            "settings": {},
+            "summary": {"simulated": len(expressions)},
+            "results": [item],
+            "candidates": [item],
+            "failed": [],
+            "invalid": [],
+        }
+
+    monkeypatch.setattr(autonomous, "run_research_batch", fake_research_batch)
+
+    result = autonomous.run_autonomous_research(
+        object(),
+        memory={
+            "family_counts": {},
+            "normalized_expressions": [],
+            "inventory": {"mode": "REPLENISHMENT"},
+            "submission": {"remaining_active_target": 2},
+        },
+        max_simulations=4,
+        generations=1,
+        family_count=1,
+    )
+
+    assert result["active_target_mode"] is True
+    assert result["summary"]["validation_cap"] == 0
+    assert result["candidates"][0]["validation"]["status"] == "validation_pending"
+    assert result["ready_candidates"] == []
+
+
 def test_autonomous_research_routes_robustness_failure_into_same_round_generation(monkeypatch):
     monkeypatch.setattr(autonomous, "run_list_alphas", lambda *_args, **_kwargs: {"ok": True, "alphas": []})
     monkeypatch.setattr(
@@ -868,7 +1043,7 @@ def test_autonomous_research_routes_robustness_failure_into_same_round_generatio
         lambda *_args, **_kwargs: ([], {"available": False, "count": 0}, []),
     )
     monkeypatch.setattr(autonomous, "build_structural_live_plan", lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(autonomous, "build_llm_live_plan", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(autonomous, "build_chatgpt_plan", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         autonomous,
         "validate_candidate_robustness",

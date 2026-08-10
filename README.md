@@ -444,15 +444,7 @@ python -m quantgpt --transport http
 
 **Zero config by default**: SQLite database, baostock + akshare free data. See [full Quick Start guide](docs/QUICKSTART.md) for details.
 
-<details>
-<summary><b>Optional: DeepSeek API (for factor generation & cross-review)</b></summary>
-
-```bash
-# Edit .env, add your DeepSeek API key (~$0.001 per query)
-DEEPSEEK_API_KEY=sk-your-key-here
-```
-
-</details>
+**AI reasoning is client-side:** use the connected ChatGPT client to generate, repair, interpret, and distill Alpha research ideas. QuantGPT itself remains a deterministic data/backtest/BRAIN execution service and requires no LLM API key.
 
 <details>
 <summary><b>Optional: PostgreSQL (for production)</b></summary>

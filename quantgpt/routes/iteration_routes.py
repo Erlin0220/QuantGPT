@@ -42,13 +42,21 @@ class IterateRequest(BaseModel):
     n_candidates: int = Field(5, ge=1, le=10, description="候选因子数量")
     run_rolling_validation: bool = Field(False, description="是否运行滚动验证")
     direction: str | None = Field(None, description="迭代方向提示，如'加入量价信息'、'增加低波暴露'")
+    chatgpt_expressions: list[str] = Field(default_factory=list, description="由 ChatGPT 生成的候选因子表达式")
 
 
 class SelectCandidateRequest(BaseModel):
     candidate_index: int = Field(..., ge=0, description="候选因子索引")
 
 
-def _run_iteration_task(task_id: str, parent_task_id: str, user_id: str, n_candidates: int, direction: str | None = None):
+def _run_iteration_task(
+    task_id: str,
+    parent_task_id: str,
+    user_id: str,
+    n_candidates: int,
+    direction: str | None = None,
+    chatgpt_expressions: list[str] | None = None,
+):
     task = tasks.get(task_id)
     if not task:
         return
@@ -159,6 +167,7 @@ def _run_iteration_task(task_id: str, parent_task_id: str, user_id: str, n_candi
             on_progress=on_progress,
             task_id=task_id,
             direction=direction,
+            chatgpt_expressions=chatgpt_expressions,
         )
 
         task["candidates"] = candidates
@@ -222,6 +231,11 @@ async def iterate_task(
         parent_params = (db_task.result or {}).get("params", {})
         parent_expression = db_task.expression
 
+    if not req.chatgpt_expressions:
+        raise HTTPException(
+            status_code=422,
+            detail="服务端已移除 LLM。请先由当前 ChatGPT 生成候选表达式，并通过 chatgpt_expressions 提交。",
+        )
     if active_task_count() >= MAX_ACTIVE_TASKS:
         raise HTTPException(status_code=503, detail="当前任务已满，请稍后再试")
 
@@ -250,7 +264,7 @@ async def iterate_task(
 
     thread = threading.Thread(
         target=_run_iteration_task,
-        args=(iter_task_id, task_id, user_id, req.n_candidates, req.direction),
+        args=(iter_task_id, task_id, user_id, req.n_candidates, req.direction, req.chatgpt_expressions),
         daemon=True,
     )
     thread.start()

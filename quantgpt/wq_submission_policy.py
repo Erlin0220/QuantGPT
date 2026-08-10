@@ -177,20 +177,17 @@ def _candidate_fallback_submission_blockers(
 ) -> list[str]:
     """Hard blockers for filling the daily ACTIVE target.
 
-    Unknown/stale robustness is intentionally soft here: when the daily ACTIVE
-    target is still unmet, BRAIN's official SC stage may be used as the final
-    filter. Explicit robustness or SC failures remain hard blockers.
+    The fallback path intentionally lets BRAIN be the final judge while the
+    local daily ACTIVE target is still unmet. Local robustness, correlation,
+    and overfitting evidence remain ranking/risk signals rather than vetoes.
+    Platform eligibility thresholds and an explicit official SC failure remain
+    hard blockers so we do not spend requests on Alphas BRAIN cannot accept.
     """
     blockers: list[str] = []
     candidate_status = str(candidate.status or "").lower()
-    validation_status = str(candidate.validation_status or "").lower()
-    validation_details = candidate.validation_details if isinstance(candidate.validation_details, dict) else {}
-    detailed_status = str(validation_details.get("status") or "").lower()
 
-    if candidate_status not in {"queued", "validation_pending"}:
+    if candidate_status not in {"queued", "validation_pending", "robustness_fail"}:
         blockers.append("candidate_not_available")
-    if "robustness_fail" in {candidate_status, validation_status, detailed_status}:
-        blockers.append("explicit_robustness_fail")
     if float(candidate.sharpe or 0.0) < 1.25:
         blockers.append("sharpe_below_threshold")
     if float(candidate.fitness or 0.0) < 1.0:
@@ -199,19 +196,6 @@ def _candidate_fallback_submission_blockers(
         blockers.append("turnover_out_of_range")
     if str(candidate.sc_status or "").upper() == "FAIL":
         blockers.append("official_self_correlation_fail")
-
-    local_evidence = {
-        "status": "available" if candidate.local_correlation is not None else "unavailable",
-        "max_correlation": candidate.local_correlation,
-        "calculated_at": candidate.local_correlation_at.isoformat() if candidate.local_correlation_at else None,
-    }
-    blockers.extend(
-        submission_evidence_blockers(
-            local_evidence,
-            validation_details.get("overfitting_evidence"),
-            now=now,
-        )
-    )
     return blockers
 
 
@@ -1451,7 +1435,7 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             select(WQResearchCandidate)
             .where(
                 WQResearchCandidate.account == account,
-                WQResearchCandidate.status.in_(["queued", "validation_pending"]),
+                WQResearchCandidate.status.in_(["queued", "validation_pending", "robustness_fail"]),
             )
             .order_by(*candidate_order)
         )
@@ -1637,7 +1621,7 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             "points_score_unchanged_pending": points_score_unchanged_pending,
             "submission_warning": submission_warning,
             "submission_frozen": submission_frozen,
-            "rule": "target_two_active_per_day; sc_fail_and_confirmed_unsubmitted_free_capacity; uncertain_submissions_fail_closed",
+            "rule": "target_two_active_per_day; official_brain_checks_hard; local_robustness_correlation_overfit_soft_for_target_fill; uncertain_submissions_fail_closed",
         }
 
 

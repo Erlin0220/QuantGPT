@@ -12,7 +12,6 @@ dependencies = [
     "mcp>=1.0",
     "uvicorn>=0.30",
     "fastapi>=0.115",
-    "openai>=1.0",
     "sqlalchemy[asyncio]>=2.0",
     "aiosqlite>=0.20",
     "alembic>=1.13",

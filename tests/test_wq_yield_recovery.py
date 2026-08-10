@@ -55,7 +55,7 @@ async def test_full_yield_recovery_grows_inventory_with_submission_slots_exhaust
         "build_live_field_plan",
         lambda *_args, **_kwargs: ([], {"available": False, "count": 0}, []),
     )
-    monkeypatch.setattr(autonomous, "build_llm_live_plan", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(autonomous, "build_chatgpt_plan", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         autonomous,
         "validate_candidate_robustness",

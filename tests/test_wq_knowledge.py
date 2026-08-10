@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -116,40 +114,42 @@ async def test_missing_evidence_sources_cannot_activate_card(knowledge_db):
 
 
 @pytest.mark.asyncio
-async def test_cross_distillation_uses_only_stored_sources_and_activates_multisource_card(knowledge_db, monkeypatch):
+async def test_cross_distillation_roundtrips_through_chatgpt_and_activates_multisource_card(knowledge_db):
     await _seed_sources()
 
-    def fake_llm(system_prompt: str, user_prompt: str, **_kwargs) -> str:
-        assert "Use ONLY the supplied sources" in system_prompt
-        assert "SOURCE_KEY=textbook:test" in user_prompt
-        assert "SOURCE_KEY=arxiv:1234.5678" in user_prompt
-        return json.dumps(
-            {
-                "concept": "short_term_reversal",
-                "family": "momentum_reversal",
-                "hypothesis": "Temporary price pressure may create short-horizon reversal.",
-                "mechanism": ["temporary price pressure"],
-                "scope": {"asset": ["equity"], "horizon": ["short"]},
-                "evidence": [
-                    {"source_key": "textbook:test", "support": "positive", "claim": "cost-aware reversal"},
-                    {"source_key": "arxiv:1234.5678", "support": "positive", "claim": "short-horizon reversal"},
-                ],
-                "operators": ["rank", "ts_delta"],
-                "expression_templates": ["-rank(ts_delta(close, 5))"],
-                "failure_modes": ["high turnover"],
-                "mutation_strategies": ["increase lookback"],
-                "confidence": 0.78,
-            }
-        )
-
-    import quantgpt.iteration as iteration
-
-    monkeypatch.setattr(iteration, "_call_llm", fake_llm)
-    result = await cross_distill_sources(
+    prepared = await cross_distill_sources(
         ["textbook:test", "arxiv:1234.5678"],
         concept="short_term_reversal",
         family="momentum_reversal",
     )
+    assert prepared["requires_chatgpt"] is True
+    assert "Use ONLY the supplied sources" in prepared["instructions"]
+    assert "SOURCE_KEY=textbook:test" in prepared["source_material"]
+    assert "SOURCE_KEY=arxiv:1234.5678" in prepared["source_material"]
+
+    chatgpt_card = {
+        "concept": "short_term_reversal",
+        "family": "momentum_reversal",
+        "hypothesis": "Temporary price pressure may create short-horizon reversal.",
+        "mechanism": ["temporary price pressure"],
+        "scope": {"asset": ["equity"], "horizon": ["short"]},
+        "evidence": [
+            {"source_key": "textbook:test", "support": "positive", "claim": "cost-aware reversal"},
+            {"source_key": "arxiv:1234.5678", "support": "positive", "claim": "short-horizon reversal"},
+        ],
+        "operators": ["rank", "ts_delta"],
+        "expression_templates": ["-rank(ts_delta(close, 5))"],
+        "failure_modes": ["high turnover"],
+        "mutation_strategies": ["increase lookback"],
+        "confidence": 0.78,
+    }
+    result = await cross_distill_sources(
+        ["textbook:test", "arxiv:1234.5678"],
+        concept="short_term_reversal",
+        family="momentum_reversal",
+        chatgpt_card=chatgpt_card,
+    )
+    assert result["distilled_by"] == "chatgpt_client"
     assert result["stored"]["status"] == "active"
     assert result["stored"]["source_count"] == 2
 

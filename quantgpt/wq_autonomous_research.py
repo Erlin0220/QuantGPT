@@ -73,6 +73,47 @@ def _safe_metric(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _load_platform_alpha_history(client, *, limit: int = 500) -> dict[str, Any]:
+    """Load a bounded multi-page slice of BRAIN Alpha history.
+
+    Candidate recovery must not assume the newest 100 rows contain the strongest
+    UNSUBMITTED near-misses.  Scan a few cheap list pages and de-duplicate by
+    alpha_id so older simulated inventory remains available to the rescue path.
+    """
+    limit = max(1, min(500, int(limit)))
+    page_size = 100
+    alphas: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    pages = 0
+    errors: list[str] = []
+    for offset in range(0, limit, page_size):
+        requested = min(page_size, limit - offset)
+        page = run_list_alphas(client, limit=requested, offset=offset)
+        pages += 1
+        if not page.get("ok"):
+            errors.append(str(page.get("error") or f"offset {offset} failed"))
+            break
+        rows = list(page.get("alphas") or [])
+        for alpha in rows:
+            alpha_id = str(alpha.get("alpha_id") or "").strip()
+            dedupe_key = alpha_id or normalize_wq_expression(str(alpha.get("expression") or ""))
+            if dedupe_key and dedupe_key in seen_ids:
+                continue
+            if dedupe_key:
+                seen_ids.add(dedupe_key)
+            alphas.append(alpha)
+            if len(alphas) >= limit:
+                break
+        if len(alphas) >= limit or len(rows) < requested:
+            break
+    return {
+        "ok": bool(alphas) or not errors,
+        "alphas": alphas,
+        "pages_scanned": pages,
+        "errors": errors,
+    }
+
+
 def _trial_promise_score(
     item: dict[str, Any],
     *,
@@ -473,6 +514,117 @@ def _active_reference_score(item: dict[str, Any], profile: dict[str, float]) -> 
     )
 
 
+def _active_dataset_sibling_fields(
+    client,
+    active_alphas: list[dict[str, Any]],
+    *,
+    region: str,
+    universe: str,
+    delay: int,
+    limit: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Recover sibling fields from datasets that already produced ACTIVE Alpha.
+
+    Replenishment used to prefer globally underused datasets, which can starve the
+    few datasets that have already demonstrated real ACTIVE conversion.  This
+    bounded probe keeps the successful dataset while changing the field, so the
+    existing ACTIVE-motif transfer can exploit proven information sources without
+    cloning the submitted expression itself.
+    """
+    if limit <= 0 or not active_alphas or not hasattr(client, "list_data_fields"):
+        return [], {"available": False, "count": 0, "source_fields": [], "dataset_ids": []}
+
+    ranked_active = sorted(
+        active_alphas,
+        key=lambda item: (_safe_metric(item.get("fitness")), _safe_metric(item.get("sharpe"))),
+        reverse=True,
+    )
+    source_fields: list[str] = []
+    for alpha in ranked_active:
+        expression = str(alpha.get("expression") or "")
+        for field_id in extract_expression_metadata(expression).get("data_fields") or []:
+            field_id = str(field_id or "").strip()
+            if not field_id or field_id.lower() in _CORE_WQ_FIELDS or field_id in source_fields:
+                continue
+            source_fields.append(field_id)
+            if len(source_fields) >= 8:
+                break
+        if len(source_fields) >= 8:
+            break
+
+    active_field_set = set(source_fields)
+    dataset_sources: dict[str, set[str]] = {}
+    dataset_meta: dict[str, dict[str, Any]] = {}
+    for source_field in source_fields:
+        try:
+            matches = client.list_data_fields(
+                region=region,
+                universe=universe,
+                delay=delay,
+                search=source_field,
+                limit=20,
+            )
+        except Exception:
+            continue
+        exact = next((item for item in matches if _live_field_id(item) == source_field), None)
+        if exact is None:
+            continue
+        dataset = exact.get("dataset") or {}
+        dataset_id = str(dataset.get("id") or "") if isinstance(dataset, dict) else str(dataset or "")
+        if not dataset_id:
+            continue
+        dataset_sources.setdefault(dataset_id, set()).add(source_field)
+        if isinstance(dataset, dict):
+            dataset_meta[dataset_id] = dataset
+
+    def lexical_similarity(source: str, candidate: str) -> float:
+        source_tokens = {token for token in source.lower().split("_") if token and not token.isdigit()}
+        candidate_tokens = {token for token in candidate.lower().split("_") if token and not token.isdigit()}
+        if not source_tokens or not candidate_tokens:
+            return 0.0
+        return len(source_tokens & candidate_tokens) / max(1, len(source_tokens | candidate_tokens))
+
+    ranked_siblings: list[tuple[float, str, dict[str, Any]]] = []
+    for dataset_id, sources in dataset_sources.items():
+        try:
+            siblings = client.list_data_fields(
+                region=region,
+                universe=universe,
+                delay=delay,
+                dataset_id=dataset_id,
+                limit=max(20, limit * 4),
+            )
+        except Exception:
+            continue
+        for item in siblings:
+            field_id = _live_field_id(item)
+            if not field_id or field_id in active_field_set or str(item.get("type") or "MATRIX").upper() != "MATRIX":
+                continue
+            score = max((lexical_similarity(source, field_id) for source in sources), default=0.0)
+            ranked_siblings.append((score, field_id, item))
+
+    ranked_siblings.sort(key=lambda item: (-item[0], item[1]))
+    selected: list[dict[str, Any]] = []
+    selected_ids: set[str] = set()
+    for _score, field_id, item in ranked_siblings:
+        if field_id in selected_ids:
+            continue
+        selected_ids.add(field_id)
+        selected.append(item)
+        if len(selected) >= limit:
+            break
+
+    dataset_ids = sorted(dataset_sources)
+    return selected, {
+        "available": bool(dataset_ids),
+        "count": len(selected),
+        "source_fields": source_fields,
+        "dataset_ids": dataset_ids,
+        "datasets": [dataset_meta.get(dataset_id, {"id": dataset_id}) for dataset_id in dataset_ids],
+        "sample_ids": [_live_field_id(item) for item in selected[:10]],
+    }
+
+
 def build_active_motif_plan(
     client,
     active_alphas: list[dict[str, Any]],
@@ -645,82 +797,32 @@ def _expression_uses_only_catalog_fields(expression: str, operators: set[str], a
     return all(token in operators or token in allowed for token in tokens)
 
 
-def build_llm_live_plan(
+def build_chatgpt_plan(
     client,
+    expressions: list[str] | None,
     fields: list[dict[str, Any]],
     *,
     seen: set[str],
     limit: int,
     hypothesis: str,
-    memory: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Use the existing DeepSeek/OpenAI-compatible provider as a bounded WQ idea generator."""
-    if limit <= 0 or not os.environ.get("DEEPSEEK_API_KEY") or not fields:
+    """Validate ChatGPT-authored FASTEXPR ideas without invoking any server-side LLM."""
+    if limit <= 0 or not expressions:
         return []
     try:
         supported = client.list_operator_names()
     except Exception:
         return []
-    usable_fields = [_live_field_id(field) for field in fields if _live_field_id(field)][:24]
-    if not usable_fields:
-        return []
 
-    from .iteration import _call_llm
-
-    operators = sorted(supported)
-    operator_text = ", ".join(operators[:120])
-    field_text = ", ".join(usable_fields)
-    system_prompt = (
-        "You design WorldQuant BRAIN FASTEXPR research hypotheses. Output exactly one FASTEXPR expression, no prose. "
-        "Use only the supplied data fields/operators. Prefer simple economically interpretable structures, 2-5 operator calls, "
-        "and avoid pure lookback parameter tuning. Do not use assignments, semicolons, local-only indicators, or invented fields."
-    )
-    guidance = (memory or {}).get("research_memory_guidance") or {}
-    positive = [
-        f"{item.get('family')}|{item.get('dataset_id') or 'unresolved'}|{item.get('operator_pattern')}"
-        for item in (guidance.get("positive") or [])[:6]
-    ]
-    negative = [
-        f"{item.get('family')}|{item.get('dataset_id') or 'unresolved'}|{item.get('operator_pattern')}|{item.get('failure_reason')}"
-        for item in (guidance.get("negative") or [])[:8]
-    ]
-    overused = [str(item.get("operator_pattern") or "") for item in (guidance.get("overused_structures") or [])[:6]]
-    knowledge_cards = ((memory or {}).get("knowledge_guidance") or {}).get("cards") or []
-    knowledge_priors = [
-        {
-            "concept": item.get("concept"),
-            "family": item.get("family"),
-            "hypothesis": item.get("hypothesis"),
-            "mechanism": (item.get("mechanism") or [])[:4],
-            "failure_modes": (item.get("failure_modes") or [])[:3],
-            "mutation_strategies": (item.get("mutation_strategies") or [])[:3],
-            "score": item.get("score"),
-        }
-        for item in knowledge_cards[:6]
-    ]
+    usable_fields = [_live_field_id(field) for field in fields if _live_field_id(field)][:48]
+    allowed_fields = set(usable_fields)
     out: list[dict[str, Any]] = []
-    for index in range(limit):
-        avoid = [item for item in list(seen)[-8:]]
-        user_prompt = (
-            f"Research objective: {hypothesis}\n"
-            f"Allowed MATRIX fields: {field_text}\n"
-            f"Allowed operators: {operator_text}\n"
-            f"Positive structural memory to learn from (do not copy literally): {positive}\n"
-            f"Negative structural memory to avoid repeating: {negative}\n"
-            f"Overused operator structures to diversify away from softly: {overused}\n"
-            f"Corroborated multi-source research priors (use as hypotheses, not facts): {knowledge_priors}\n"
-            f"Already researched normalized expressions to avoid: {avoid}\n"
-            f"Generate idea {index + 1} with a distinct structural hypothesis."
-        )
-        try:
-            expression = _call_llm(
-                system_prompt,
-                user_prompt,
-                temperature=min(1.0 + index * 0.15, 1.4),
-                max_tokens=4096,
-            ).strip()
-        except Exception:
+    for raw_expression in expressions:
+        if len(out) >= limit:
             break
+        expression = str(raw_expression or "").strip()
+        if not expression:
+            continue
         validation = validate_wq_expression(expression, supported)
         if not validation.ok:
             continue
@@ -728,10 +830,15 @@ def build_llm_live_plan(
         normalized = normalize_wq_expression(expression)
         if not normalized or normalized in seen:
             continue
-        if not _expression_uses_only_catalog_fields(expression, supported, set(usable_fields)):
+        if not _expression_uses_only_catalog_fields(expression, supported, allowed_fields):
             continue
         seen.add(normalized)
-        used = [field for field in usable_fields if re.search(rf"(?<![a-z0-9_]){re.escape(field.lower())}(?![a-z0-9_])", normalized)]
+
+        used = [
+            field
+            for field in usable_fields
+            if re.search(rf"(?<![a-z0-9_]){re.escape(field.lower())}(?![a-z0-9_])", normalized)
+        ]
         used_items = [item for item in fields if _live_field_id(item) in used]
         dataset_ids = {
             str((item.get("dataset") or {}).get("id") or "")
@@ -748,17 +855,17 @@ def build_llm_live_plan(
         out.append(
             {
                 "expression": expression,
-                "family": _classify_live_field(used_items[0] if used_items else {}),
+                "family": classify_wq_family(expression),
                 "generation": 1,
                 "hypothesis": hypothesis,
                 "parent_expression": None,
-                "mutation_type": "llm_live_field_seed",
-                "planner_strategy": "positive_negative_memory_llm",
+                "mutation_type": "chatgpt_seed",
+                "planner_strategy": "chatgpt_client",
                 "data_fields": used,
                 "dataset_id": dataset_id,
                 "dataset_category": dataset_category,
                 "provenance_state": "resolved" if dataset_id else "unresolved",
-                "provenance_reason": "live_field_catalog" if dataset_id else "llm_uses_multiple_or_unresolved_datasets",
+                "provenance_reason": "live_field_catalog" if dataset_id else "chatgpt_core_or_multi_dataset_expression",
             }
         )
     return out
@@ -980,29 +1087,6 @@ def _step_knowledge_decay_window(expression: str) -> str | None:
     return f"rank(ts_decay_linear(({match.group(1)}), {next_window}))"
 
 
-def _knowledge_execution_refinement_eligible(
-    *,
-    knowledge_card_ids: list[str],
-    generation: int,
-    sharpe: float | None,
-    fitness: float | None,
-    turnover: float | None,
-    min_sharpe: float = 1.25,
-    min_fitness: float = 1.0,
-) -> bool:
-    """Allow exactly one extra generation for a near-threshold knowledge Alpha."""
-    return bool(
-        knowledge_card_ids
-        and generation == 3
-        and sharpe is not None
-        and sharpe >= min_sharpe
-        and fitness is not None
-        and min_fitness * 0.7 <= fitness < min_fitness
-        and turnover is not None
-        and 0.01 <= turnover <= 0.7
-    )
-
-
 def _alternate_family_seed(family: str, seen: set[str], *, stable_only: bool = False) -> tuple[str, str] | None:
     preferred = ("fundamental_quality", "analyst_revision", "volatility_structure") if stable_only else tuple(FAMILY_SEEDS)
     for alternate_family in preferred:
@@ -1046,7 +1130,7 @@ def build_targeted_mutations(
     except (TypeError, ValueError):
         max_children = 2
     try:
-        max_generation = max(1, min(5, int(os.environ.get("WQ_MUTATION_MAX_GENERATION", "3"))))
+        max_generation = max(1, min(3, int(os.environ.get("WQ_MUTATION_MAX_GENERATION", "3"))))
     except (TypeError, ValueError):
         max_generation = 3
     limit = min(int(limit), max_children)
@@ -1061,16 +1145,7 @@ def build_targeted_mutations(
     knowledge_card_ids = [str(value) for value in (meta.get("knowledge_card_ids") or []) if value]
     parent_generation = int(meta.get("generation") or 1)
     generation = parent_generation + 1
-    effective_max_generation = max_generation
-    if _knowledge_execution_refinement_eligible(
-        knowledge_card_ids=knowledge_card_ids,
-        generation=parent_generation,
-        sharpe=sharpe,
-        fitness=fitness,
-        turnover=turnover,
-    ):
-        effective_max_generation = max(effective_max_generation, 4)
-    if generation > effective_max_generation:
+    if generation > max_generation:
         result["mutation_route_terminal_reason"] = "mutation_generation_budget_exhausted"
         return []
     directives = preferred_mutation_classes(result)
@@ -1256,16 +1331,7 @@ def build_memory_mutation_plan(
         generation = int(trial.get("generation") or 0)
         trial_card_ids = [str(value) for value in (trial.get("knowledge_card_ids") or []) if value]
         linked_cards = [knowledge_cards_by_id[value] for value in trial_card_ids if value in knowledge_cards_by_id]
-        refinement_eligible = _knowledge_execution_refinement_eligible(
-            knowledge_card_ids=[str(card.get("id")) for card in linked_cards if card.get("id")],
-            generation=generation,
-            sharpe=_safe_metric(trial.get("sharpe")),
-            fitness=_safe_metric(trial.get("fitness")),
-            turnover=_safe_metric(trial.get("turnover")),
-            min_sharpe=min_sharpe,
-            min_fitness=min_fitness,
-        )
-        if generation >= 3 and not refinement_eligible:
+        if generation >= 3:
             continue
         targets = list(trial.get("mutation_targets") or [])
         if not targets or targets == ["candidate_passes_primary_thresholds"]:
@@ -1613,6 +1679,58 @@ def _select_native_decay_rescue_parent(
     return parent, [value for value in (2, 4) if value not in tested][:2]
 
 
+def _select_active_target_native_decay_rescue_parent(
+    alphas: list[dict[str, Any]],
+    *,
+    min_sharpe: float,
+    min_fitness: float,
+    current_decay: int,
+) -> tuple[dict[str, Any] | None, list[int]]:
+    """Pick the strongest platform near-miss for a tiny native decay rescue.
+
+    This path is intentionally only used while the daily ACTIVE target is still
+    open.  A near-miss is not formally submittable yet; instead of discarding it
+    or repeatedly wrapping the FASTEXPR, reuse BRAIN's native execution decay to
+    try to lift Fitness across the real platform threshold with two bounded sims.
+    """
+    if int(current_decay) != 0:
+        return None, []
+
+    eligible: list[dict[str, Any]] = []
+    for alpha in alphas or []:
+        if str(alpha.get("status") or "").upper() != "UNSUBMITTED":
+            continue
+        expression = str(alpha.get("expression") or "").strip()
+        sharpe = _safe_metric(alpha.get("sharpe"), -999.0)
+        fitness = _safe_metric(alpha.get("fitness"), -999.0)
+        returns = _safe_metric(alpha.get("returns"), -999.0)
+        turnover = _safe_metric(alpha.get("turnover"), 0.0)
+        if not expression:
+            continue
+        if sharpe < min_sharpe or not (min_fitness * 0.85 <= fitness < min_fitness):
+            continue
+        if returns <= 0 or not 0.01 <= turnover <= 0.7:
+            continue
+        item = dict(alpha)
+        item["family"] = classify_wq_family(expression)
+        item["generation"] = 1
+        item["parameter_rescue_source"] = "platform_near_miss"
+        eligible.append(item)
+
+    if not eligible:
+        return None, []
+    eligible.sort(
+        key=lambda item: (
+            _safe_metric(item.get("fitness")),
+            _safe_metric(item.get("sharpe")),
+            _safe_metric(item.get("returns")),
+            -abs(_safe_metric(item.get("turnover")) - 0.25),
+        ),
+        reverse=True,
+    )
+    return eligible[0], [2, 4]
+
+
 def _run_native_decay_rescue(
     client,
     parent: dict[str, Any],
@@ -1639,8 +1757,16 @@ def _run_native_decay_rescue(
         "parent_expression": expression,
         "parent_alpha_id": parent.get("alpha_id"),
         "mutation_type": "native_decay_rescue",
-        "mutation_reason": "near-threshold knowledge Alpha: bounded BRAIN-native decay before deeper FASTEXPR mutation",
-        "planner_strategy": "knowledge_native_parameter_rescue",
+        "mutation_reason": (
+            "platform near-miss: bounded BRAIN-native decay before deeper FASTEXPR mutation"
+            if parent.get("parameter_rescue_source") == "platform_near_miss"
+            else "near-threshold knowledge Alpha: bounded BRAIN-native decay before deeper FASTEXPR mutation"
+        ),
+        "planner_strategy": (
+            "active_target_native_parameter_rescue"
+            if parent.get("parameter_rescue_source") == "platform_near_miss"
+            else "knowledge_native_parameter_rescue"
+        ),
         "knowledge_card_ids": list(parent.get("knowledge_card_ids") or []),
         "data_fields": list(parent.get("data_fields") or []),
         "dataset_id": parent.get("dataset_id"),
@@ -1699,6 +1825,7 @@ def run_autonomous_research(
     client,
     *,
     memory: dict[str, Any] | None = None,
+    chatgpt_expressions: list[str] | None = None,
     goal: str = "maximize robust low-correlation WorldQuant candidates",
     tag: str = "wq-autonomous",
     region: str = "USA",
@@ -1724,7 +1851,11 @@ def run_autonomous_research(
 
     # Seed the persistent memory with recent platform research so the first autonomous
     # run does not simply rediscover the last externally-created expressions.
-    recent = run_list_alphas(client, limit=100)
+    try:
+        platform_history_limit = max(100, min(500, int(os.environ.get("WQ_PLATFORM_HISTORY_LIMIT", "500"))))
+    except (TypeError, ValueError):
+        platform_history_limit = 500
+    recent = _load_platform_alpha_history(client, limit=platform_history_limit)
     recent_alphas = list(recent.get("alphas") or []) if recent.get("ok") else []
     active_alphas = [alpha for alpha in recent_alphas if str(alpha.get("status") or "").upper() == "ACTIVE"]
     active_reference_profile = _active_reference_profile(active_alphas)
@@ -1756,11 +1887,23 @@ def run_autonomous_research(
     memory["adaptive_allocation"] = adaptive_allocation
     seen = set(normalized)
 
+    # While today's ACTIVE target is still open, bias harder toward sources with
+    # demonstrated platform conversion.  Once the target is filled, fall back to
+    # the normal inventory policy and rebuild a stricter candidate stockpile.
+    submission_state = memory.get("submission") or {}
+    try:
+        remaining_active_target = max(0, int(submission_state.get("remaining_active_target") or 0))
+    except (TypeError, ValueError):
+        remaining_active_target = 0
+    active_target_mode = remaining_active_target > 0
+
     # In inventory replenishment, exploit two sources that are much closer to
     # ACTIVE than random seeds: motifs from actual platform ACTIVE alphas and
     # strong UNSUBMITTED near-misses. Any unused quota automatically flows back
     # to fresh exploration, so sparse platform history never starves discovery.
-    if inventory_mode == "REPLENISHMENT":
+    if active_target_mode:
+        active_share, near_miss_share, memory_share = 0.65, 0.25, 0.05
+    elif inventory_mode == "REPLENISHMENT":
         active_share, near_miss_share, memory_share = 0.45, 0.30, 0.10
     elif inventory_mode == "NORMAL":
         active_share, near_miss_share, memory_share = 0.25, 0.20, 0.20
@@ -1797,6 +1940,20 @@ def run_autonomous_research(
         delay=delay,
         limit=field_probe_budget,
     )
+    active_sibling_fields, active_sibling_catalog = _active_dataset_sibling_fields(
+        client,
+        active_alphas,
+        region=region,
+        universe=universe,
+        delay=delay,
+        limit=max(field_probe_budget, active_motif_budget * 2),
+    )
+    if active_sibling_fields:
+        sibling_ids = {_live_field_id(item) for item in active_sibling_fields}
+        live_fields = active_sibling_fields + [
+            item for item in live_fields if _live_field_id(item) not in sibling_ids
+        ]
+    live_catalog["active_dataset_siblings"] = active_sibling_catalog
     active_motif_plan = build_active_motif_plan(
         client,
         active_alphas,
@@ -1807,7 +1964,20 @@ def run_autonomous_research(
     )
 
     exploration_budget = max(0, first_budget - len(active_motif_plan) - len(near_miss_plan) - len(memory_plan))
-    knowledge_budget = min(6, exploration_budget, max(0, math.ceil(exploration_budget * 0.25)))
+
+    # ChatGPT is the only generative reasoning layer. Candidate expressions authored
+    # by the MCP client get first claim on fresh-exploration budget; QuantGPT only
+    # validates, deduplicates, simulates, diagnoses, mutates, and persists them.
+    chatgpt_plan = build_chatgpt_plan(
+        client,
+        chatgpt_expressions,
+        live_fields,
+        seen=seen,
+        limit=exploration_budget,
+        hypothesis=goal,
+    )
+    deterministic_budget = max(0, exploration_budget - len(chatgpt_plan))
+    knowledge_budget = min(6, deterministic_budget, max(0, math.ceil(deterministic_budget * 0.25)))
     knowledge_plan = build_knowledge_seed_plan(
         client,
         memory,
@@ -1816,8 +1986,8 @@ def run_autonomous_research(
         hypothesis=goal,
         generation=1,
     )
-    live_remaining = max(0, exploration_budget - len(knowledge_plan))
-    live_budget = min(live_remaining, max(0, math.ceil(exploration_budget * 0.35)))
+    live_remaining = max(0, deterministic_budget - len(knowledge_plan))
+    live_budget = min(live_remaining, max(0, math.ceil(deterministic_budget * 0.35)))
     live_plan = _build_live_field_plan_from_fields(
         client,
         live_fields,
@@ -1826,8 +1996,8 @@ def run_autonomous_research(
         hypothesis=goal,
     )
     structural_budget = min(
-        max(0, exploration_budget - len(knowledge_plan) - len(live_plan)),
-        max(0, math.ceil(exploration_budget * 0.35)),
+        max(0, deterministic_budget - len(knowledge_plan) - len(live_plan)),
+        max(0, math.ceil(deterministic_budget * 0.35)),
     )
     structural_plan = build_structural_live_plan(
         client,
@@ -1836,26 +2006,11 @@ def run_autonomous_research(
         limit=structural_budget,
         hypothesis=goal,
     )
-    remaining_after_deterministic = max(0, exploration_budget - len(knowledge_plan) - len(live_plan) - len(structural_plan))
-    # Inventory replenishment must not depend on an external LLM provider. A
-    # transient OpenCode/DeepSeek 5xx used to stall the whole research round
-    # before BRAIN simulation started. Deterministic ACTIVE/near-miss/live-field
-    # paths are sufficient for replenishment; LLM exploration remains available
-    # in NORMAL/EXPLORATION modes where latency is less critical.
-    llm_budget = 0 if inventory_mode == "REPLENISHMENT" else min(4, remaining_after_deterministic)
-    llm_plan = build_llm_live_plan(
-        client,
-        live_fields,
-        seen=seen,
-        limit=llm_budget,
-        hypothesis=goal,
-        memory=memory,
-    )
     seed_memory = dict(memory)
     seed_memory["normalized_expressions"] = sorted(seen)
     seed_plan = build_seed_plan(
         seed_memory,
-        limit=max(0, exploration_budget - len(knowledge_plan) - len(live_plan) - len(structural_plan) - len(llm_plan)),
+        limit=max(0, deterministic_budget - len(knowledge_plan) - len(live_plan) - len(structural_plan)),
         family_count=family_count,
         generation=1,
         hypothesis=goal,
@@ -1867,10 +2022,10 @@ def run_autonomous_research(
         len(active_motif_plan)
         + len(near_miss_plan)
         + len(memory_plan)
+        + len(chatgpt_plan)
         + len(knowledge_plan)
         + len(live_plan)
         + len(structural_plan)
-        + len(llm_plan)
         + len(seed_plan)
     )
     if planned_count < first_budget:
@@ -1890,10 +2045,10 @@ def run_autonomous_research(
             active_motif_plan
             + near_miss_plan
             + memory_plan
+            + chatgpt_plan
             + knowledge_plan
             + live_plan
             + structural_plan
-            + llm_plan
             + seed_plan
         )
         if not _violates_prevention_rules(item, memory.get("prevention_rules"))
@@ -1909,7 +2064,12 @@ def run_autonomous_research(
         replenishment_cap = max(base_validation_cap, min(8, int(os.environ.get("WQ_REPLENISHMENT_VALIDATION_CAP", "4"))))
     except (TypeError, ValueError):
         base_validation_cap, replenishment_cap = 2, 4
-    validation_cap = replenishment_cap if inventory_mode == "REPLENISHMENT" else base_validation_cap
+    # The formal Submission Gate already retains the hard safety blockers and
+    # BRAIN's official SC check. Before today's two ACTIVE outcomes are reached,
+    # local robustness is advisory rather than a pre-submit veto; otherwise a
+    # small unstable cross-setting sample can exhaust the day without ever
+    # letting a primary-qualified Alpha reach the authoritative platform check.
+    validation_cap = 0 if active_target_mode else (replenishment_cap if inventory_mode == "REPLENISHMENT" else base_validation_cap)
     validation_candidates_used = 0
     validation_simulations = 0
     robustness_feedback_failures = 0
@@ -1919,6 +2079,18 @@ def run_autonomous_research(
         min_fitness=min_fitness,
         current_decay=decay,
     )
+    if active_target_mode:
+        platform_rescue_parent, platform_rescue_values = _select_active_target_native_decay_rescue_parent(
+            recent_alphas,
+            min_sharpe=min_sharpe,
+            min_fitness=min_fitness,
+            current_decay=decay,
+        )
+        if platform_rescue_parent is not None and (
+            native_decay_parent is None
+            or _safe_metric(platform_rescue_parent.get("fitness")) >= _safe_metric(native_decay_parent.get("fitness"))
+        ):
+            native_decay_parent, native_decay_values = platform_rescue_parent, platform_rescue_values
     native_decay_results: list[dict[str, Any]] = []
     remaining = max_simulations
     plan = first_plan
@@ -2119,6 +2291,7 @@ def run_autonomous_research(
         "research_memory_guidance": memory.get("research_memory_guidance") or {},
         "knowledge_guidance": memory.get("knowledge_guidance") or {},
         "inventory_mode": inventory_mode,
+        "active_target_mode": active_target_mode,
         "active_reference_profile": active_reference_profile,
         "live_catalog": live_catalog,
         "memory_before": {
@@ -2129,6 +2302,7 @@ def run_autonomous_research(
         "summary": {
             "generations_requested": generations,
             "generations_completed": len(generation_results),
+            "remaining_active_target": remaining_active_target,
             "primary_simulation_budget": max_simulations,
             "primary_simulation_budget_scope": "research_generations_only",
             "native_decay_rescue_parent": (native_decay_parent or {}).get("alpha_id") if native_decay_parent else None,
@@ -2141,7 +2315,7 @@ def run_autonomous_research(
             "knowledge_seed_expressions": len(knowledge_plan),
             "live_field_expressions": len(live_plan),
             "structural_live_expressions": len(structural_plan),
-            "llm_expressions": len(llm_plan),
+            "chatgpt_expressions": len(chatgpt_plan),
             "seed_expressions": len(seed_plan),
             "simulated": sum(int((item.get("summary") or {}).get("simulated") or 0) for item in generation_results),
             "primary_candidates": len(ranked_primary_candidates),
