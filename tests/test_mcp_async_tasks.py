@@ -49,12 +49,38 @@ class TestWQMCPAsyncSurface(unittest.IsolatedAsyncioTestCase):
             ("single", lambda: mcp_server.wq_brain_submit("rank(close/open)", "smoke")),
             ("batch", lambda: mcp_server.wq_brain_batch_submit("rank(close/open)", "smoke")),
             ("research", lambda: mcp_server.wq_brain_research(["rank(close/open)"])),
+            (
+                "autonomous",
+                lambda: mcp_server.wq_brain_autonomous_research(
+                    skill_candidates=[{
+                        "expression": "rank(close/open)",
+                        "hypothesis": "relative close/open strength should predict next-day cross-sectional returns",
+                        "skill_chain": ["wq-alpha-hypothesis", "wq-alpha-review"],
+                        "review_decision": "RUN",
+                    }]
+                ),
+            ),
             ("submitids", lambda: mcp_server.wq_brain_submit_by_ids(["abc123"])),
             ("finalize", lambda: mcp_server.wq_brain_finalize_submissions(["abc123"])),
         ]
         for name, call in cases:
             with self.subTest(name=name):
                 await self._assert_enqueued(name, call)
+
+    async def test_autonomous_research_requires_devspace_skill_candidates_by_default(self):
+        with (
+            patch.dict(
+                os.environ,
+                {"WQ_BRAIN_EMAIL": "test@example.com", "WQ_BRAIN_PASSWORD": "pw"},
+                clear=False,
+            ),
+            patch.object(mcp_server, "start_mcp_task", new=AsyncMock()) as start_task,
+        ):
+            payload = json.loads(await mcp_server.wq_brain_autonomous_research())
+
+        self.assertEqual(payload["status"], "skill_generation_required")
+        self.assertEqual(payload["required_skill_chain"], ["wq-alpha-hypothesis", "wq-alpha-review"])
+        start_task.assert_not_awaited()
 
     async def test_auto_submit_is_rejected_before_task_enqueue(self):
         with (

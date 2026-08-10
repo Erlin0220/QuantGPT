@@ -46,7 +46,7 @@ from .mcp_task_helper import (
 )
 from .report import generate_report
 from .task_executor import _run_backtest_in_process, get_executor
-from .wq_autonomous_research import run_autonomous_research
+from .wq_autonomous_research import REQUIRED_WQ_SKILL_CHAIN, run_autonomous_research, validate_skill_candidate_contract
 from .wq_brain_service import (
     prepare_wq_expression,
     reconcile_submission_uncertainty,
@@ -1335,7 +1335,9 @@ def _run_wq_autonomous_research_mcp_task(task_id: str, params: dict) -> dict:
         result = run_autonomous_research(
             client,
             memory=memory,
+            skill_candidates=params.get("skill_candidates") or [],
             chatgpt_expressions=params.get("chatgpt_expressions") or [],
+            allow_deterministic_fallback=bool(params.get("allow_deterministic_fallback")),
             goal=params["goal"],
             tag=params["tag"],
             region=params["region"],
@@ -1804,7 +1806,9 @@ async def wq_brain_research(
 
 @mcp.tool()
 async def wq_brain_autonomous_research(
+    skill_candidates: list[dict] | None = None,
     chatgpt_expressions: list[str] | None = None,
+    allow_deterministic_fallback: bool = False,
     goal: str = "maximize robust low-correlation WorldQuant candidates",
     tag: str = "wq-autonomous",
     region: str = "USA",
@@ -1814,16 +1818,19 @@ async def wq_brain_autonomous_research(
     neutralization: str = "SUBINDUSTRY",
     truncation: float = 0.08,
     max_simulations: int = 20,
-    generations: int = 2,
+    generations: int = 1,
     family_count: int = 3,
     min_sharpe: float = 1.25,
     min_fitness: float = 1.0,
 ) -> str:
-    """自主规划并研究 WQ Alpha；生成式推理由当前 ChatGPT 客户端负责。
+    """Skill-first 研究 WQ Alpha；生成式推理由当前 ChatGPT + DevSpace 项目 Skill 负责。
 
-    推荐 ChatGPT 先调用 ``list_wq_operators`` 与 ``wq_brain_data_catalog``，结合账号研究记忆生成
-    FASTEXPR，再通过 ``chatgpt_expressions`` 注入本工具。QuantGPT 服务端不调用任何 LLM；未提供
-    ChatGPT 候选时仍可使用 ACTIVE/near-miss/knowledge/live-field 等确定性路径补充库存。
+    默认必须先用 DevSpace 打开 QuantGPT 项目，执行 ``wq-alpha-hypothesis`` 生成候选，再执行
+    ``wq-alpha-review``；只有 review_decision=RUN 的结构化 ``skill_candidates`` 才会进入 BRAIN
+    Simulation。真实 Simulation 失败后的下一代应回到 ``wq-alpha-repair`` / ``wq-alpha-diversify``
+    再生成，而不是由服务端隐藏模板继续变异。``allow_deterministic_fallback=True`` 仅用于显式兼容/
+    故障降级，此时才允许 legacy chatgpt_expressions 与确定性 ACTIVE/near-miss/knowledge/live-field 路径。
+    QuantGPT 服务端不调用任何 LLM。
     ``max_simulations`` 是主研究 generations 的 Simulation 预算；
     Robustness Validation 使用独立、显式上报的有界预算。Primary Pass 还会经过有限的跨
     Universe/Neutralization Robustness Funnel，只有 READY Candidate 才进入正式候选库存。工具永远不会正式提交
@@ -1838,13 +1845,39 @@ async def wq_brain_autonomous_research(
         return json.dumps({"error": "WQ BRAIN 未配置 — 请设置 WQ_BRAIN_EMAIL 和 WQ_BRAIN_PASSWORD"})
     if max_simulations < 4 or max_simulations > 40:
         return json.dumps({"error": "max_simulations 必须在 4~40 之间"})
+    skill_candidates = list(skill_candidates or [])
+    if not allow_deterministic_fallback:
+        if not skill_candidates:
+            return json.dumps({
+                "ok": False,
+                "status": "skill_generation_required",
+                "error": "skill_candidates_required",
+                "project_path": r"C:\project\QuantGPT",
+                "required_skill_chain": list(REQUIRED_WQ_SKILL_CHAIN),
+                "next_step": "用 DevSpace 打开项目，执行 wq-alpha-hypothesis → wq-alpha-review，并把 RUN 候选作为 skill_candidates 传回。",
+            }, ensure_ascii=False)
+        contract_errors = [
+            {"index": index, "error": error}
+            for index, candidate in enumerate(skill_candidates)
+            if (error := validate_skill_candidate_contract(candidate))
+        ]
+        if contract_errors:
+            return json.dumps({
+                "ok": False,
+                "status": "skill_candidate_contract_invalid",
+                "error": "skill_candidates 未通过 DevSpace Skill provenance 门禁",
+                "required_skill_chain": list(REQUIRED_WQ_SKILL_CHAIN),
+                "details": contract_errors,
+            }, ensure_ascii=False)
     if generations < 1 or generations > 3:
         return json.dumps({"error": "generations 必须在 1~3 之间"})
     if family_count < 1 or family_count > 4:
         return json.dumps({"error": "family_count 必须在 1~4 之间"})
 
     params = {
+        "skill_candidates": skill_candidates[:40],
         "chatgpt_expressions": list(chatgpt_expressions or [])[:40],
+        "allow_deterministic_fallback": bool(allow_deterministic_fallback),
         "goal": goal,
         "tag": tag,
         "region": region,

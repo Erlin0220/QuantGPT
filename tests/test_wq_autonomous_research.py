@@ -429,6 +429,58 @@ def test_robustness_failure_reduces_cross_run_parent_promise():
     assert autonomous._trial_promise_score(robust_failure) < autonomous._trial_promise_score(base)
 
 
+def test_skill_candidate_contract_requires_hypothesis_review_chain_and_run_decision():
+    valid = {
+        "expression": "rank(ts_mean(returns, 20))",
+        "hypothesis": "recent return persistence should rank future returns",
+        "skill_chain": ["wq-alpha-hypothesis", "wq-alpha-review"],
+        "review_decision": "RUN",
+    }
+
+    assert autonomous.validate_skill_candidate_contract(valid) is None
+    assert "missing hypothesis" in autonomous.validate_skill_candidate_contract({**valid, "hypothesis": ""})
+    assert "wq-alpha-review" in autonomous.validate_skill_candidate_contract({**valid, "skill_chain": ["wq-alpha-hypothesis"]})
+    assert "review_decision" in autonomous.validate_skill_candidate_contract({**valid, "review_decision": "REVISE"})
+
+
+def test_skill_plan_preserves_devspace_provenance_and_live_dataset():
+    class FakeClient:
+        def list_operator_names(self):
+            return {"rank", "ts_mean", "ts_backfill"}
+
+    fields = [
+        {
+            "id": "real_field",
+            "type": "MATRIX",
+            "description": "analyst revision signal",
+            "dataset": {"id": "analyst4", "category": {"id": "analyst"}},
+        }
+    ]
+    plan = autonomous.build_skill_plan(
+        FakeClient(),
+        [{
+            "expression": "rank(ts_mean(ts_backfill(real_field, 60), 20))",
+            "hypothesis": "positive analyst revisions should predict relative outperformance",
+            "family": "analyst_revision",
+            "skill_chain": ["wq-alpha-hypothesis", "wq-alpha-review"],
+            "review_decision": "RUN",
+            "review_notes": "live field and operator checks passed",
+        }],
+        fields,
+        seen=set(),
+        limit=1,
+        hypothesis="fallback goal",
+    )
+
+    assert len(plan) == 1
+    assert plan[0]["planner_strategy"] == "devspace_skill"
+    assert plan[0]["generation_source"] == "devspace_skill"
+    assert plan[0]["skill_provenance_verified"] is True
+    assert plan[0]["skill_chain"] == ["wq-alpha-hypothesis", "wq-alpha-review"]
+    assert plan[0]["dataset_id"] == "analyst4"
+    assert plan[0]["hypothesis"].startswith("positive analyst revisions")
+
+
 def test_chatgpt_plan_rejects_invented_fields_and_keeps_catalog_expression():
     class FakeClient:
         def list_operator_names(self):

@@ -797,6 +797,108 @@ def _expression_uses_only_catalog_fields(expression: str, operators: set[str], a
     return all(token in operators or token in allowed for token in tokens)
 
 
+REQUIRED_WQ_SKILL_CHAIN = ("wq-alpha-hypothesis", "wq-alpha-review")
+
+
+def validate_skill_candidate_contract(candidate: dict[str, Any]) -> str | None:
+    """Validate client-side DevSpace skill provenance before spending BRAIN budget."""
+    expression = str(candidate.get("expression") or "").strip()
+    hypothesis = str(candidate.get("hypothesis") or "").strip()
+    skill_chain = [str(value).strip() for value in (candidate.get("skill_chain") or []) if str(value).strip()]
+    review_decision = str(candidate.get("review_decision") or "").strip().upper()
+    if not expression:
+        return "missing expression"
+    if not hypothesis:
+        return "missing hypothesis"
+    missing = [name for name in REQUIRED_WQ_SKILL_CHAIN if name not in skill_chain]
+    if missing:
+        return f"missing required skill(s): {', '.join(missing)}"
+    if review_decision != "RUN":
+        return "review_decision must be RUN"
+    return None
+
+
+def build_skill_plan(
+    client,
+    candidates: list[dict[str, Any]] | None,
+    fields: list[dict[str, Any]],
+    *,
+    seen: set[str],
+    limit: int,
+    hypothesis: str,
+) -> list[dict[str, Any]]:
+    """Validate DevSpace skill-authored candidates and preserve their research provenance."""
+    if limit <= 0 or not candidates:
+        return []
+    try:
+        supported = client.list_operator_names()
+    except Exception:
+        return []
+
+    usable_fields = [_live_field_id(field) for field in fields if _live_field_id(field)][:48]
+    allowed_fields = set(usable_fields)
+    out: list[dict[str, Any]] = []
+    for raw_candidate in candidates:
+        if len(out) >= limit:
+            break
+        if not isinstance(raw_candidate, dict) or validate_skill_candidate_contract(raw_candidate):
+            continue
+        expression = str(raw_candidate.get("expression") or "").strip()
+        validation = validate_wq_expression(expression, supported)
+        if not validation.ok:
+            continue
+        expression = validation.expression
+        normalized = normalize_wq_expression(expression)
+        if not normalized or normalized in seen:
+            continue
+        if not _expression_uses_only_catalog_fields(expression, supported, allowed_fields):
+            continue
+        seen.add(normalized)
+
+        used = [
+            field
+            for field in usable_fields
+            if re.search(rf"(?<![a-z0-9_]){re.escape(field.lower())}(?![a-z0-9_])", normalized)
+        ]
+        used_items = [item for item in fields if _live_field_id(item) in used]
+        dataset_ids = {
+            str((item.get("dataset") or {}).get("id") or "")
+            for item in used_items
+            if isinstance(item.get("dataset") or {}, dict) and (item.get("dataset") or {}).get("id")
+        }
+        categories = {
+            _dataset_category(item.get("dataset") or {})
+            for item in used_items
+            if isinstance(item.get("dataset") or {}, dict)
+        }
+        dataset_id = next(iter(dataset_ids)) if len(dataset_ids) == 1 else raw_candidate.get("dataset_id")
+        dataset_category = next(iter(categories)) if len(categories) == 1 else raw_candidate.get("dataset_category")
+        out.append(
+            {
+                "expression": expression,
+                "family": str(raw_candidate.get("family") or classify_wq_family(expression)),
+                "generation": 1,
+                "hypothesis": str(raw_candidate.get("hypothesis") or hypothesis),
+                "parent_expression": raw_candidate.get("parent_expression"),
+                "mutation_type": str(raw_candidate.get("mutation_type") or "skill_seed"),
+                "mutation_reason": raw_candidate.get("mutation_reason"),
+                "planner_strategy": "devspace_skill",
+                "data_fields": used or list(raw_candidate.get("data_fields") or []),
+                "dataset_id": dataset_id,
+                "dataset_category": dataset_category,
+                "provenance_state": "resolved" if dataset_id else "unresolved",
+                "provenance_reason": "devspace_skill_live_catalog" if dataset_id else "devspace_skill_core_or_multi_dataset_expression",
+                "generation_source": "devspace_skill",
+                "skill_chain": list(raw_candidate.get("skill_chain") or []),
+                "skill_review_decision": "RUN",
+                "skill_review_notes": raw_candidate.get("review_notes"),
+                "skill_provenance_verified": True,
+                "knowledge_card_ids": list(raw_candidate.get("knowledge_card_ids") or []),
+            }
+        )
+    return out
+
+
 def build_chatgpt_plan(
     client,
     expressions: list[str] | None,
@@ -806,7 +908,7 @@ def build_chatgpt_plan(
     limit: int,
     hypothesis: str,
 ) -> list[dict[str, Any]]:
-    """Validate ChatGPT-authored FASTEXPR ideas without invoking any server-side LLM."""
+    """Validate legacy ChatGPT-authored FASTEXPR ideas without server-side LLM calls."""
     if limit <= 0 or not expressions:
         return []
     try:
@@ -1825,7 +1927,9 @@ def run_autonomous_research(
     client,
     *,
     memory: dict[str, Any] | None = None,
+    skill_candidates: list[dict[str, Any]] | None = None,
     chatgpt_expressions: list[str] | None = None,
+    allow_deterministic_fallback: bool = True,
     goal: str = "maximize robust low-correlation WorldQuant candidates",
     tag: str = "wq-autonomous",
     region: str = "USA",
@@ -1845,6 +1949,19 @@ def run_autonomous_research(
     """Plan, simulate, diagnose, and mutate a bounded autonomous research round."""
     max_simulations = max(4, min(40, int(max_simulations)))
     generations = max(1, min(3, int(generations)))
+    skill_candidates = list(skill_candidates or [])
+    strict_skill_mode = not allow_deterministic_fallback
+    if strict_skill_mode and not skill_candidates:
+        return {
+            "ok": False,
+            "mode": "skill_first",
+            "error": "skill_candidates_required",
+            "required_skill_chain": list(REQUIRED_WQ_SKILL_CHAIN),
+        }
+    if strict_skill_mode:
+        # Repair/diversification after real BRAIN feedback must come back through
+        # DevSpace skills on the next client turn rather than hidden server templates.
+        generations = 1
     memory = dict(memory or {})
     family_counts = Counter(memory.get("family_counts") or {})
     normalized = set(memory.get("normalized_expressions") or [])
@@ -1870,6 +1987,8 @@ def run_autonomous_research(
     memory["normalized_expressions"] = sorted(normalized)
 
     first_budget = max_simulations if generations == 1 else max(4, math.ceil(max_simulations * 0.65))
+    if strict_skill_mode:
+        first_budget = min(first_budget, len(skill_candidates))
     inventory = memory.get("inventory") or {}
     explicit_inventory_mode = str(inventory.get("mode") or memory.get("inventory_mode") or "").upper()
     high_confidence_inventory = sum(
@@ -1901,7 +2020,9 @@ def run_autonomous_research(
     # ACTIVE than random seeds: motifs from actual platform ACTIVE alphas and
     # strong UNSUBMITTED near-misses. Any unused quota automatically flows back
     # to fresh exploration, so sparse platform history never starves discovery.
-    if active_target_mode:
+    if strict_skill_mode:
+        active_share, near_miss_share, memory_share = 0.0, 0.0, 0.0
+    elif active_target_mode:
         active_share, near_miss_share, memory_share = 0.65, 0.25, 0.05
     elif inventory_mode == "REPLENISHMENT":
         active_share, near_miss_share, memory_share = 0.45, 0.30, 0.10
@@ -1965,18 +2086,27 @@ def run_autonomous_research(
 
     exploration_budget = max(0, first_budget - len(active_motif_plan) - len(near_miss_plan) - len(memory_plan))
 
-    # ChatGPT is the only generative reasoning layer. Candidate expressions authored
-    # by the MCP client get first claim on fresh-exploration budget; QuantGPT only
-    # validates, deduplicates, simulates, diagnoses, mutates, and persists them.
-    chatgpt_plan = build_chatgpt_plan(
+    # Skill-first candidates get first claim on the entire fresh research budget.
+    # In strict mode they are the only source of new expressions; deterministic
+    # server templates remain available only behind an explicit fallback opt-in.
+    skill_plan = build_skill_plan(
         client,
-        chatgpt_expressions,
+        skill_candidates,
         live_fields,
         seen=seen,
         limit=exploration_budget,
         hypothesis=goal,
     )
-    deterministic_budget = max(0, exploration_budget - len(chatgpt_plan))
+    legacy_budget = 0 if strict_skill_mode else max(0, exploration_budget - len(skill_plan))
+    chatgpt_plan = build_chatgpt_plan(
+        client,
+        chatgpt_expressions,
+        live_fields,
+        seen=seen,
+        limit=legacy_budget,
+        hypothesis=goal,
+    )
+    deterministic_budget = 0 if strict_skill_mode else max(0, legacy_budget - len(chatgpt_plan))
     knowledge_budget = min(6, deterministic_budget, max(0, math.ceil(deterministic_budget * 0.25)))
     knowledge_plan = build_knowledge_seed_plan(
         client,
@@ -2022,13 +2152,14 @@ def run_autonomous_research(
         len(active_motif_plan)
         + len(near_miss_plan)
         + len(memory_plan)
+        + len(skill_plan)
         + len(chatgpt_plan)
         + len(knowledge_plan)
         + len(live_plan)
         + len(structural_plan)
         + len(seed_plan)
     )
-    if planned_count < first_budget:
+    if not strict_skill_mode and planned_count < first_budget:
         memory_plan.extend(
             build_memory_mutation_plan(
                 memory,
@@ -2045,6 +2176,7 @@ def run_autonomous_research(
             active_motif_plan
             + near_miss_plan
             + memory_plan
+            + skill_plan
             + chatgpt_plan
             + knowledge_plan
             + live_plan
@@ -2282,7 +2414,7 @@ def run_autonomous_research(
     }
     return {
         "ok": True,
-        "mode": "autonomous",
+        "mode": "skill_first" if strict_skill_mode else "autonomous",
         "goal": goal,
         "tag": tag,
         "selected_families": selected_families,
@@ -2312,6 +2444,9 @@ def run_autonomous_research(
             "active_motif_expressions": len(active_motif_plan),
             "platform_near_miss_expressions": len(near_miss_plan),
             "memory_parent_mutations": len(memory_plan),
+            "skill_expressions": len(skill_plan),
+            "skill_first_required": strict_skill_mode,
+            "deterministic_fallback_enabled": bool(allow_deterministic_fallback),
             "knowledge_seed_expressions": len(knowledge_plan),
             "live_field_expressions": len(live_plan),
             "structural_live_expressions": len(structural_plan),
