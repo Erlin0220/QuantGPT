@@ -819,6 +819,25 @@ def _narrow_windows(expression: str) -> str:
     return value
 
 
+def _step_knowledge_decay_window(expression: str) -> str | None:
+    """Increase only the decay window of our knowledge rescue wrapper.
+
+    Avoid ``_widen_windows`` here because that would also change the economic
+    signal's own lookbacks (for example volatility 20 -> 40) at the same time,
+    making it impossible to learn whether lower turnover came from execution
+    smoothing or from changing the underlying hypothesis.
+    """
+    match = re.fullmatch(r"rank\(ts_decay_linear\(\((.*)\),\s*(\d+)\)\)", expression.strip())
+    if not match:
+        return None
+    current = int(match.group(2))
+    ladder = (5, 10, 20, 40)
+    next_window = next((value for value in ladder if value > current), None)
+    if next_window is None:
+        return None
+    return f"rank(ts_decay_linear(({match.group(1)}), {next_window}))"
+
+
 def _alternate_family_seed(family: str, seen: set[str], *, stable_only: bool = False) -> tuple[str, str] | None:
     preferred = ("fundamental_quality", "analyst_revision", "volatility_structure") if stable_only else tuple(FAMILY_SEEDS)
     for alternate_family in preferred:
@@ -890,22 +909,49 @@ def build_targeted_mutations(
     if knowledge_card_ids and turnover is not None and turnover > 0.7:
         strategy_hint = "; ".join(knowledge_strategies[:2])
         suffix = f"; knowledge guidance: {strategy_hint}" if strategy_hint else ""
-        variants.append(
-            (
-                f"hump(rank(({expression})), hump=0.01)",
-                "knowledge_turnover_hump",
-                "knowledge-backed high-turnover signal: constrain position changes before changing the hypothesis" + suffix,
-                None,
+        stepped_decay = _step_knowledge_decay_window(expression)
+        if stepped_decay:
+            variants.append(
+                (
+                    stepped_decay,
+                    "knowledge_decay_step",
+                    "knowledge-backed near-threshold turnover: increase only the execution decay window while preserving signal lookbacks" + suffix,
+                    None,
+                )
             )
-        )
-        variants.append(
-            (
-                f"rank(ts_decay_linear(({expression}), 5))",
-                "knowledge_decay_smoothing",
-                "knowledge-backed high-turnover signal: decay/smooth the same hypothesis to improve implementation efficiency" + suffix,
-                None,
+            variants.append(
+                (
+                    f"rank(ts_mean(({expression}), 3))",
+                    "knowledge_post_decay_smoothing",
+                    "knowledge-backed near-threshold turnover: add light post-decay smoothing without changing the economic hypothesis" + suffix,
+                    None,
+                )
             )
-        )
+        else:
+            variants.append(
+                (
+                    f"rank(ts_decay_linear(({expression}), 5))",
+                    "knowledge_decay_smoothing",
+                    "knowledge-backed high-turnover signal: decay/smooth the same hypothesis to improve implementation efficiency" + suffix,
+                    None,
+                )
+            )
+            variants.append(
+                (
+                    f"rank(ts_mean(({expression}), 3))",
+                    "knowledge_short_smoothing",
+                    "knowledge-backed high-turnover signal: apply light smoothing before more aggressive turnover controls" + suffix,
+                    None,
+                )
+            )
+            variants.append(
+                (
+                    f"hump(rank(({expression})), hump=0.01)",
+                    "knowledge_turnover_hump",
+                    "knowledge-backed high-turnover fallback: strongly constrain position changes if lighter smoothing is insufficient" + suffix,
+                    None,
+                )
+            )
     for directive in directives:
         mutation_class = directive["mutation_class"]
         rationale = directive["rationale"]
@@ -917,8 +963,10 @@ def build_targeted_mutations(
                 variants.append((reseed[0], mutation_class, rationale, reseed[1]))
         elif mutation_class == "widen_windows":
             variants.append((_widen_windows(expression), mutation_class, rationale, None))
-        elif mutation_class in {"smooth_signal", "cost_reduction"}:
+        elif mutation_class == "smooth_signal":
             variants.append((f"rank(ts_mean(({expression}), 10))", mutation_class, rationale, None))
+        elif mutation_class == "cost_reduction":
+            variants.append((f"rank(ts_decay_linear(({expression}), 5))", mutation_class, rationale, None))
         elif mutation_class == "conditional_execution":
             variants.append((f"trade_when(volume > ts_mean(volume, 20), ({expression}), -1)", mutation_class, rationale, None))
         elif mutation_class == "operator_family_switch":

@@ -411,12 +411,12 @@ def test_knowledge_backed_high_turnover_prioritizes_cost_rescue():
     mutations = autonomous.build_targeted_mutations(result, seen=set(), limit=2)
 
     assert [item["mutation_type"] for item in mutations] == [
-        "knowledge_turnover_hump",
         "knowledge_decay_smoothing",
+        "knowledge_short_smoothing",
     ]
     assert all(item["knowledge_card_ids"] == [card_id] for item in mutations)
-    assert mutations[0]["expression"].startswith("hump(rank(")
-    assert "ts_decay_linear" in mutations[1]["expression"]
+    assert "ts_decay_linear" in mutations[0]["expression"]
+    assert "ts_mean" in mutations[1]["expression"]
 
 
 def test_memory_plan_rehydrates_knowledge_guidance_for_cost_rescue():
@@ -450,11 +450,35 @@ def test_memory_plan_rehydrates_knowledge_guidance_for_cost_rescue():
     plan = autonomous.build_memory_mutation_plan(memory, seen=set(), limit=2, hypothesis="continue")
 
     assert [item["mutation_type"] for item in plan] == [
-        "knowledge_turnover_hump",
         "knowledge_decay_smoothing",
+        "knowledge_short_smoothing",
     ]
     assert all(item["knowledge_card_ids"] == [card_id] for item in plan)
     assert all("knowledge guidance" in item["mutation_reason"] for item in plan)
+
+
+def test_knowledge_decay_parent_steps_decay_without_changing_signal_lookbacks():
+    card_id = "ab65eb3e-ec5e-4c94-ac8c-6aff83566112"
+    expression = "rank(ts_decay_linear((-1 * ts_delta(close, 1) / ts_std_dev(close, 20)), 5))"
+    result = {
+        "expression": expression,
+        "is_metrics": {"sharpe": 1.84, "fitness": 0.85, "turnover": 0.7267},
+        "mutation_targets": ["improve_fitness", "reduce_turnover"],
+        "research_meta": {
+            "family": "momentum_reversal",
+            "generation": 2,
+            "knowledge_card_ids": [card_id],
+            "knowledge_mutation_strategies": ["Reduce trading intensity while preserving the hypothesis."],
+        },
+    }
+
+    mutations = autonomous.build_targeted_mutations(result, seen=set(), limit=2)
+
+    assert mutations[0]["mutation_type"] == "knowledge_decay_step"
+    assert mutations[0]["expression"] == "rank(ts_decay_linear((-1 * ts_delta(close, 1) / ts_std_dev(close, 20)), 10))"
+    assert "ts_std_dev(close, 20)" in mutations[0]["expression"]
+    assert mutations[1]["mutation_type"] == "knowledge_post_decay_smoothing"
+    assert all(item["knowledge_card_ids"] == [card_id] for item in mutations)
 
 
 def test_positive_weak_signal_is_smoothed_not_inverted():
