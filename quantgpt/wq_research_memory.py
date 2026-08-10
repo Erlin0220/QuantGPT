@@ -453,7 +453,16 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
     }
     dataset_present = sum(1 for row in rows if row.dataset_id)
     provenance_counts = Counter(str(row.provenance_state or "unresolved").lower() for row in rows)
-    provenance_reason_counts = Counter(str(row.provenance_reason or "unspecified") for row in rows if str(row.provenance_state or "").lower() != "resolved")
+    unresolved_reason_counts = Counter(
+        str(row.provenance_reason or "unspecified")
+        for row in rows
+        if str(row.provenance_state or "").lower() == "unresolved"
+    )
+    partial_reason_counts = Counter(
+        str(row.provenance_reason or "unspecified")
+        for row in rows
+        if str(row.provenance_state or "").lower() == "partial"
+    )
     provenance_resolved = int(provenance_counts.get("resolved", 0))
     provenance_partial = int(provenance_counts.get("partial", 0))
     provenance_classified = provenance_resolved + provenance_partial
@@ -471,7 +480,8 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
         "classified": provenance_classified,
         "classified_rate": round(provenance_classified / max(1, len(rows)), 4),
         "classified_note": "resolved_and_truthfully_partial_rows_are_valid_provenance;_only_resolved_rows_feed_dataset_specific_learning",
-        "unresolved_reasons": dict(provenance_reason_counts),
+        "unresolved_reasons": dict(unresolved_reason_counts),
+        "partial_reasons": dict(partial_reason_counts),
     }
     min_points_confidence, min_points_samples = _points_feedback_thresholds()
     family_points_attribution: Counter[str] = Counter()

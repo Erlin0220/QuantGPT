@@ -350,3 +350,7 @@ async def test_memory_reports_metadata_completeness(lineage_db):
     assert completeness["dataset_id"]["missing"] == 1
     assert memory["provenance"]["resolved"] == 1
     assert memory["provenance"]["partial"] == 1
+    assert memory["provenance"]["unresolved_reasons"] == {}
+    assert memory["provenance"]["partial_reasons"] == {
+        "core_or_derived_fields_have_no_truthful_platform_dataset": 1
+    }
