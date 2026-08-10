@@ -21,7 +21,11 @@ from sqlalchemy import func, select
 
 from .db import _get_session_factory
 from .models import WQResearchCandidate, WQResearchTrial, WQSubmissionAttempt, WQSubmissionState
-from .wq_candidate_calibration import calibrate_active_probability, calibration_report
+from .wq_candidate_calibration import (
+    calibrate_active_probability,
+    calibration_report,
+    configured_confidence_thresholds,
+)
 from .wq_correlation_proxy import correlation_priority_multiplier
 from .wq_failure_taxonomy import classify_research_failure
 from .wq_lineage import lineage_id_for, parent_lineage_id_for, recover_research_metadata
@@ -30,6 +34,10 @@ from .wq_research_scheduler import research_cell_key
 
 _DEFAULT_DAILY_BUDGET = 2
 _MAX_CONFIGURED_BUDGET = 5
+_DEFAULT_INVENTORY_FLOOR = 30
+_DEFAULT_INVENTORY_TARGET_LOW = 40
+_DEFAULT_INVENTORY_TARGET_HIGH = 50
+_DEFAULT_FRESHNESS_HOURS = 24.0
 _TERMINAL_POSITIVE_STATUSES = {"ACTIVE"}
 _TERMINAL_NEGATIVE_STATUSES = {"SC_FAIL", "OTHER_FAIL"}
 _CONVERSION_PRIOR_ALPHA = 2.0
@@ -44,6 +52,28 @@ def _configured_daily_budget() -> int:
     except (TypeError, ValueError):
         value = _DEFAULT_DAILY_BUDGET
     return max(1, min(_MAX_CONFIGURED_BUDGET, value))
+
+
+def _configured_inventory_policy() -> dict[str, float | int]:
+    def integer(name: str, default: int) -> int:
+        try:
+            return max(1, int(os.environ.get(name, str(default))))
+        except (TypeError, ValueError):
+            return default
+
+    floor = integer("WQ_CANDIDATE_INVENTORY_FLOOR", _DEFAULT_INVENTORY_FLOOR)
+    target_low = max(floor, integer("WQ_CANDIDATE_INVENTORY_TARGET_LOW", _DEFAULT_INVENTORY_TARGET_LOW))
+    target_high = max(target_low, integer("WQ_CANDIDATE_INVENTORY_TARGET_HIGH", _DEFAULT_INVENTORY_TARGET_HIGH))
+    try:
+        freshness_hours = float(os.environ.get("WQ_CANDIDATE_FRESHNESS_HOURS", str(_DEFAULT_FRESHNESS_HOURS)))
+    except (TypeError, ValueError):
+        freshness_hours = _DEFAULT_FRESHNESS_HOURS
+    return {
+        "floor": floor,
+        "target_low": target_low,
+        "target_high": target_high,
+        "freshness_hours": max(0.25, freshness_hours),
+    }
 
 
 def _submission_timezone():
@@ -67,6 +97,15 @@ def _normalized_datetime(value: datetime | None) -> datetime | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _candidate_is_fresh(candidate: WQResearchCandidate, *, now: datetime | None = None) -> bool:
+    validated_at = _normalized_datetime(candidate.last_validated_at)
+    if validated_at is None:
+        return False
+    current = _normalized_datetime(now or datetime.now(timezone.utc)) or datetime.now(timezone.utc)
+    age_hours = max(0.0, (current - validated_at).total_seconds() / 3600.0)
+    return age_hours <= float(_configured_inventory_policy()["freshness_hours"])
 
 
 def _structure_signature(expression: str) -> str:
@@ -339,6 +378,11 @@ async def record_research_candidates(
                 "probability_support": int(calibration["support"]),
                 "probability_provenance": str(calibration["provenance"]),
                 "calibration_details": calibration,
+                "last_validated_at": (
+                    datetime.now(timezone.utc)
+                    if validation_status == "ready"
+                    else (existing.last_validated_at if existing is not None else None)
+                ),
                 "family": meta.get("family"),
                 "hypothesis": meta.get("hypothesis"),
                 "parent_expression": meta.get("parent_expression"),
@@ -484,7 +528,10 @@ async def reconcile_candidate_platform_statuses(
     factory = _get_session_factory()
     updated = 0
     async with factory() as session:
+        conversion_feedback = await _load_conversion_feedback(session, account)
         for alpha_id, info in platform_alphas.items():
+            if (info or {}).get("ok") is False:
+                continue
             platform_status = str((info or {}).get("status") or "").upper()
             sc_result = str((info or {}).get("sc_result") or "").upper()
             try:
@@ -509,31 +556,61 @@ async def reconcile_candidate_platform_statuses(
             )
             candidate = result.scalar_one_or_none()
             if candidate is not None:
-                if target_status is not None:
-                    candidate.status = target_status
+                for field in ("sharpe", "fitness", "returns", "turnover"):
+                    value = (info or {}).get(field)
+                    if value is not None:
+                        try:
+                            setattr(candidate, field, float(value))
+                        except (TypeError, ValueError):
+                            pass
                 candidate.sc_status = sc_result or candidate.sc_status
                 if sc_value is not None:
                     candidate.self_correlation = sc_value
-                candidate.priority_score = _priority_score(
-                    {
-                        "expression": candidate.expression,
-                        "is_metrics": {
-                            "fitness": candidate.fitness,
-                            "sharpe": candidate.sharpe,
-                            "returns": candidate.returns,
-                            "turnover": candidate.turnover,
-                            "checks": [
-                                {
-                                    "name": "SELF_CORRELATION",
-                                    "result": candidate.sc_status,
-                                    "value": candidate.self_correlation,
-                                }
-                            ],
-                        },
-                        "validation": {"robustness_score": candidate.robustness_score},
-                        "novelty_score": candidate.novelty_score,
-                    }
-                )
+                candidate.last_validated_at = datetime.now(timezone.utc)
+                if target_status is not None:
+                    candidate.status = target_status
+                elif platform_status == "UNSUBMITTED":
+                    ready = (
+                        float(candidate.sharpe or 0.0) >= 1.25
+                        and float(candidate.fitness or 0.0) >= 1.0
+                        and 0.01 <= float(candidate.turnover or 0.0) <= 0.7
+                        and sc_result != "FAIL"
+                    )
+                    candidate.status = "queued" if ready else "validation_pending"
+                    candidate.validation_status = "ready" if ready else "platform_readiness_failed"
+                evidence = {
+                    "expression": candidate.expression,
+                    "family": candidate.family,
+                    "dataset_id": candidate.dataset_id,
+                    "research_meta": {
+                        "family": candidate.family,
+                        "dataset_id": candidate.dataset_id,
+                        "operator_pattern": candidate.operator_pattern,
+                    },
+                    "is_metrics": {
+                        "fitness": candidate.fitness,
+                        "sharpe": candidate.sharpe,
+                        "returns": candidate.returns,
+                        "turnover": candidate.turnover,
+                        "checks": [{
+                            "name": "SELF_CORRELATION",
+                            "result": candidate.sc_status,
+                            "value": candidate.self_correlation,
+                        }],
+                    },
+                    "validation": {
+                        "status": candidate.validation_status,
+                        "robustness_score": candidate.robustness_score,
+                    },
+                    "novelty_score": candidate.novelty_score,
+                }
+                calibration = calibrate_active_probability(evidence, conversion_feedback)
+                candidate.active_probability = float(calibration["probability"])
+                candidate.confidence_tier = str(calibration["tier"])
+                candidate.probability_support = int(calibration["support"])
+                candidate.probability_provenance = str(calibration["provenance"])
+                candidate.calibration_details = calibration
+                candidate.priority_score = _priority_score(evidence) * (0.75 + candidate.active_probability * 0.5)
                 updated += 1
         await session.commit()
     return updated
@@ -555,16 +632,8 @@ async def reserve_submission(
     factory = _get_session_factory()
     async with factory() as session:
         state = await _get_or_create_state(session, account)
-        budget = max(1, int(state.daily_budget or _configured_daily_budget()))
-        if str(state.last_points_status or "").upper() == "LEADERBOARD_LAGGING" and int(state.untracked_active_gap or 0) > 0:
-            return {
-                "allowed": False,
-                "reason": "leaderboard_lagging_with_untracked_submissions",
-                "alpha_id": alpha_id,
-                "submission_day": day,
-                "daily_budget": budget,
-                "untracked_active_gap": int(state.untracked_active_gap or 0),
-            }
+        budget = _configured_daily_budget()
+        state.daily_budget = budget
 
         readiness_result = await session.execute(
             select(WQResearchCandidate).where(
@@ -587,7 +656,6 @@ async def reserve_submission(
             .where(
                 WQSubmissionAttempt.account == account,
                 WQSubmissionAttempt.alpha_id == alpha_id,
-                WQSubmissionAttempt.status.in_(["RESERVED", "ACTIVE", "SC_PENDING", "SC_FAIL"]),
             )
             .order_by(WQSubmissionAttempt.created_at.desc())
             .limit(1)
@@ -607,6 +675,7 @@ async def reserve_submission(
             select(func.count()).where(
                 WQSubmissionAttempt.account == account,
                 WQSubmissionAttempt.submission_day == day,
+                WQSubmissionAttempt.status.in_(["RESERVED", "ACTIVE", "SC_PENDING"]),
             )
         )
         used = int(count_result.scalar() or 0)
@@ -829,10 +898,20 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             select(func.count()).where(
                 WQSubmissionAttempt.account == account,
                 WQSubmissionAttempt.submission_day == day,
+                WQSubmissionAttempt.status.in_(["RESERVED", "ACTIVE", "SC_PENDING"]),
             )
         )
         used_slots = int(attempts_result.scalar() or 0)
-        daily_budget = max(1, int(state.daily_budget or _configured_daily_budget()))
+        failed_result = await session.execute(
+            select(func.count()).where(
+                WQSubmissionAttempt.account == account,
+                WQSubmissionAttempt.submission_day == day,
+                WQSubmissionAttempt.status.in_(["SC_FAIL", "OTHER_FAIL"]),
+            )
+        )
+        failed_attempts = int(failed_result.scalar() or 0)
+        daily_budget = _configured_daily_budget()
+        state.daily_budget = daily_budget
 
         pending_result = await session.execute(
             select(func.count()).where(
@@ -843,23 +922,20 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
         )
         pending_score = int(pending_result.scalar() or 0)
 
-        queue_count_result = await session.execute(
-            select(func.count()).where(
-                WQResearchCandidate.account == account,
-                WQResearchCandidate.status == "queued",
-            )
-        )
-        queue_count = int(queue_count_result.scalar() or 0)
-
         queue_result = await session.execute(
             select(WQResearchCandidate)
             .where(
                 WQResearchCandidate.account == account,
                 WQResearchCandidate.status == "queued",
             )
-            .order_by(WQResearchCandidate.priority_score.desc(), WQResearchCandidate.created_at.asc())
-            .limit(5)
+            .order_by(
+                WQResearchCandidate.active_probability.desc(),
+                WQResearchCandidate.priority_score.desc(),
+                WQResearchCandidate.created_at.asc(),
+            )
         )
+        queued_candidates = list(queue_result.scalars().all())
+        queue_count = len(queued_candidates)
         top_candidates = [
             {
                 "alpha_id": item.alpha_id,
@@ -892,14 +968,61 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
                 "dataset_id": item.dataset_id,
                 "tag": item.tag,
             }
-            for item in queue_result.scalars().all()
+            for item in queued_candidates[:5]
         ]
 
-        submission_frozen = bool(
-            str(state.last_points_status or "").upper() == "LEADERBOARD_LAGGING"
-            and int(state.untracked_active_gap or 0) > 0
+        confidence_counts = {"S": 0, "A": 0, "B": 0}
+        ready_confidence_counts = {"S": 0, "A": 0, "B": 0}
+        high_confidence_count = 0
+        stale_high_confidence_count = 0
+        for candidate in queued_candidates:
+            tier = str(candidate.confidence_tier or "B").upper()
+            if tier not in confidence_counts:
+                tier = "B"
+            confidence_counts[tier] += 1
+            if str(candidate.validation_status or "").lower() == "ready":
+                ready_confidence_counts[tier] += 1
+                if tier in {"S", "A"}:
+                    if _candidate_is_fresh(candidate):
+                        high_confidence_count += 1
+                    else:
+                        stale_high_confidence_count += 1
+
+        inventory_policy = _configured_inventory_policy()
+        inventory_floor = int(inventory_policy["floor"])
+        target_low = int(inventory_policy["target_low"])
+        target_high = int(inventory_policy["target_high"])
+        inventory_deficit = max(0, inventory_floor - high_confidence_count)
+        if high_confidence_count < inventory_floor:
+            research_mode = "REPLENISHMENT"
+        elif high_confidence_count > target_high:
+            research_mode = "EXPLORATION"
+        else:
+            research_mode = "NORMAL"
+
+        leaderboard_lagging = str(state.last_points_status or "").upper() == "LEADERBOARD_LAGGING"
+        untracked_active_gap = int(state.untracked_active_gap or 0)
+        submission_warning = (
+            "leaderboard_lagging_with_untracked_active_alphas"
+            if leaderboard_lagging and untracked_active_gap > 0
+            else None
         )
+        submission_frozen = False
         budget_remaining = max(0, daily_budget - used_slots)
+        inventory_status = {
+            "floor": inventory_floor,
+            "target_low": target_low,
+            "target_high": target_high,
+            "freshness_hours": float(inventory_policy["freshness_hours"]),
+            "high_confidence_count": high_confidence_count,
+            "stale_high_confidence_count": stale_high_confidence_count,
+            "deficit": inventory_deficit,
+            "mode": research_mode,
+            "tier_counts": confidence_counts,
+            "ready_tier_counts": ready_confidence_counts,
+            "queue_count": queue_count,
+            "top_candidates": top_candidates,
+        }
 
         await session.commit()
         return {
@@ -907,19 +1030,31 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             "submission_timezone": os.environ.get("WQ_SUBMISSION_TIMEZONE", "UTC") or "UTC",
             "daily_submission_budget": daily_budget,
             "used_submission_slots": used_slots,
+            "failed_submission_attempts": failed_attempts,
             "budget_remaining_slots": budget_remaining,
-            "remaining_submission_slots": 0 if submission_frozen else budget_remaining,
+            "remaining_submission_slots": budget_remaining,
             "pending_score_submissions": pending_score,
             "candidate_queue_count": queue_count,
+            "candidate_confidence_counts": confidence_counts,
+            "candidate_confidence_thresholds": {
+                "S": configured_confidence_thresholds()[0],
+                "A": configured_confidence_thresholds()[1],
+            },
             "candidate_queue_top": top_candidates,
+            "high_confidence_candidate_count": high_confidence_count,
+            "inventory_deficit": inventory_deficit,
+            "research_mode": research_mode,
+            "inventory": inventory_status,
             "last_observed_points": state.last_observed_points,
             "last_points_status": state.last_points_status,
             "last_settled_points": state.last_settled_points,
             "last_settled_delta": state.last_settled_delta,
             "last_settled_submission_count": state.last_settled_submission_count,
-            "untracked_active_gap": int(state.untracked_active_gap or 0),
+            "untracked_active_gap": untracked_active_gap,
+            "leaderboard_lagging": leaderboard_lagging,
+            "submission_warning": submission_warning,
             "submission_frozen": submission_frozen,
-            "rule": "points_are_feedback_not_realtime_rate_limit",
+            "rule": "submission_budget_and_candidate_inventory_are_independent_control_loops",
         }
 
 

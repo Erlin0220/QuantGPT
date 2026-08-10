@@ -56,6 +56,16 @@ async def test_daily_budget_blocks_third_submission(policy_db):
 
 
 @pytest.mark.asyncio
+async def test_empty_inventory_enters_replenishment_mode(policy_db):
+    status = await get_submission_policy_status("primary")
+    assert status["inventory"]["floor"] == 30
+    assert status["inventory"]["high_confidence_count"] == 0
+    assert status["inventory"]["deficit"] == 30
+    assert status["inventory"]["mode"] == "REPLENISHMENT"
+    assert status["research_mode"] == "REPLENISHMENT"
+
+
+@pytest.mark.asyncio
 async def test_lagging_points_do_not_settle_until_leaderboard_is_current(policy_db):
     await reserve_submission("primary", "alpha-1")
     await finalize_submission_attempt("primary", "alpha-1", {"ok": True, "final_status": "ACTIVE"})
@@ -75,7 +85,7 @@ async def test_lagging_points_do_not_settle_until_leaderboard_is_current(policy_
     assert current["pending_score_submissions"] == 0
     assert current["last_settled_delta"] == 2000
     assert current["last_settled_submission_count"] == 1
-    assert current["daily_submission_budget"] == 1
+    assert current["daily_submission_budget"] == 2
 
 
 @pytest.mark.asyncio
@@ -126,7 +136,7 @@ async def test_points_settlement_records_confidence_weighted_research_feedback(p
 
 
 @pytest.mark.asyncio
-async def test_untracked_leaderboard_gap_freezes_new_submissions(policy_db):
+async def test_untracked_leaderboard_gap_warns_but_does_not_freeze_new_submissions(policy_db):
     lagging = await observe_account_status(
         "primary",
         {
@@ -135,12 +145,12 @@ async def test_untracked_leaderboard_gap_freezes_new_submissions(policy_db):
             "leaderboard": {"active_alpha_gap": 1},
         },
     )
-    assert lagging["submission_frozen"] is True
+    assert lagging["submission_frozen"] is False
     assert lagging["untracked_active_gap"] == 1
+    assert lagging["submission_warning"] == "leaderboard_lagging_with_untracked_active_alphas"
 
-    blocked = await reserve_submission("primary", "alpha-new")
-    assert blocked["allowed"] is False
-    assert blocked["reason"] == "leaderboard_lagging_with_untracked_submissions"
+    allowed_while_lagging = await reserve_submission("primary", "alpha-new")
+    assert allowed_while_lagging["allowed"] is True
 
     current = await observe_account_status(
         "primary",
@@ -152,8 +162,8 @@ async def test_untracked_leaderboard_gap_freezes_new_submissions(policy_db):
     )
     assert current["submission_frozen"] is False
 
-    allowed = await reserve_submission("primary", "alpha-new")
-    assert allowed["allowed"] is True
+    second = await reserve_submission("primary", "alpha-second")
+    assert second["allowed"] is True
 
 
 @pytest.mark.asyncio

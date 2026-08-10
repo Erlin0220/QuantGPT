@@ -164,6 +164,10 @@ def _migrate_add_columns(connection):
         "ALTER TABLE wq_research_candidates ADD COLUMN calibration_details JSON",
     )
     _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "last_validated_at",
+        "ALTER TABLE wq_research_candidates ADD COLUMN last_validated_at DATETIME",
+    )
+    _add_column_if_missing(
         connection, inspector, "wq_research_trials", "data_fields",
         "ALTER TABLE wq_research_trials ADD COLUMN data_fields JSON",
     )

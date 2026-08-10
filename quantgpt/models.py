@@ -199,6 +199,7 @@ class WQResearchCandidate(Base):
     probability_support = Column(Integer, nullable=False, default=0)
     probability_provenance = Column(String(200), nullable=True)
     calibration_details = Column(JSON, nullable=True)
+    last_validated_at = Column(DateTime(timezone=True), nullable=True)
     family = Column(String(50), nullable=True)
     hypothesis = Column(Text, nullable=True)
     parent_expression = Column(Text, nullable=True)
@@ -233,6 +234,7 @@ class WQResearchCandidate(Base):
     __table_args__ = (
         Index("ix_wq_candidates_account_alpha", "account", "alpha_id", unique=True),
         Index("ix_wq_candidates_account_status_priority", "account", "status", "priority_score"),
+        Index("ix_wq_candidates_account_status_confidence", "account", "status", "active_probability"),
     )
 
 
