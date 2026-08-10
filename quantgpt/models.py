@@ -174,6 +174,52 @@ class SubmittedAlpha(Base):
     __table_args__ = (Index("ix_submitted_alphas_user_expr", "user_id", "expression_normalized"),)
 
 
+class WQKnowledgeSource(Base):
+    __tablename__ = "wq_knowledge_sources"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    source_key: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    source_type: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    authors: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    published_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    external_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    access_scope: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_metadata: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)
+
+
+class WQKnowledgeCard(Base):
+    __tablename__ = "wq_knowledge_cards"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    card_key: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    concept: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    family: Mapped[str] = mapped_column(String(80), nullable=False, default="unknown", index=True)
+    hypothesis: Mapped[str] = mapped_column(Text, nullable=False)
+    mechanism: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    scope: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    evidence: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    source_keys: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    source_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    operators: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    expression_templates: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    failure_modes: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    mutation_strategies: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="draft", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_wq_knowledge_cards_family_status", "family", "status"),
+        Index("ix_wq_knowledge_cards_status_confidence", "status", "confidence"),
+    )
+
+
 class WQResearchCandidate(Base):
     __tablename__ = "wq_research_candidates"
 
@@ -228,6 +274,7 @@ class WQResearchCandidate(Base):
     planner_strategy: Mapped[str | None] = mapped_column(String(100), nullable=True)
     allocation_cell: Mapped[str | None] = mapped_column(String(200), nullable=True)
     source_run_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    knowledge_card_ids: Mapped[Any | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="queued")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)
@@ -277,6 +324,7 @@ class WQResearchTrial(Base):
     planner_strategy: Mapped[str | None] = mapped_column(String(100), nullable=True)
     allocation_cell: Mapped[str | None] = mapped_column(String(200), nullable=True)
     source_run_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    knowledge_card_ids: Mapped[Any | None] = mapped_column(JSON, nullable=True)
     tag: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
 

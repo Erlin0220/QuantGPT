@@ -142,6 +142,7 @@ def _trial_from_item(
         planner_strategy=str(meta.get("planner_strategy") or "") or None,
         allocation_cell=str(meta.get("allocation_cell") or "") or None,
         source_run_id=str(meta.get("source_run_id") or item.get("run_id") or item.get("task_id") or "") or None,
+        knowledge_card_ids=list(meta.get("knowledge_card_ids") or []),
         tag=tag,
     )
 
@@ -591,6 +592,9 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
         points_coverage=points_coverage,
     )
     field_registry = build_field_metadata_registry([*rows, *candidate_rows])
+    from .wq_knowledge import load_knowledge_guidance
+
+    knowledge_guidance = await load_knowledge_guidance(limit=24)
 
     positive_rows = sorted(
         [row for row in rows if str(row.status or "").lower() == "candidate" or (float(row.fitness or 0.0) >= 0.85 and float(row.sharpe or 0.0) >= 1.0)],
@@ -675,6 +679,7 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
             "planner_strategy": row.planner_strategy,
             "allocation_cell": row.allocation_cell,
             "source_run_id": row.source_run_id,
+            "knowledge_card_ids": list(row.knowledge_card_ids or []),
         }
         for row in rows[:200]
         if row.expression
@@ -701,6 +706,7 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
         "learning_funnel": learning_funnel,
         "learning_maturity": learning_maturity,
         "research_memory_guidance": research_memory_guidance,
+        "knowledge_guidance": knowledge_guidance,
         "local_correlation_risk": {
             "available": local_correlation_available,
             "high_risk": local_correlation_high_risk,

@@ -718,6 +718,136 @@ async def wq_brain_data_catalog(
 
 
 @mcp.tool()
+async def kb_upsert_source(
+    source_type: str,
+    title: str,
+    content: str = "",
+    source_key: str | None = None,
+    authors: list[str] | None = None,
+    published_year: int | None = None,
+    url: str | None = None,
+    external_id: str | None = None,
+    access_scope: str | None = None,
+    metadata: dict | None = None,
+) -> str:
+    """写入/更新 Alpha Knowledge 原始来源。
+
+    适合接收 book-fetch/仓颉蒸馏前的教材文本、arXiv/SSRN 摘要或合法全文、WorldQuant 官方资料。
+    原始来源与 BRAIN 实验记忆分开保存；不会因为写入来源而直接影响 Alpha 搜索。
+    """
+    from .wq_knowledge import upsert_knowledge_source
+
+    try:
+        result = await upsert_knowledge_source(
+            source_type=source_type,
+            source_key=source_key,
+            title=title,
+            content=content,
+            authors=authors,
+            published_year=published_year,
+            url=url,
+            external_id=external_id,
+            access_scope=access_scope,
+            metadata=metadata,
+        )
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+
+@mcp.tool()
+async def kb_upsert_card(card: dict) -> str:
+    """写入一张结构化 Alpha Knowledge Card。
+
+    Active Card 必须至少引用两个不同 source_key；单来源卡自动降级为 draft，避免把单篇论文/单本书当成确定事实。
+    """
+    from .wq_knowledge import upsert_knowledge_card
+
+    try:
+        result = await upsert_knowledge_card(card)
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+
+@mcp.tool()
+async def kb_search_alpha_knowledge(
+    query: str = "",
+    family: str | None = None,
+    operators: list[str] | None = None,
+    limit: int = 12,
+    include_drafts: bool = False,
+) -> str:
+    """检索多源 Alpha Knowledge，并叠加真实 BRAIN trial 的经验反馈排序。"""
+    from .wq_knowledge import search_alpha_knowledge
+
+    try:
+        result = await search_alpha_knowledge(
+            query=query,
+            families=[family] if family else None,
+            operators=operators,
+            limit=limit,
+            include_drafts=include_drafts,
+        )
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+
+@mcp.tool()
+async def kb_arxiv_search(query: str, limit: int = 10, ingest: bool = False) -> str:
+    """通过 arXiv 官方 API 搜索论文元数据/摘要；ingest=true 时写入 Knowledge Sources。"""
+    from .wq_knowledge import fetch_arxiv_sources
+
+    try:
+        result = await fetch_arxiv_sources(query, limit=limit, ingest=ingest)
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+
+@mcp.tool()
+async def kb_distill_sources(
+    source_keys: list[str],
+    concept: str,
+    family: str = "unknown",
+    research_goal: str = "WorldQuant BRAIN Alpha research",
+) -> str:
+    """把至少两个已存来源交叉蒸馏为一张证据约束的 Alpha Knowledge Card。
+
+    蒸馏只允许使用指定来源内容，必须保留相互冲突的证据，并输出 WQ operator / expression template / failure / mutation 信息。
+    """
+    from .wq_knowledge import cross_distill_sources
+
+    try:
+        result = await cross_distill_sources(
+            source_keys,
+            concept=concept,
+            family=family,
+            research_goal=research_goal,
+        )
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+
+@mcp.tool()
+async def kb_explain_alpha(
+    alpha_id: str | None = None,
+    expression: str | None = None,
+    account: str = "primary",
+) -> str:
+    """解释一个 Alpha 的知识血缘：使用过哪些 Knowledge Card，以及这些卡驱动后的真实 trial 表现。"""
+    from .wq_knowledge import explain_alpha_knowledge
+
+    try:
+        result = await explain_alpha_knowledge(account=account, alpha_id=alpha_id, expression=expression)
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+
+@mcp.tool()
 def validate_expression(expression: str, mode: str = "local") -> str:
     """验证因子表达式语法是否正确。返回 OK 或错误信息。
 
@@ -1898,6 +2028,12 @@ async def wq_brain_account_status(account: str = "primary") -> str:
                 "field_registry_count": len(memory.get("field_registry") or {}),
                 "learning_maturity": memory.get("learning_maturity", {}),
                 "research_memory_guidance": memory.get("research_memory_guidance", {}),
+                "knowledge_guidance": {
+                    "policy": (memory.get("knowledge_guidance") or {}).get("policy"),
+                    "active_cards": len((memory.get("knowledge_guidance") or {}).get("cards") or []),
+                    "preferred_templates": len((memory.get("knowledge_guidance") or {}).get("preferred_templates") or []),
+                    "family_confidence": (memory.get("knowledge_guidance") or {}).get("family_confidence", {}),
+                },
                 "candidate_funnel": memory.get("candidate_funnel", {}),
                 "learning_funnel": memory.get("learning_funnel", {}),
                 "research_cells": memory.get("research_cells", []),

@@ -543,6 +543,19 @@ def build_llm_live_plan(
         for item in (guidance.get("negative") or [])[:8]
     ]
     overused = [str(item.get("operator_pattern") or "") for item in (guidance.get("overused_structures") or [])[:6]]
+    knowledge_cards = ((memory or {}).get("knowledge_guidance") or {}).get("cards") or []
+    knowledge_priors = [
+        {
+            "concept": item.get("concept"),
+            "family": item.get("family"),
+            "hypothesis": item.get("hypothesis"),
+            "mechanism": (item.get("mechanism") or [])[:4],
+            "failure_modes": (item.get("failure_modes") or [])[:3],
+            "mutation_strategies": (item.get("mutation_strategies") or [])[:3],
+            "score": item.get("score"),
+        }
+        for item in knowledge_cards[:6]
+    ]
     out: list[dict[str, Any]] = []
     for index in range(limit):
         avoid = [item for item in list(seen)[-8:]]
@@ -553,6 +566,7 @@ def build_llm_live_plan(
             f"Positive structural memory to learn from (do not copy literally): {positive}\n"
             f"Negative structural memory to avoid repeating: {negative}\n"
             f"Overused operator structures to diversify away from softly: {overused}\n"
+            f"Corroborated multi-source research priors (use as hypotheses, not facts): {knowledge_priors}\n"
             f"Already researched normalized expressions to avoid: {avoid}\n"
             f"Generate idea {index + 1} with a distinct structural hypothesis."
         )
@@ -605,6 +619,61 @@ def build_llm_live_plan(
                 "provenance_reason": "live_field_catalog" if dataset_id else "llm_uses_multiple_or_unresolved_datasets",
             }
         )
+    return out
+
+
+def build_knowledge_seed_plan(
+    client,
+    memory: dict[str, Any] | None,
+    *,
+    seen: set[str],
+    limit: int,
+    hypothesis: str,
+    generation: int = 1,
+) -> list[dict[str, Any]]:
+    """Turn corroborated multi-source knowledge cards into bounded live-valid WQ seeds."""
+    if limit <= 0:
+        return []
+    guidance = (memory or {}).get("knowledge_guidance") or {}
+    templates = list(guidance.get("preferred_templates") or [])
+    if not templates:
+        return []
+    try:
+        supported = client.list_operator_names()
+    except Exception:
+        return []
+    if not supported:
+        return []
+    templates.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    out: list[dict[str, Any]] = []
+    for item in templates:
+        expression = str(item.get("expression") or "").strip()
+        if not expression:
+            continue
+        validation = validate_wq_expression(expression, supported)
+        if not validation.ok:
+            continue
+        expression = validation.expression
+        normalized = normalize_wq_expression(expression)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(
+            {
+                "expression": expression,
+                "family": str(item.get("family") or classify_wq_family(expression)),
+                "generation": generation,
+                "hypothesis": str(item.get("hypothesis") or hypothesis),
+                "parent_expression": None,
+                "mutation_type": "knowledge_seed",
+                "mutation_reason": "multi_source_research_prior",
+                "planner_strategy": "multi_source_knowledge",
+                "knowledge_card_ids": [str(item.get("card_id"))] if item.get("card_id") else [],
+                "knowledge_source_keys": list(item.get("source_keys") or []),
+            }
+        )
+        if len(out) >= limit:
+            break
     return out
 
 
@@ -862,6 +931,7 @@ def build_targeted_mutations(
                 "dataset_category": None if family_override else meta.get("dataset_category"),
                 "provenance_state": "unresolved" if family_override else meta.get("provenance_state"),
                 "provenance_reason": "economic_reseed_requires_new_provenance" if family_override else meta.get("provenance_reason"),
+                "knowledge_card_ids": [] if family_override else list(meta.get("knowledge_card_ids") or []),
                 "failure_trigger": sorted({entry["reason"] if isinstance(entry, dict) else str(entry) for entry in (result.get("failure_reasons") or [])} | ({str(result.get("failure_reason"))} if result.get("failure_reason") else set())),
             }
         )
@@ -930,6 +1000,7 @@ def build_memory_mutation_plan(
                 "provenance_state": trial.get("provenance_state"),
                 "provenance_reason": trial.get("provenance_reason"),
                 "operator_pattern": trial.get("operator_pattern"),
+                "knowledge_card_ids": list(trial.get("knowledge_card_ids") or []),
             },
         }
         variants = build_targeted_mutations(
@@ -1168,7 +1239,17 @@ def run_autonomous_research(
         min_fitness=min_fitness,
     )
     exploration_budget = max(0, first_budget - len(memory_plan))
-    live_budget = min(exploration_budget, max(0, math.ceil(exploration_budget * 0.35)))
+    knowledge_budget = min(6, exploration_budget, max(0, math.ceil(exploration_budget * 0.25)))
+    knowledge_plan = build_knowledge_seed_plan(
+        client,
+        memory,
+        seen=seen,
+        limit=knowledge_budget,
+        hypothesis=goal,
+        generation=1,
+    )
+    live_remaining = max(0, exploration_budget - len(knowledge_plan))
+    live_budget = min(live_remaining, max(0, math.ceil(exploration_budget * 0.35)))
     live_plan, live_catalog, live_fields = build_live_field_plan(
         client,
         memory,
@@ -1180,7 +1261,7 @@ def run_autonomous_research(
         hypothesis=goal,
     )
     structural_budget = min(
-        max(0, exploration_budget - len(live_plan)),
+        max(0, exploration_budget - len(knowledge_plan) - len(live_plan)),
         max(0, math.ceil(exploration_budget * 0.35)),
     )
     structural_plan = build_structural_live_plan(
@@ -1190,7 +1271,7 @@ def run_autonomous_research(
         limit=structural_budget,
         hypothesis=goal,
     )
-    llm_budget = min(4, max(0, exploration_budget - len(live_plan) - len(structural_plan)))
+    llm_budget = min(4, max(0, exploration_budget - len(knowledge_plan) - len(live_plan) - len(structural_plan)))
     llm_plan = build_llm_live_plan(
         client,
         live_fields,
@@ -1203,7 +1284,7 @@ def run_autonomous_research(
     seed_memory["normalized_expressions"] = sorted(seen)
     seed_plan = build_seed_plan(
         seed_memory,
-        limit=max(0, exploration_budget - len(live_plan) - len(structural_plan) - len(llm_plan)),
+        limit=max(0, exploration_budget - len(knowledge_plan) - len(live_plan) - len(structural_plan) - len(llm_plan)),
         family_count=family_count,
         generation=1,
         hypothesis=goal,
@@ -1211,7 +1292,7 @@ def run_autonomous_research(
     for item in seed_plan:
         seen.add(normalize_wq_expression(item["expression"]))
 
-    planned_count = len(memory_plan) + len(live_plan) + len(structural_plan) + len(llm_plan) + len(seed_plan)
+    planned_count = len(memory_plan) + len(knowledge_plan) + len(live_plan) + len(structural_plan) + len(llm_plan) + len(seed_plan)
     if planned_count < first_budget:
         memory_plan.extend(
             build_memory_mutation_plan(
@@ -1224,7 +1305,7 @@ def run_autonomous_research(
             )
         )
     first_plan = [
-        item for item in (memory_plan + live_plan + structural_plan + llm_plan + seed_plan)
+        item for item in (memory_plan + knowledge_plan + live_plan + structural_plan + llm_plan + seed_plan)
         if not _violates_prevention_rules(item, memory.get("prevention_rules"))
     ]
     generation_results: list[dict[str, Any]] = []
@@ -1387,6 +1468,7 @@ def run_autonomous_research(
         "adaptive_allocation": adaptive_allocation,
         "learning_maturity": memory.get("learning_maturity") or {},
         "research_memory_guidance": memory.get("research_memory_guidance") or {},
+        "knowledge_guidance": memory.get("knowledge_guidance") or {},
         "inventory_mode": inventory_mode,
         "live_catalog": live_catalog,
         "memory_before": {
@@ -1400,6 +1482,7 @@ def run_autonomous_research(
             "primary_simulation_budget": max_simulations,
             "primary_simulation_budget_scope": "research_generations_only",
             "memory_parent_mutations": len(memory_plan),
+            "knowledge_seed_expressions": len(knowledge_plan),
             "live_field_expressions": len(live_plan),
             "structural_live_expressions": len(structural_plan),
             "llm_expressions": len(llm_plan),

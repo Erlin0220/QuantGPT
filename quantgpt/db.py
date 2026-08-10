@@ -248,6 +248,10 @@ def _migrate_add_columns(connection):
             connection, inspector, table, "source_run_id",
             f"ALTER TABLE {table} ADD COLUMN source_run_id VARCHAR(100)",
         )
+        _add_column_if_missing(
+            connection, inspector, table, "knowledge_card_ids",
+            f"ALTER TABLE {table} ADD COLUMN knowledge_card_ids JSON",
+        )
     _add_column_if_missing(
         connection, inspector, "wq_submission_attempts", "attributed_points_share",
         "ALTER TABLE wq_submission_attempts ADD COLUMN attributed_points_share FLOAT",

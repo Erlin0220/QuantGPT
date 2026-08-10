@@ -625,6 +625,7 @@ async def record_research_candidates(
                 "planner_strategy": str(meta.get("planner_strategy") or "") or None,
                 "allocation_cell": str(meta.get("allocation_cell") or "") or None,
                 "source_run_id": str(meta.get("source_run_id") or candidate.get("run_id") or candidate.get("task_id") or "") or None,
+                "knowledge_card_ids": list(meta.get("knowledge_card_ids") or []),
                 "validation_status": validation_status,
                 "robustness_score": validation.get("robustness_score"),
                 "novelty_score": novelty_score,
