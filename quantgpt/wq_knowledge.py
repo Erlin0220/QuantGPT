@@ -543,7 +543,14 @@ concept, family, hypothesis, mechanism, scope, evidence, operators, expression_t
 SOURCES:
 {source_blob}
 """
-    raw = await asyncio.to_thread(_call_llm, system_prompt, user_prompt, temperature=0.2, max_tokens=4096)
+    raw = await asyncio.to_thread(
+        _call_llm,
+        system_prompt,
+        user_prompt,
+        temperature=0.2,
+        max_tokens=4096,
+        clean_output=False,
+    )
     card = _extract_json_object(raw)
     card["concept"] = card.get("concept") or concept
     card["family"] = card.get("family") or family

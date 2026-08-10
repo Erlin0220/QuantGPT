@@ -320,8 +320,14 @@ def _call_llm(
     user_prompt: str,
     temperature: float = 0.9,
     max_tokens: int = 256,
+    clean_output: bool = True,
 ) -> str:
-    """Call LLM and return cleaned expression string."""
+    """Call LLM and return cleaned expression text by default.
+
+    ``clean_output=False`` is intended for structured/non-expression callers
+    that need the provider's raw text (for example JSON knowledge distillation).
+    Existing factor-generation callers keep the historical cleaning behavior.
+    """
     import time as _time
 
     from openai import OpenAI
@@ -347,7 +353,8 @@ def _call_llm(
                 max_tokens=max(64, min(8192, int(max_tokens))),
                 timeout=60,
             )
-            return _clean_expression(resp.choices[0].message.content)
+            content = resp.choices[0].message.content or ""
+            return _clean_expression(content) if clean_output else content.strip()
         except Exception as e:
             logger.warning(f"LLM call attempt {attempt+1} failed: {e}")
             _time.sleep(3 * (attempt + 1))
