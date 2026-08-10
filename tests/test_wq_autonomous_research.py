@@ -457,6 +457,52 @@ def test_memory_plan_rehydrates_knowledge_guidance_for_cost_rescue():
     assert all("knowledge guidance" in item["mutation_reason"] for item in plan)
 
 
+def test_memory_plan_reserves_first_slot_for_viable_knowledge_followup():
+    card_id = "ab65eb3e-ec5e-4c94-ac8c-6aff83566112"
+    knowledge_parent = "rank(ts_decay_linear((-1 * ts_delta(close, 1) / ts_std_dev(close, 20)), 5))"
+    generic_parent = "group_rank((-rank(ts_std_dev(ts_backfill(accumulated_amortization_customer_intangibles, 60), 20))), subindustry)"
+    memory = {
+        "recent_trials": [
+            {
+                "expression": generic_parent,
+                "family": "fundamental_quality",
+                "generation": 1,
+                "fitness": 0.97,
+                "sharpe": 1.46,
+                "turnover": 0.2,
+                "mutation_targets": ["improve_fitness"],
+            },
+            {
+                "expression": knowledge_parent,
+                "family": "momentum_reversal",
+                "generation": 2,
+                "fitness": 0.85,
+                "sharpe": 1.84,
+                "turnover": 0.7267,
+                "mutation_targets": ["improve_fitness", "reduce_turnover"],
+                "failure_reason": "low_fitness",
+                "knowledge_card_ids": [card_id],
+            },
+        ],
+        "knowledge_guidance": {
+            "cards": [
+                {
+                    "id": card_id,
+                    "failure_modes": ["High transaction costs can eliminate profits."],
+                    "mutation_strategies": ["Reduce trading intensity while preserving the hypothesis."],
+                }
+            ]
+        },
+    }
+
+    plan = autonomous.build_memory_mutation_plan(memory, seen=set(), limit=1, hypothesis="continue")
+
+    assert len(plan) == 1
+    assert plan[0]["parent_expression"] == knowledge_parent
+    assert plan[0]["mutation_type"] == "knowledge_decay_step"
+    assert plan[0]["knowledge_card_ids"] == [card_id]
+
+
 def test_knowledge_decay_parent_steps_decay_without_changing_signal_lookbacks():
     card_id = "ab65eb3e-ec5e-4c94-ac8c-6aff83566112"
     expression = "rank(ts_decay_linear((-1 * ts_delta(close, 1) / ts_std_dev(close, 20)), 5))"

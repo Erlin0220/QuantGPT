@@ -1045,10 +1045,20 @@ def build_memory_mutation_plan(
         for card in ((memory.get("knowledge_guidance") or {}).get("cards") or [])
         if card.get("id")
     }
-    recent.sort(
-        key=lambda item: _trial_promise_score(item, min_sharpe=min_sharpe, min_fitness=min_fitness),
-        reverse=True,
-    )
+    def memory_parent_rank(item: dict[str, Any]) -> tuple[int, float]:
+        promise = _trial_promise_score(item, min_sharpe=min_sharpe, min_fitness=min_fitness)
+        linked_ids = [str(value) for value in (item.get("knowledge_card_ids") or []) if value]
+        # Reserve the first memory-mutation slot for a viable knowledge-backed
+        # parent when one exists. Otherwise a large legacy trial inventory can
+        # permanently crowd out the very follow-up experiments needed to turn a
+        # literature prior into an implementable Alpha.
+        knowledge_followup = int(
+            promise >= min_parent_promise
+            and any(card_id in knowledge_cards_by_id for card_id in linked_ids)
+        )
+        return knowledge_followup, promise
+
+    recent.sort(key=memory_parent_rank, reverse=True)
 
     plan: list[dict[str, Any]] = []
     for trial in recent:
