@@ -32,8 +32,8 @@ async def policy_db(monkeypatch):
     factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     monkeypatch.setattr(db, "_engine", engine)
     monkeypatch.setattr(db, "_session_factory", factory)
-    monkeypatch.setenv("WQ_DAILY_SUBMISSION_BUDGET", "2")
-    monkeypatch.setenv("WQ_SUBMISSION_TIMEZONE", "UTC")
+    monkeypatch.setenv("WQ_DAILY_ACTIVE_TARGET", "2")
+    monkeypatch.setenv("WQ_SUBMISSION_TIMEZONE", "Asia/Shanghai")
     yield
     await engine.dispose()
 
@@ -75,7 +75,7 @@ async def _seed_ready_candidate(
 
 
 @pytest.mark.asyncio
-async def test_daily_budget_blocks_third_submission(policy_db):
+async def test_daily_active_target_blocks_third_active_submission(policy_db):
     for alpha_id in ("alpha-1", "alpha-2", "alpha-3"):
         await _seed_ready_candidate(alpha_id)
     first = await reserve_submission("primary", "alpha-1")
@@ -88,13 +88,45 @@ async def test_daily_budget_blocks_third_submission(policy_db):
 
     third = await reserve_submission("primary", "alpha-3")
     assert third["allowed"] is False
-    assert third["reason"] == "daily_submission_budget_exhausted"
+    assert third["reason"] == "daily_active_target_filled_or_inflight"
 
     status = await get_submission_policy_status("primary")
-    assert status["daily_submission_budget"] == 2
+    assert status["daily_active_target"] == 2
+    assert status["daily_active_count"] == 2
+    assert status["daily_active_target_met"] is True
+    assert status["remaining_active_target"] == 0
     assert status["used_submission_slots"] == 2
     assert status["remaining_submission_slots"] == 0
     assert status["pending_score_submissions"] == 2
+
+
+@pytest.mark.asyncio
+async def test_sc_fail_releases_capacity_until_two_active(policy_db):
+    for alpha_id in ("retry-1", "retry-2", "retry-3", "retry-4"):
+        await _seed_ready_candidate(alpha_id)
+
+    first = await reserve_submission("primary", "retry-1")
+    assert first["allowed"] is True
+    await finalize_submission_attempt(
+        "primary",
+        "retry-1",
+        {"ok": False, "final_status": "SC_FAIL", "detail": "SC FAIL"},
+    )
+
+    after_fail = await get_submission_policy_status("primary")
+    assert after_fail["daily_active_count"] == 0
+    assert after_fail["used_submission_slots"] == 0
+    assert after_fail["failed_submission_attempts"] == 1
+    assert after_fail["remaining_active_target"] == 2
+
+    for alpha_id in ("retry-2", "retry-3"):
+        decision = await reserve_submission("primary", alpha_id)
+        assert decision["allowed"] is True
+        await finalize_submission_attempt("primary", alpha_id, {"ok": True, "final_status": "ACTIVE"})
+
+    blocked = await reserve_submission("primary", "retry-4")
+    assert blocked["allowed"] is False
+    assert blocked["reason"] == "daily_active_target_filled_or_inflight"
 
 
 @pytest.mark.asyncio
@@ -276,7 +308,7 @@ async def test_platform_history_backfills_only_strong_unsubmitted_candidates(pol
 
 
 @pytest.mark.asyncio
-async def test_autonomous_candidate_waits_for_robustness_before_queue_and_submission(policy_db):
+async def test_pending_robustness_can_fill_daily_active_target_as_fallback(policy_db):
     saved = await record_research_candidates(
         "primary",
         [
@@ -293,10 +325,13 @@ async def test_autonomous_candidate_waits_for_robustness_before_queue_and_submis
     status = await get_submission_policy_status("primary")
     assert status["candidate_queue_count"] == 0
 
+    assert status["submission_candidate_top"][0]["alpha_id"] == "pending-robustness"
+    assert status["submission_candidate_top"][0]["submission_mode"] == "active_target_fallback"
+
     decision = await reserve_submission("primary", "pending-robustness")
-    assert decision["allowed"] is False
-    assert decision["reason"] == "candidate_not_ready"
-    assert decision["candidate_status"] == "validation_pending"
+    assert decision["allowed"] is True
+    assert decision["submission_mode"] == "active_target_fallback"
+    assert "validation_not_ready" in decision["soft_blockers_waived"]
 
 
 @pytest.mark.asyncio
@@ -397,7 +432,7 @@ async def test_platform_active_reconciles_stale_candidate_queue_entry(policy_db)
 
 
 @pytest.mark.asyncio
-async def test_platform_preflight_does_not_bypass_missing_robustness(policy_db):
+async def test_platform_preflight_allows_missing_robustness_as_active_target_fallback(policy_db):
     await record_research_candidates(
         "primary",
         [
@@ -416,26 +451,38 @@ async def test_platform_preflight_does_not_bypass_missing_robustness(policy_db):
     assert updated == 1
     status = await get_submission_policy_status("primary")
     assert status["candidate_queue_count"] == 0
-    decision = await reserve_submission("primary", "platform-no-robustness")
-    assert decision["allowed"] is False
-    assert decision["validation_status"] == "robustness_pending"
+    assert status["submission_candidate_top"][0]["alpha_id"] == "platform-no-robustness"
 
     payloads = await get_candidate_robustness_revalidation_payloads(
         "primary",
         ["platform-no-robustness"],
     )
     assert len(payloads) == 1
-    payload = payloads[0]
-    assert payload["expression"] == "rank(close)"
-    payload["validation"] = {"status": "ready", "robustness_score": 1.0, "completed": 2, "passed": 2}
+    assert payloads[0]["expression"] == "rank(close)"
+
+    decision = await reserve_submission("primary", "platform-no-robustness")
+    assert decision["allowed"] is True
+    assert decision["submission_mode"] == "active_target_fallback"
+    assert "validation_not_ready" in decision["soft_blockers_waived"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_robustness_fail_remains_hard_blocker(policy_db):
     await record_research_candidates(
         "primary",
-        [payload],
-        settings=payload["settings"],
-        tag=payload["tag"],
+        [
+            {
+                "alpha_id": "robustness-failed",
+                "expression": "rank(close)",
+                "is_metrics": {"sharpe": 1.8, "fitness": 1.3, "returns": 0.1, "turnover": 0.2},
+                "validation": {"status": "robustness_fail", "robustness_score": 0.0},
+            }
+        ],
     )
-    promoted = await reserve_submission("primary", "platform-no-robustness")
-    assert promoted["allowed"] is True
+    decision = await reserve_submission("primary", "robustness-failed")
+    assert decision["allowed"] is False
+    assert decision["reason"] == "candidate_not_ready"
+    assert "explicit_robustness_fail" in decision["blockers"]
 
 
 @pytest.mark.asyncio

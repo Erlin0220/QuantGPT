@@ -52,8 +52,10 @@ _reservation_lock = threading.Lock()
 
 
 def _configured_daily_budget() -> int:
+    """Daily ACTIVE target; legacy env name is retained for compatibility."""
+    raw = os.environ.get("WQ_DAILY_ACTIVE_TARGET", os.environ.get("WQ_DAILY_SUBMISSION_BUDGET", str(_DEFAULT_DAILY_BUDGET)))
     try:
-        value = int(os.environ.get("WQ_DAILY_SUBMISSION_BUDGET", str(_DEFAULT_DAILY_BUDGET)))
+        value = int(raw)
     except (TypeError, ValueError):
         value = _DEFAULT_DAILY_BUDGET
     return max(1, min(_MAX_CONFIGURED_BUDGET, value))
@@ -82,7 +84,7 @@ def _configured_inventory_policy() -> dict[str, float | int]:
 
 
 def _submission_timezone():
-    name = os.environ.get("WQ_SUBMISSION_TIMEZONE", "UTC").strip() or "UTC"
+    name = os.environ.get("WQ_SUBMISSION_TIMEZONE", "Asia/Shanghai").strip() or "Asia/Shanghai"
     try:
         return ZoneInfo(name)
     except ZoneInfoNotFoundError:
@@ -168,9 +170,58 @@ def _candidate_submission_blockers(
     return blockers
 
 
+def _candidate_fallback_submission_blockers(
+    candidate: WQResearchCandidate,
+    *,
+    now: datetime | None = None,
+) -> list[str]:
+    """Hard blockers for filling the daily ACTIVE target.
+
+    Unknown/stale robustness is intentionally soft here: when the daily ACTIVE
+    target is still unmet, BRAIN's official SC stage may be used as the final
+    filter. Explicit robustness or SC failures remain hard blockers.
+    """
+    blockers: list[str] = []
+    candidate_status = str(candidate.status or "").lower()
+    validation_status = str(candidate.validation_status or "").lower()
+    validation_details = candidate.validation_details if isinstance(candidate.validation_details, dict) else {}
+    detailed_status = str(validation_details.get("status") or "").lower()
+
+    if candidate_status not in {"queued", "validation_pending"}:
+        blockers.append("candidate_not_available")
+    if "robustness_fail" in {candidate_status, validation_status, detailed_status}:
+        blockers.append("explicit_robustness_fail")
+    if float(candidate.sharpe or 0.0) < 1.25:
+        blockers.append("sharpe_below_threshold")
+    if float(candidate.fitness or 0.0) < 1.0:
+        blockers.append("fitness_below_threshold")
+    if not 0.01 <= float(candidate.turnover or 0.0) <= 0.7:
+        blockers.append("turnover_out_of_range")
+    if str(candidate.sc_status or "").upper() == "FAIL":
+        blockers.append("official_self_correlation_fail")
+
+    local_evidence = {
+        "status": "available" if candidate.local_correlation is not None else "unavailable",
+        "max_correlation": candidate.local_correlation,
+        "calculated_at": candidate.local_correlation_at.isoformat() if candidate.local_correlation_at else None,
+    }
+    blockers.extend(
+        submission_evidence_blockers(
+            local_evidence,
+            validation_details.get("overfitting_evidence"),
+            now=now,
+        )
+    )
+    return blockers
+
+
 def _candidate_research_ready(candidate: WQResearchCandidate) -> bool:
     """Cold-start inventory eligibility from deterministic submission-readiness evidence."""
     return not _candidate_submission_blockers(candidate)
+
+
+def _candidate_fallback_submission_ready(candidate: WQResearchCandidate) -> bool:
+    return not _candidate_fallback_submission_blockers(candidate)
 
 
 def _structure_signature(expression: str) -> str:
@@ -985,8 +1036,9 @@ async def reserve_submission(
                 "alpha_id": alpha_id,
                 "detail": "formal submission requires a tracked Candidate Queue entry",
             }
-        blockers = _candidate_submission_blockers(readiness_candidate)
-        if blockers:
+        strict_blockers = _candidate_submission_blockers(readiness_candidate)
+        fallback_blockers = _candidate_fallback_submission_blockers(readiness_candidate)
+        if fallback_blockers:
             await session.commit()
             return {
                 "allowed": False,
@@ -994,8 +1046,10 @@ async def reserve_submission(
                 "alpha_id": alpha_id,
                 "candidate_status": readiness_candidate.status,
                 "validation_status": readiness_candidate.validation_status,
-                "blockers": blockers,
+                "blockers": fallback_blockers,
+                "strict_blockers": strict_blockers,
             }
+        submission_mode = "strict_ready" if not strict_blockers else "active_target_fallback"
 
         prior_result = await session.execute(
             select(WQSubmissionAttempt)
@@ -1029,9 +1083,10 @@ async def reserve_submission(
         if used >= budget:
             return {
                 "allowed": False,
-                "reason": "daily_submission_budget_exhausted",
+                "reason": "daily_active_target_filled_or_inflight",
                 "alpha_id": alpha_id,
                 "submission_day": day,
+                "daily_active_target": budget,
                 "daily_budget": budget,
                 "used_slots": used,
                 "remaining_slots": 0,
@@ -1072,8 +1127,11 @@ async def reserve_submission(
         return {
             "allowed": True,
             "reason": "slot_reserved",
+            "submission_mode": submission_mode,
+            "soft_blockers_waived": strict_blockers if submission_mode == "active_target_fallback" else [],
             "alpha_id": alpha_id,
             "submission_day": day,
+            "daily_active_target": budget,
             "daily_budget": budget,
             "used_slots": used + 1,
             "remaining_slots": max(0, budget - used - 1),
@@ -1281,12 +1339,9 @@ async def observe_account_status(account: str, status: dict[str, Any]) -> dict[s
                         attempt.settled_at = settled_at
                     state.last_settled_delta = delta
                     state.last_settled_submission_count = len(pending)
-                    # Only auto-calibrate within the conservative 1..2 range and
-                    # only after the leaderboard has caught up with active Alphas.
-                    if len(pending) == 1 and delta >= 1800:
-                        state.daily_budget = 1
-                    else:
-                        state.daily_budget = min(2, _configured_daily_budget())
+                    # The daily target is user-configured and must not shrink just
+                    # because one ACTIVE Alpha happened to settle a large point gain.
+                    state.daily_budget = _configured_daily_budget()
                     state.last_settled_points = points_value
                 elif not pending and points_value != state.last_settled_points:
                     # Catch up the baseline for score changes not created by this
@@ -1321,6 +1376,15 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             )
         )
         used_slots = int(attempts_result.scalar() or 0)
+        active_today_result = await session.execute(
+            select(func.count()).where(
+                WQSubmissionAttempt.account == account,
+                WQSubmissionAttempt.submission_day == day,
+                WQSubmissionAttempt.status == "ACTIVE",
+            )
+        )
+        active_today = int(active_today_result.scalar() or 0)
+        inflight_today = max(0, used_slots - active_today)
         failed_result = await session.execute(
             select(func.count()).where(
                 WQSubmissionAttempt.account == account,
@@ -1359,8 +1423,28 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             key=lambda candidate: (not _candidate_research_ready(candidate),),
         )
         queue_count = len(queued_candidates)
-        top_candidates = [
-            {
+
+        submission_pool_result = await session.execute(
+            select(WQResearchCandidate)
+            .where(
+                WQResearchCandidate.account == account,
+                WQResearchCandidate.status.in_(["queued", "validation_pending"]),
+            )
+            .order_by(*candidate_order)
+        )
+        submission_candidates = list(submission_pool_result.scalars().all())
+        submission_candidates.sort(
+            key=lambda candidate: (
+                not _candidate_research_ready(candidate),
+                not _candidate_fallback_submission_ready(candidate),
+                -(float(candidate.priority_score or 0.0)),
+            ),
+        )
+
+        def candidate_payload(item: WQResearchCandidate) -> dict[str, Any]:
+            strict_ready = _candidate_research_ready(item)
+            fallback_ready = _candidate_fallback_submission_ready(item)
+            return {
                 "alpha_id": item.alpha_id,
                 "fitness": item.fitness,
                 "sharpe": item.sharpe,
@@ -1392,12 +1476,19 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
                 "dataset_category": item.dataset_category,
                 "provenance_state": item.provenance_state,
                 "provenance_reason": item.provenance_reason,
-                "research_readiness_eligible": _candidate_research_ready(item),
+                "research_readiness_eligible": strict_ready,
                 "submission_blockers": _candidate_submission_blockers(item),
+                "fallback_submission_eligible": fallback_ready,
+                "fallback_submission_blockers": _candidate_fallback_submission_blockers(item),
+                "submission_mode": "strict_ready" if strict_ready else ("active_target_fallback" if fallback_ready else "blocked"),
                 "tag": item.tag,
             }
-            for item in queued_candidates[:5]
+
+        top_candidates = [candidate_payload(item) for item in queued_candidates[:5]]
+        fallback_submission_candidates = [
+            item for item in submission_candidates if _candidate_fallback_submission_ready(item)
         ]
+        submission_candidate_top = [candidate_payload(item) for item in fallback_submission_candidates[:10]]
 
         confidence_counts = {"S": 0, "A": 0, "B": 0}
         ready_confidence_counts = {"S": 0, "A": 0, "B": 0}
@@ -1456,6 +1547,8 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             submission_warning = None
         submission_frozen = False
         budget_remaining = max(0, daily_budget - used_slots)
+        remaining_active_target = max(0, daily_budget - active_today)
+        daily_active_target_met = remaining_active_target == 0
         inventory_status = {
             "floor": inventory_floor,
             "target_low": target_low,
@@ -1478,7 +1571,12 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
         await session.commit()
         return {
             "submission_day": day,
-            "submission_timezone": os.environ.get("WQ_SUBMISSION_TIMEZONE", "UTC") or "UTC",
+            "submission_timezone": os.environ.get("WQ_SUBMISSION_TIMEZONE", "Asia/Shanghai") or "Asia/Shanghai",
+            "daily_active_target": daily_budget,
+            "daily_active_count": active_today,
+            "daily_active_target_met": daily_active_target_met,
+            "remaining_active_target": remaining_active_target,
+            "inflight_submission_count": inflight_today,
             "daily_submission_budget": daily_budget,
             "used_submission_slots": used_slots,
             "failed_submission_attempts": failed_attempts,
@@ -1496,6 +1594,8 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
                 "A": configured_confidence_thresholds()[1],
             },
             "candidate_queue_top": top_candidates,
+            "submission_candidate_top": submission_candidate_top,
+            "fallback_submission_candidate_count": len(fallback_submission_candidates),
             "high_confidence_candidate_count": high_confidence_count,
             "research_readiness_eligible_count": research_readiness_eligible_count,
             "candidate_eligibility_mode": eligibility_mode,
@@ -1514,7 +1614,7 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             "points_score_unchanged_pending": points_score_unchanged_pending,
             "submission_warning": submission_warning,
             "submission_frozen": submission_frozen,
-            "rule": "submission_budget_and_candidate_inventory_are_independent_control_loops",
+            "rule": "target_two_active_per_day; sc_fail_and_confirmed_unsubmitted_free_capacity; uncertain_submissions_fail_closed",
         }
 
 

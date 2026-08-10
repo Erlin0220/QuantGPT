@@ -1251,6 +1251,7 @@ def _run_wq_submit_by_ids_mcp_task(task_id: str, params: dict) -> dict:
         _run_coro_sync,
         finalize_submission_attempt_sync,
         get_candidate_robustness_revalidation_payloads_sync,
+        get_submission_policy_status,
         reconcile_candidate_platform_statuses,
         record_research_candidates_sync,
         reserve_submission_sync,
@@ -1293,10 +1294,22 @@ def _run_wq_submit_by_ids_mcp_task(task_id: str, params: dict) -> dict:
         )
 
         robustness_revalidation: dict[str, dict] = {}
-        pending_robustness = get_candidate_robustness_revalidation_payloads_sync(
-            params["account"],
-            params["alpha_ids"],
+        submission_policy = _run_coro_sync(get_submission_policy_status(params["account"]))
+        require_pre_submit_robustness = os.environ.get("WQ_REQUIRE_PRE_SUBMIT_ROBUSTNESS", "0").strip() == "1"
+        pending_robustness = (
+            get_candidate_robustness_revalidation_payloads_sync(
+                params["account"],
+                params["alpha_ids"],
+            )
+            if require_pre_submit_robustness
+            else []
         )
+        if not require_pre_submit_robustness:
+            robustness_revalidation["_policy"] = {
+                "status": "advisory_not_blocking",
+                "reason": "daily ACTIVE target uses official BRAIN SC as the final fallback filter",
+                "remaining_active_target": submission_policy.get("remaining_active_target"),
+            }
         for index, payload in enumerate(pending_robustness, start=1):
             if is_mcp_task_cancelled(task_id):
                 break
