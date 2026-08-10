@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from quantgpt.models import Base, WQSubmissionAttempt
 from quantgpt.wq_research_memory import load_research_memory, record_research_trials
 from quantgpt.wq_submission_policy import (
+    _normalized_submission_result_status,
     finalize_submission_attempt,
     get_candidate_robustness_revalidation_payloads,
     get_submission_policy_status,
@@ -908,3 +909,28 @@ async def test_active_submission_is_monotonic_against_later_uncertain_or_unsubmi
     status = await get_submission_policy_status("primary")
     assert status["used_submission_slots"] == 1
     assert status["pending_score_submissions"] == 1
+
+
+def test_explicit_platform_check_failure_is_terminal_other_fail():
+    detail = '{"is":{"checks":[{"name":"LOW_SUB_UNIVERSE_SHARPE","result":"FAIL","limit":0.55,"value":0.5},{"name":"SELF_CORRELATION","result":"PENDING"}]}}'
+    status = _normalized_submission_result_status(
+        {
+            "ok": False,
+            "final_status": "SUBMIT_UNKNOWN",
+            "status_code": 403,
+            "detail": detail,
+        }
+    )
+    assert status == "OTHER_FAIL"
+
+
+def test_transport_unknown_remains_fail_closed():
+    status = _normalized_submission_result_status(
+        {
+            "ok": False,
+            "final_status": "SUBMIT_UNKNOWN",
+            "status_code": 503,
+            "detail": "upstream timeout",
+        }
+    )
+    assert status == "SUBMIT_UNKNOWN"

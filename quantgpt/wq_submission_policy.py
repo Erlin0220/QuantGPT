@@ -1138,15 +1138,37 @@ async def reserve_submission(
         }
 
 
+def _authoritative_platform_check_failure(result: dict[str, Any]) -> str | None:
+    """Return a named BRAIN check that explicitly rejected an unsubmitted Alpha."""
+    try:
+        status_code = int(result.get("status_code") or 0)
+    except (TypeError, ValueError):
+        status_code = 0
+    if status_code != 403:
+        return None
+    detail = str(result.get("detail") or "")
+    for match in re.finditer(
+        r'"name"\s*:\s*"([^"]+)"\s*,\s*"result"\s*:\s*"FAIL"',
+        detail,
+        flags=re.IGNORECASE,
+    ):
+        check_name = str(match.group(1) or "").upper()
+        if check_name and check_name != "SELF_CORRELATION":
+            return check_name
+    return None
+
 def _normalized_submission_result_status(result: dict[str, Any]) -> str:
     """Map remote submission observations to fail-closed local ledger states."""
     explicit = str(result.get("final_status") or "").upper()
     platform_status = str(result.get("platform_status") or "").upper()
     detail = str(result.get("detail") or "")
+    platform_check_failure = _authoritative_platform_check_failure(result)
 
     if explicit in {"UNSUBMITTED", "UNSUBMITTED_CONFIRMED"}:
         return "UNSUBMITTED_CONFIRMED"
     if explicit in {"ERROR", "TIMEOUT", "UNKNOWN", "SUBMIT_UNKNOWN"}:
+        if platform_check_failure:
+            return "OTHER_FAIL"
         return "SUBMIT_UNKNOWN"
     if explicit == "OTHER_FAIL" and not result.get("confirmed_not_submitted"):
         return "SUBMIT_UNKNOWN"
