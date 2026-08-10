@@ -1,0 +1,7 @@
+[
+  {"prompt":"这个 BRAIN Alpha Fitness 0.91、Sharpe 1.31，怎么定向修？","expected":"invoke","reason":"real near-threshold repair"},
+  {"prompt":"这个候选 HIGH_TURNOVER，别换逻辑，帮我降低换手。","expected":"invoke","reason":"turnover-directed repair"},
+  {"prompt":"SELF_CORRELATION FAIL，怎么改才能不靠加噪声？","expected":"invoke","reason":"correlation repair"},
+  {"prompt":"给我生成 20 个完全新的 Alpha 思路。","expected":"not_invoke","reason":"use wq-alpha-hypothesis"},
+  {"prompt":"检查这批候选是否值得先跑 Simulation。","expected":"not_invoke","reason":"use wq-alpha-review"}
+]

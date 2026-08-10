@@ -9,7 +9,7 @@ description: Diversify a WorldQuant BRAIN Alpha research pool when self-correlat
 
 Distilled from `worldquant:learn2quant`, `worldquant:finding-alphas-official`, `worldquant:iqc-2026`, and `worldquant:iqc-guidelines-2026`.
 
-WorldQuant explicitly teaches diversification of the Alpha pool. Official IQC material spans Fundamental/Model, Price Volume, D0, Options/Relationship/Vector and newly released datasets. IQC rules apply a correlation test when Alpha pools are combined.
+WorldQuant explicitly teaches diversification of the Alpha pool. Official Learn2Quant lessons separate diversity by data category, idea type, holding frequency/delay and model/combination technique. Its risk-management lesson also warns that common factor exposure can create correlation even among superficially different approaches. Official IQC material spans Fundamental/Model, Price Volume, D0, Options/Relationship/Vector and newly released datasets. IQC rules apply a correlation test when Alpha pools are combined.
 
 ## I — Interpretation
 
@@ -32,9 +32,10 @@ Invoke when Self-Correlation failures rise, the candidate queue is dominated by 
 5. Keep a bounded exploitation slice for families with real ACTIVE/candidate evidence, but reserve explicit exploration for low-coverage categories.
 6. On Self-Correlation failure, mutate in this priority order:
    1. different data source / dataset;
-   2. different economic mechanism;
+   2. different economic mechanism / idea type;
    3. different structural transform/horizon;
-   4. only then fine parameter changes.
+   4. if evidence points to shared factor exposure, a justified neutralized sibling;
+   5. only then fine parameter changes.
 7. Review each diversified candidate with `wq-alpha-review`. For `RUN` candidates emit structured `skill_candidates` with `skill_chain: ["wq-alpha-hypothesis", "wq-alpha-diversify", "wq-alpha-review"]`, the new hypothesis/family/data fields, and review notes; return them through `wq_brain_autonomous_research` with deterministic fallback disabled.
 8. Use BRAIN simulation and current SC feedback to evaluate whether diversification is real. Persist family/dataset/structure lineage.
 9. Avoid creating a pool that is numerically diverse but economically identical.

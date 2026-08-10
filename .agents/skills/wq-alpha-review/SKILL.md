@@ -7,9 +7,9 @@ description: Review WorldQuant BRAIN Alpha hypotheses and FASTEXPR before spendi
 
 ## R — Reading
 
-Distilled from `worldquant:alpha-examples-104`, `worldquant:learn2quant`, `worldquant:iqc-guidelines-2026`, the live BRAIN operator/data catalogs, and QuantGPT Research Memory.
+Distilled from `worldquant:alpha-examples-104`, `worldquant:learn2quant`, `worldquant:iqc-guidelines-2026`, the dated `dated BRAIN check calibration` Knowledge Card, the live BRAIN operator/data catalogs, and QuantGPT Research Memory.
 
-The official examples explicitly separate hypothesis, implementation, simulation settings, results and improvements. Delay-1 is used to prevent look-ahead in the Price/Volume example. Official rules also make out-of-sample qualification, correlation and anti-gaming relevant to research quality.
+The official examples explicitly separate hypothesis, implementation, simulation settings, results and improvements. Delay-1 is used to prevent look-ahead in the Price/Volume example. Official rules also make out-of-sample qualification, correlation and anti-gaming relevant to research quality. Numeric BRAIN limits observed from prior simulations are dated calibration evidence only; refresh against current platform responses instead of labeling them timeless official rules.
 
 ## I — Interpretation
 
@@ -30,13 +30,14 @@ For each candidate, score the following as PASS / WARN / FAIL:
 1. **Hypothesis:** Is the expected direction and mechanism stated before the expression?
 2. **Field semantics:** Do the live Data Explorer descriptions actually represent the claimed information?
 3. **Operator validity:** Does `list_wq_operators` contain every used operator?
-4. **Look-ahead/timing:** Is Delay consistent with what data is observable at the intended time? Prefer Delay-1 for completed daily-price hypotheses unless there is an explicit D0 design.
+4. **Look-ahead/timing:** Is Delay consistent with what data is observable at the intended time, and does the intended holding frequency match the signal horizon? Prefer Delay-1 for completed daily-price hypotheses unless there is an explicit D0 design.
 5. **Minimality:** Does each operator have a job? Reject decorative transforms and unexplained terms.
 6. **Coverage/sparsity:** For fundamental/analyst fields, is missingness/backfill handled conservatively without inventing information?
 7. **Turnover plausibility:** Is the signal likely to churn? If so, propose Decay/smoothing/conditional trading as settings or a separate repair experiment.
-8. **Neutralization/concentration:** Is peer-group/market structure handled in a way consistent with the hypothesis?
-9. **Differentiation:** Is this materially different from recent/ACTIVE structures, rather than a window-only clone?
-10. **Integrity:** No random noise, gaming terms, or guessed hidden-rule hacks.
+8. **Factor risk / neutralization / concentration:** What common factor exposure is plausible, and is the chosen peer-group/market neutralization justified by the hypothesis rather than applied mechanically? Flag likely shared factor exposure that could masquerade as Alpha diversity.
+9. **Differentiation:** Is this materially different in data category, idea type or mechanism from recent/ACTIVE structures, rather than a window-only clone?
+10. **Advanced-method necessity:** If ML, imputation, enhanced/model data or high-dimensional transforms are proposed, what concrete data problem do they solve, and was an existing live BRAIN model/enhanced field checked first?
+11. **Integrity:** No random noise, gaming terms, or guessed hidden-rule hacks.
 
 Decision:
 - **RUN:** no hard FAIL; spend BRAIN simulation budget.
@@ -50,7 +51,7 @@ Do not reject solely because a local proxy predicts mediocre robustness. BRAIN r
 ## B — Boundary
 
 - This is not a replacement for BRAIN Simulation or official submission checks.
-- Do not hard-code undocumented thresholds as official rules.
+- Do not hard-code undocumented thresholds as official rules. If a recent BRAIN limit is used as a pre-simulation prior, preserve its date/scope and let the current simulation response supersede it.
 - Do not over-filter until the daily submission budget becomes unusable.
 - Do not formal-submit from the review step.
 

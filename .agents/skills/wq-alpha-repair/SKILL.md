@@ -33,7 +33,8 @@ Invoke after a real WQ simulation/check produces actionable failure evidence: lo
    - **Turnover high:** first test simulation Decay or light smoothing; then conditional `trade_when` if the hypothesis has a defensible regime condition.
    - **Sharpe/Fitness near threshold:** preserve the main field/mechanism; change one lookback, normalization, estimate variant, or neutralization at a time.
    - **Sub-universe weakness / concentration:** prefer broader coverage, group-relative transforms, simpler expressions, or a better-supported field before adding complexity.
-   - **Self-correlation:** change data family, information source, or economic mechanism. Do not inject random noise.
+   - **Common factor exposure / shared drawdown:** preserve the idiosyncratic hypothesis and test a justified neutralization change; compare Sharpe/drawdown against any turnover increase. Do not use neutralization as a generic cure.
+   - **Self-correlation:** change data family, information source, or economic mechanism. Do not inject random noise. If common-factor exposure is specifically implicated, a neutralized sibling may be tested before abandoning the family.
    - **Coverage/sparsity:** use live field metadata and conservative `ts_backfill`/group handling when justified.
 4. Generate at most 2–4 directed siblings per diagnosis. Record parent, mutation type and reason. Preserve the parent hypothesis and emit `skill_chain: ["wq-alpha-hypothesis", "wq-alpha-repair", "wq-alpha-review"]` after each child passes `wq-alpha-review`; only `review_decision: "RUN"` children may return to BRAIN.
 5. Re-simulate through `wq_brain_autonomous_research` as structured `skill_candidates` with deterministic fallback disabled. Compare the child against the parent on the metric that motivated the mutation and reject repairs that only improve unrelated metrics.

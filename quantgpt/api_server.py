@@ -48,6 +48,19 @@ async def lifespan(app: FastAPI):
     await init_db()
     logger.info("Database initialized")
 
+    try:
+        from .wq_official_knowledge_seed import seed_official_worldquant_knowledge
+
+        seeded = await seed_official_worldquant_knowledge()
+        logger.info(
+            "WorldQuant official knowledge seeded: %s sources, %s cards",
+            seeded["sources"],
+            seeded["cards"],
+        )
+    except Exception:
+        # Knowledge priors must not prevent the API/MCP service from starting.
+        logger.exception("WorldQuant official knowledge seed failed")
+
     from .db import _get_session_factory as _sf
 
     active_statuses = [

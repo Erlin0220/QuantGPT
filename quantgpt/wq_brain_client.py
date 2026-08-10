@@ -252,18 +252,33 @@ class WQBrainClient:
         key = (instrument_type, region, universe, int(delay), limit)
         if key in self._datasets_cache and not refresh:
             return list(self._datasets_cache[key])
-        params = {
-            "instrumentType": instrument_type,
-            "region": region,
-            "delay": int(delay),
-            "universe": universe,
-            "limit": limit,
-            "offset": 0,
-        }
-        r = self._get_session().get(f"{API_BASE}/data-sets", params=params, timeout=HTTP_TIMEOUT)
-        if r.status_code != 200:
-            raise RuntimeError(f"Failed to fetch WQ datasets: HTTP {r.status_code}: {r.text[:300]}")
-        result = self._catalog_results(r.json())[:limit]
+
+        datasets: list[dict] = []
+        offset = 0
+        # BRAIN rejects oversized catalog pages on some accounts.  Keep the
+        # request size aligned with the data-fields endpoint and paginate.
+        page_size = min(50, limit)
+        while len(datasets) < limit:
+            params = {
+                "instrumentType": instrument_type,
+                "region": region,
+                "delay": int(delay),
+                "universe": universe,
+                "limit": min(page_size, limit - len(datasets)),
+                "offset": offset,
+            }
+            r = self._get_session().get(f"{API_BASE}/data-sets", params=params, timeout=HTTP_TIMEOUT)
+            if r.status_code != 200:
+                raise RuntimeError(f"Failed to fetch WQ datasets: HTTP {r.status_code}: {r.text[:300]}")
+            data = r.json()
+            page = self._catalog_results(data)
+            datasets.extend(page)
+            total = int(data.get("count", len(datasets))) if isinstance(data, dict) else len(datasets)
+            if not page or len(datasets) >= total:
+                break
+            offset += len(page)
+
+        result = datasets[:limit]
         self._datasets_cache[key] = list(result)
         return result
 

@@ -11,6 +11,9 @@ This skill is distilled from the official WorldQuant sources stored in QuantGPT 
 
 - `worldquant:learn2quant`: start from your own Alpha ideas; vary data category, idea type, holding frequency and delay; diversify the pool and manage risk.
 - `worldquant:alpha-examples-104`: the official workflow is hypothesis → implementation → simulation → potential improvement. Its Price/Volume example uses close-open reversion with `group_rank`, Delay-1, neutralization and turnover-aware decay. Its Fundamental example uses operating cash flow / market cap with a time-series z-score and suggests analyst forecasts as a forward-looking improvement.
+- Learn2Quant Lessons 4–8: deliberately cross data categories (Price Volume, Fundamental, Sentiment, Options), idea types (reversion, momentum, seasonality), holding frequencies/delays and model/data diversity.
+- Learn2Quant Lesson 9: separate common factor risk from idiosyncratic Alpha and use justified risk neutralization rather than allowing shared factor exposure to masquerade as diversity.
+- Learn2Quant Lesson 10: advanced data enhancement/ML is justified only by a concrete data problem and must remain constrained by backtesting and overfit control.
 - `worldquant:brain-operators-live` and live Data Explorer snapshots: field/operator availability must be checked against the authenticated account instead of assumed.
 
 ## I — Interpretation
@@ -32,8 +35,8 @@ Invoke when the user asks for new WorldQuant Alpha ideas, a batch of candidates,
 1. Read `kb_search_alpha_knowledge` for the target goal/family. Prefer active cards with multiple WorldQuant sources and useful empirical BRAIN feedback.
 2. Call `list_wq_operators`; never emit an operator that is absent from the live catalog unless explicitly treating it as an unvalidated proposal.
 3. Call `wq_brain_data_catalog` for the relevant data concept. Use exact account-visible field IDs; do not invent field names.
-4. Write 3–8 hypotheses before expressions. Each hypothesis must state: expected direction, economic/market mechanism, intended horizon/delay, and what would falsify it.
-5. Prefer diversity across data families and structures. Do not spend the batch on window-only variants of one motif.
+4. Write 3–8 hypotheses before expressions. Each hypothesis must state: expected direction, economic/market mechanism, intended horizon/delay, likely common-factor exposure, and what would falsify it.
+5. Prefer diversity across the official data-category × idea-type matrix and structures. Do not spend the batch on window-only variants of one motif. When a proposed advanced/ML route is useful, first check whether BRAIN already exposes a model/enhanced field before building anything locally.
 6. Translate each hypothesis into the smallest plausible FASTEXPR. Keep the economic signal separate from simulation settings such as Delay, Decay, Neutralization and Truncation.
 7. For official-example descendants, preserve the source logic first. Example: test `-group_rank(close-open, subindustry)` as the close-open reversion seed; test cash-flow-to-cap with a time-series z-score and a live analyst cash-flow field as a separate forward-looking sibling.
 8. Run `wq-alpha-review` before spending BRAIN budget. Package only `RUN` candidates for `wq_brain_autonomous_research` as structured `skill_candidates`. Each candidate must carry at least: `expression`, `hypothesis`, `family`, `data_fields`, `skill_chain: ["wq-alpha-hypothesis", "wq-alpha-review"]`, `review_decision: "RUN"`, and concise `review_notes`. Add `knowledge_card_ids` when applicable.

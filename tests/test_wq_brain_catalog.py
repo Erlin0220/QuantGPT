@@ -29,6 +29,23 @@ class _CatalogSession:
         return _Response({}, status_code=404)
 
 
+class _DatasetPaginationSession:
+    def __init__(self):
+        self.calls = []
+
+    def get(self, url, params=None, timeout=None):
+        params = dict(params or {})
+        self.calls.append((url, params))
+        if not url.endswith("/data-sets"):
+            return _Response({}, status_code=404)
+        if int(params.get("limit", 0)) > 50:
+            return _Response({"detail": "pagination limit too high"}, status_code=400)
+        offset = int(params.get("offset", 0))
+        if offset == 0:
+            return _Response({"count": 3, "results": [{"id": "pv1"}, {"id": "fundamental6"}]})
+        return _Response({"count": 3, "results": [{"id": "analyst4"}]})
+
+
 def test_list_data_fields_paginates_and_caches():
     client = WQBrainClient(email="x", password="y")
     session = _CatalogSession()
@@ -68,3 +85,17 @@ def test_list_datasets_uses_brain_data_sets_endpoint_and_caches():
     assert first == [{"id": "fundamental6", "name": "Fundamentals"}]
     assert second == first
     assert len([call for call in session.calls if call[0].endswith("/data-sets")]) == 1
+
+
+def test_list_datasets_paginates_with_brain_safe_page_size():
+    client = WQBrainClient(email="x", password="y")
+    session = _DatasetPaginationSession()
+    client._session = session
+
+    result = client.list_datasets(limit=100)
+
+    assert [item["id"] for item in result] == ["pv1", "fundamental6", "analyst4"]
+    dataset_calls = [call for call in session.calls if call[0].endswith("/data-sets")]
+    assert len(dataset_calls) == 2
+    assert all(call[1]["limit"] <= 50 for call in dataset_calls)
+    assert [call[1]["offset"] for call in dataset_calls] == [0, 2]

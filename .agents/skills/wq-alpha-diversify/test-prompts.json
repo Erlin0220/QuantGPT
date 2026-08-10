@@ -1,0 +1,7 @@
+[
+  {"prompt":"最近 SELF_CORRELATION FAIL 太多，下一轮研究换真正不同的方向。","expected":"invoke","reason":"pool saturation"},
+  {"prompt":"候选都来自 price_volume，帮我把库存做得更分散。","expected":"invoke","reason":"family concentration"},
+  {"prompt":"同一个公式换 10 个窗口继续跑。","expected":"invoke","reason":"should redirect cosmetic variation toward true diversification"},
+  {"prompt":"这个 Alpha Fitness 不够，怎么修？","expected":"not_invoke","reason":"use wq-alpha-repair"},
+  {"prompt":"从零生成一个现金流 Alpha。","expected":"not_invoke","reason":"use wq-alpha-hypothesis"}
+]
