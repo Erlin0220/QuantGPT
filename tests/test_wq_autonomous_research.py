@@ -390,6 +390,73 @@ def test_targeted_mutations_follow_diagnostics_and_preserve_lineage(monkeypatch)
     assert all(item["parent_expression"] == expression for item in mutations)
 
 
+def test_knowledge_backed_high_turnover_prioritizes_cost_rescue():
+    card_id = "ab65eb3e-ec5e-4c94-ac8c-6aff83566112"
+    expression = "-1 * ts_delta(close, 1) / ts_std_dev(close, 20)"
+    result = {
+        "expression": expression,
+        "is_metrics": {"sharpe": 1.65, "fitness": 0.48, "turnover": 1.4575},
+        "mutation_targets": ["improve_fitness", "reduce_turnover"],
+        "research_meta": {
+            "family": "momentum_reversal",
+            "generation": 1,
+            "knowledge_card_ids": [card_id],
+            "knowledge_mutation_strategies": [
+                "Add a liquidity filter using volume or market cap to focus on liquid stocks.",
+                "Combine reversal signal with volatility scaling to normalize risk.",
+            ],
+        },
+    }
+
+    mutations = autonomous.build_targeted_mutations(result, seen=set(), limit=2)
+
+    assert [item["mutation_type"] for item in mutations] == [
+        "knowledge_turnover_hump",
+        "knowledge_decay_smoothing",
+    ]
+    assert all(item["knowledge_card_ids"] == [card_id] for item in mutations)
+    assert mutations[0]["expression"].startswith("hump(rank(")
+    assert "ts_decay_linear" in mutations[1]["expression"]
+
+
+def test_memory_plan_rehydrates_knowledge_guidance_for_cost_rescue():
+    card_id = "ab65eb3e-ec5e-4c94-ac8c-6aff83566112"
+    expression = "-1 * ts_delta(close, 1) / ts_std_dev(close, 20)"
+    memory = {
+        "recent_trials": [
+            {
+                "expression": expression,
+                "family": "momentum_reversal",
+                "generation": 1,
+                "fitness": 0.48,
+                "sharpe": 1.65,
+                "turnover": 1.4575,
+                "mutation_targets": ["improve_fitness", "reduce_turnover"],
+                "failure_reason": "low_fitness",
+                "knowledge_card_ids": [card_id],
+            }
+        ],
+        "knowledge_guidance": {
+            "cards": [
+                {
+                    "id": card_id,
+                    "failure_modes": ["High transaction costs can eliminate profits."],
+                    "mutation_strategies": ["Reduce trading intensity while preserving the hypothesis."],
+                }
+            ]
+        },
+    }
+
+    plan = autonomous.build_memory_mutation_plan(memory, seen=set(), limit=2, hypothesis="continue")
+
+    assert [item["mutation_type"] for item in plan] == [
+        "knowledge_turnover_hump",
+        "knowledge_decay_smoothing",
+    ]
+    assert all(item["knowledge_card_ids"] == [card_id] for item in plan)
+    assert all("knowledge guidance" in item["mutation_reason"] for item in plan)
+
+
 def test_positive_weak_signal_is_smoothed_not_inverted():
     result = {
         "expression": "rank(ts_mean(returns, 10))",

@@ -670,6 +670,10 @@ def build_knowledge_seed_plan(
                 "planner_strategy": "multi_source_knowledge",
                 "knowledge_card_ids": [str(item.get("card_id"))] if item.get("card_id") else [],
                 "knowledge_source_keys": list(item.get("source_keys") or []),
+                "knowledge_failure_modes": list(item.get("failure_modes") or []),
+                "knowledge_mutation_strategies": list(item.get("mutation_strategies") or []),
+                "knowledge_empirical": dict(item.get("empirical") or {}),
+                "knowledge_confidence": item.get("confidence"),
             }
         )
         if len(out) >= limit:
@@ -872,8 +876,36 @@ def build_targeted_mutations(
     targets = list(result.get("mutation_targets") or [])
     metrics = result.get("is_metrics") or {}
     sharpe = _safe_metric(metrics.get("sharpe"))
+    turnover = _safe_metric(metrics.get("turnover"))
     directives = preferred_mutation_classes(result)
     variants: list[tuple[str, str, str, str | None]] = []
+
+    # Knowledge-backed parents get a deterministic implementation-cost rescue
+    # before generic mutation routes.  This matters for short-horizon effects:
+    # a strong raw Sharpe can be economically real while still being unusable
+    # because the naive expression trades too aggressively.  Keep the economic
+    # hypothesis/card lineage, but slow position changes first.
+    knowledge_card_ids = list(meta.get("knowledge_card_ids") or [])
+    knowledge_strategies = [str(value) for value in (meta.get("knowledge_mutation_strategies") or []) if value]
+    if knowledge_card_ids and turnover is not None and turnover > 0.7:
+        strategy_hint = "; ".join(knowledge_strategies[:2])
+        suffix = f"; knowledge guidance: {strategy_hint}" if strategy_hint else ""
+        variants.append(
+            (
+                f"hump(rank(({expression})), hump=0.01)",
+                "knowledge_turnover_hump",
+                "knowledge-backed high-turnover signal: constrain position changes before changing the hypothesis" + suffix,
+                None,
+            )
+        )
+        variants.append(
+            (
+                f"rank(ts_decay_linear(({expression}), 5))",
+                "knowledge_decay_smoothing",
+                "knowledge-backed high-turnover signal: decay/smooth the same hypothesis to improve implementation efficiency" + suffix,
+                None,
+            )
+        )
     for directive in directives:
         mutation_class = directive["mutation_class"]
         rationale = directive["rationale"]
@@ -960,6 +992,11 @@ def build_memory_mutation_plan(
         return []
     memory = memory or {}
     recent = list(memory.get("recent_trials") or [])
+    knowledge_cards_by_id = {
+        str(card.get("id")): card
+        for card in ((memory.get("knowledge_guidance") or {}).get("cards") or [])
+        if card.get("id")
+    }
     recent.sort(
         key=lambda item: _trial_promise_score(item, min_sharpe=min_sharpe, min_fitness=min_fitness),
         reverse=True,
@@ -976,6 +1013,20 @@ def build_memory_mutation_plan(
         promise = _trial_promise_score(trial, min_sharpe=min_sharpe, min_fitness=min_fitness)
         if promise < min_parent_promise:
             continue
+        trial_card_ids = [str(value) for value in (trial.get("knowledge_card_ids") or []) if value]
+        linked_cards = [knowledge_cards_by_id[value] for value in trial_card_ids if value in knowledge_cards_by_id]
+        knowledge_failure_modes = [
+            str(value)
+            for card in linked_cards
+            for value in (card.get("failure_modes") or [])
+            if value
+        ]
+        knowledge_mutation_strategies = [
+            str(value)
+            for card in linked_cards
+            for value in (card.get("mutation_strategies") or [])
+            if value
+        ]
         synthetic = {
             "expression": trial.get("expression"),
             "is_metrics": {
@@ -1000,7 +1051,9 @@ def build_memory_mutation_plan(
                 "provenance_state": trial.get("provenance_state"),
                 "provenance_reason": trial.get("provenance_reason"),
                 "operator_pattern": trial.get("operator_pattern"),
-                "knowledge_card_ids": list(trial.get("knowledge_card_ids") or []),
+                "knowledge_card_ids": trial_card_ids,
+                "knowledge_failure_modes": knowledge_failure_modes[:12],
+                "knowledge_mutation_strategies": knowledge_mutation_strategies[:12],
             },
         }
         variants = build_targeted_mutations(

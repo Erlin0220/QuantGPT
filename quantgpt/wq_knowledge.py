@@ -399,6 +399,10 @@ async def load_knowledge_guidance(*, query: str = "", families: list[str] | None
                     "family": card.get("family"),
                     "hypothesis": card.get("hypothesis"),
                     "source_keys": card.get("source_keys") or [],
+                    "failure_modes": card.get("failure_modes") or [],
+                    "mutation_strategies": card.get("mutation_strategies") or [],
+                    "empirical": card.get("empirical") or {"trials": 0},
+                    "confidence": card.get("confidence"),
                     "score": card.get("score"),
                 }
             )
