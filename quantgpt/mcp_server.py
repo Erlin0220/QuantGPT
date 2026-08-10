@@ -1241,13 +1241,33 @@ def _run_wq_autonomous_research_mcp_task(task_id: str, params: dict) -> dict:
 
 def _run_wq_submit_by_ids_mcp_task(task_id: str, params: dict) -> dict:
     from .wq_brain_client import get_client
-    from .wq_submission_policy import finalize_submission_attempt_sync, reserve_submission_sync
+    from .wq_submission_policy import (
+        _run_coro_sync,
+        finalize_submission_attempt_sync,
+        reconcile_candidate_platform_statuses,
+        reserve_submission_sync,
+    )
 
     client = get_client(params["account"])
     try:
         update_mcp_task(task_id, status="authenticating", progress=0, progress_message="认证 WQ BRAIN", persist=True)
         if not client.authenticate():
             return {"ok": False, "error": "WQ BRAIN 认证失败"}
+
+        update_mcp_task(
+            task_id,
+            status="finalizing",
+            progress=0,
+            progress_message="正式提交前刷新 BRAIN 指标与 SC 状态",
+            persist=True,
+        )
+        preflight = run_check_alphas(client, params["alpha_ids"])
+        _run_coro_sync(
+            reconcile_candidate_platform_statuses(
+                params["account"],
+                preflight.get("alphas", {}),
+            )
+        )
 
         def on_progress(current: int, total: int, alpha_id: str) -> None:
             pct = int((current - 1) * 100 / total) if total else 0
@@ -1269,7 +1289,7 @@ def _run_wq_submit_by_ids_mcp_task(task_id: str, params: dict) -> dict:
             submission_guard=lambda alpha_id: reserve_submission_sync(params["account"], alpha_id),
             submission_result_callback=lambda alpha_id, entry: finalize_submission_attempt_sync(params["account"], alpha_id, entry),
         )
-        return {"ok": True, **result}
+        return {"ok": True, "preflight": preflight, **result}
     finally:
         client.close()
 
@@ -1673,6 +1693,7 @@ async def wq_brain_account_status(account: str = "primary") -> str:
 
     client = get_client(account)
     platform_candidate_backfill = None
+    reservation_recovery = None
     try:
         authenticated = await asyncio.to_thread(client.authenticate)
         if not authenticated:
@@ -1687,6 +1708,11 @@ async def wq_brain_account_status(account: str = "primary") -> str:
                 min_fitness=1.0,
                 status_filter="UNSUBMITTED",
             )
+            from .wq_submission_policy import get_submission_reservation_recovery_ids
+
+            recovery_ids = await get_submission_reservation_recovery_ids(account)
+            if recovery_ids:
+                reservation_recovery = await asyncio.to_thread(run_check_alphas, client, recovery_ids)
     finally:
         await asyncio.to_thread(client.close)
 
@@ -1694,12 +1720,27 @@ async def wq_brain_account_status(account: str = "primary") -> str:
         return json.dumps({"error": result.get("error", "unknown")}, ensure_ascii=False)
     result["account"] = account
     try:
-        from .wq_submission_policy import observe_account_status, record_platform_candidates
+        from .wq_submission_policy import (
+            observe_account_status,
+            reconcile_candidate_platform_statuses,
+            reconcile_submission_reservations,
+            record_platform_candidates,
+        )
 
         if platform_candidate_backfill and platform_candidate_backfill.get("ok"):
             result["platform_candidates_recovered"] = await record_platform_candidates(
                 account,
                 platform_candidate_backfill.get("alphas", []),
+            )
+        if reservation_recovery and reservation_recovery.get("alphas"):
+            recovery_alphas = reservation_recovery.get("alphas", {})
+            result["submission_reservations_reconciled"] = await reconcile_submission_reservations(
+                account,
+                recovery_alphas,
+            )
+            result["reservation_candidates_reconciled"] = await reconcile_candidate_platform_statuses(
+                account,
+                recovery_alphas,
             )
         result["submission_policy"] = await observe_account_status(account, result)
     except Exception as exc:

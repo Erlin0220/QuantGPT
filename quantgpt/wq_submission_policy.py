@@ -13,7 +13,7 @@ import asyncio
 import os
 import re
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -26,7 +26,7 @@ from .wq_candidate_calibration import (
     calibration_report,
     configured_confidence_thresholds,
 )
-from .wq_correlation_proxy import correlation_priority_multiplier
+from .wq_correlation_proxy import correlation_evidence_is_fresh, correlation_priority_multiplier
 from .wq_failure_taxonomy import classify_research_failure
 from .wq_learning_maturity import active_feedback_gate
 from .wq_lineage import lineage_id_for, parent_lineage_id_for, recover_research_metadata
@@ -39,6 +39,9 @@ _DEFAULT_INVENTORY_FLOOR = 30
 _DEFAULT_INVENTORY_TARGET_LOW = 40
 _DEFAULT_INVENTORY_TARGET_HIGH = 50
 _DEFAULT_FRESHNESS_HOURS = 24.0
+_DEFAULT_RESERVATION_TTL_SECONDS = 15 * 60
+_DEFAULT_SUBMISSION_MAX_LOCAL_CORRELATION = 0.70
+_DEFAULT_SUBMISSION_MIN_OVERFIT_SCORE = 0.50
 _TERMINAL_POSITIVE_STATUSES = {"ACTIVE"}
 _TERMINAL_NEGATIVE_STATUSES = {"SC_FAIL", "OTHER_FAIL"}
 _CONVERSION_PRIOR_ALPHA = 2.0
@@ -109,17 +112,105 @@ def _candidate_is_fresh(candidate: WQResearchCandidate, *, now: datetime | None 
     return age_hours <= float(_configured_inventory_policy()["freshness_hours"])
 
 
-def _candidate_research_ready(candidate: WQResearchCandidate) -> bool:
-    """Cold-start inventory eligibility from deterministic research-readiness evidence."""
-    return (
-        str(candidate.status or "").lower() == "queued"
-        and str(candidate.validation_status or "").lower() == "ready"
-        and float(candidate.sharpe or 0.0) >= 1.25
-        and float(candidate.fitness or 0.0) >= 1.0
-        and 0.01 <= float(candidate.turnover or 0.0) <= 0.7
-        and str(candidate.sc_status or "").upper() != "FAIL"
-        and _candidate_is_fresh(candidate)
+def _configured_reservation_ttl_seconds() -> int:
+    try:
+        value = int(os.environ.get("WQ_SUBMISSION_RESERVATION_TTL_SECONDS", str(_DEFAULT_RESERVATION_TTL_SECONDS)))
+    except (TypeError, ValueError):
+        value = _DEFAULT_RESERVATION_TTL_SECONDS
+    return max(120, value)
+
+
+def _configured_submission_evidence_policy() -> dict[str, float]:
+    try:
+        max_local_correlation = float(
+            os.environ.get("WQ_SUBMISSION_MAX_LOCAL_CORRELATION", str(_DEFAULT_SUBMISSION_MAX_LOCAL_CORRELATION))
+        )
+    except (TypeError, ValueError):
+        max_local_correlation = _DEFAULT_SUBMISSION_MAX_LOCAL_CORRELATION
+    try:
+        min_overfit_score = float(
+            os.environ.get("WQ_SUBMISSION_MIN_OVERFIT_SCORE", str(_DEFAULT_SUBMISSION_MIN_OVERFIT_SCORE))
+        )
+    except (TypeError, ValueError):
+        min_overfit_score = _DEFAULT_SUBMISSION_MIN_OVERFIT_SCORE
+    return {
+        "max_local_correlation": max(0.0, min(1.0, max_local_correlation)),
+        "min_overfit_score": max(0.0, min(1.0, min_overfit_score)),
+    }
+
+
+def _submission_evidence_blockers(
+    local_evidence: dict[str, Any] | None,
+    overfitting: dict[str, Any] | None,
+    *,
+    now: datetime | None = None,
+) -> list[str]:
+    blockers: list[str] = []
+    evidence_policy = _configured_submission_evidence_policy()
+    local_evidence = local_evidence if isinstance(local_evidence, dict) else {}
+    try:
+        local_correlation = float(local_evidence.get("max_correlation"))
+    except (TypeError, ValueError):
+        local_correlation = None
+    if (
+        local_correlation is not None
+        and correlation_evidence_is_fresh(local_evidence, now=now)
+        and local_correlation >= evidence_policy["max_local_correlation"]
+    ):
+        blockers.append("local_correlation_high")
+
+    overfitting = overfitting if isinstance(overfitting, dict) else {}
+    if str(overfitting.get("status") or "").lower() == "available":
+        try:
+            overfit_score = float(overfitting.get("score"))
+        except (TypeError, ValueError):
+            overfit_score = None
+        if overfit_score is not None and overfit_score < evidence_policy["min_overfit_score"]:
+            blockers.append("overfitting_evidence_weak")
+    return blockers
+
+
+def _candidate_submission_blockers(
+    candidate: WQResearchCandidate,
+    *,
+    now: datetime | None = None,
+) -> list[str]:
+    """Return deterministic reasons a tracked candidate must not consume a formal slot."""
+    blockers: list[str] = []
+    if str(candidate.status or "").lower() != "queued":
+        blockers.append("candidate_not_queued")
+    if str(candidate.validation_status or "").lower() != "ready":
+        blockers.append("validation_not_ready")
+    if float(candidate.sharpe or 0.0) < 1.25:
+        blockers.append("sharpe_below_threshold")
+    if float(candidate.fitness or 0.0) < 1.0:
+        blockers.append("fitness_below_threshold")
+    if not 0.01 <= float(candidate.turnover or 0.0) <= 0.7:
+        blockers.append("turnover_out_of_range")
+    if str(candidate.sc_status or "").upper() == "FAIL":
+        blockers.append("official_self_correlation_fail")
+    if not _candidate_is_fresh(candidate, now=now):
+        blockers.append("validation_stale")
+
+    local_evidence = {
+        "status": "available" if candidate.local_correlation is not None else "unavailable",
+        "max_correlation": candidate.local_correlation,
+        "calculated_at": candidate.local_correlation_at.isoformat() if candidate.local_correlation_at else None,
+    }
+    validation_details = candidate.validation_details if isinstance(candidate.validation_details, dict) else {}
+    blockers.extend(
+        _submission_evidence_blockers(
+            local_evidence,
+            validation_details.get("overfitting_evidence"),
+            now=now,
+        )
     )
+    return blockers
+
+
+def _candidate_research_ready(candidate: WQResearchCandidate) -> bool:
+    """Cold-start inventory eligibility from deterministic submission-readiness evidence."""
+    return not _candidate_submission_blockers(candidate)
 
 
 def _structure_signature(expression: str) -> str:
@@ -291,6 +382,110 @@ async def _get_or_create_state(session, account: str) -> WQSubmissionState:
     return state
 
 
+async def _expire_stale_reservations(
+    session,
+    account: str,
+    *,
+    now: datetime | None = None,
+) -> list[str]:
+    """Release stale local slot leases without making the same Alpha retryable blindly."""
+    current = _normalized_datetime(now or datetime.now(timezone.utc)) or datetime.now(timezone.utc)
+    cutoff = current - timedelta(seconds=_configured_reservation_ttl_seconds())
+    result = await session.execute(
+        select(WQSubmissionAttempt).where(
+            WQSubmissionAttempt.account == account,
+            WQSubmissionAttempt.status == "RESERVED",
+            WQSubmissionAttempt.created_at <= cutoff,
+        )
+    )
+    stale = list(result.scalars().all())
+    for attempt in stale:
+        attempt.status = "RESERVATION_EXPIRED"
+        attempt.score_state = "NOT_ELIGIBLE"
+        attempt.detail = "local reservation lease expired; platform recheck required before retry"
+        candidate_result = await session.execute(
+            select(WQResearchCandidate).where(
+                WQResearchCandidate.account == account,
+                WQResearchCandidate.alpha_id == attempt.alpha_id,
+            )
+        )
+        candidate = candidate_result.scalar_one_or_none()
+        if candidate is not None and str(candidate.status or "").lower() == "reserved":
+            candidate.status = "validation_pending"
+            candidate.validation_status = "reservation_recovery_required"
+    return [str(attempt.alpha_id) for attempt in stale]
+
+
+async def get_submission_reservation_recovery_ids(account: str = "primary", *, limit: int = 20) -> list[str]:
+    """Return stale/expired reservations that need a platform-side status recheck."""
+    factory = _get_session_factory()
+    async with factory() as session:
+        expired_now = await _expire_stale_reservations(session, account)
+        result = await session.execute(
+            select(WQSubmissionAttempt.alpha_id)
+            .where(
+                WQSubmissionAttempt.account == account,
+                WQSubmissionAttempt.status == "RESERVATION_EXPIRED",
+            )
+            .order_by(WQSubmissionAttempt.created_at.desc())
+            .limit(max(1, min(100, int(limit))))
+        )
+        ids = [str(value) for value in result.scalars().all() if value]
+        await session.commit()
+    return list(dict.fromkeys([*expired_now, *ids]))[: max(1, min(100, int(limit)))]
+
+
+async def reconcile_submission_reservations(
+    account: str,
+    platform_alphas: dict[str, dict[str, Any]],
+) -> int:
+    """Recover expired submission leases from authoritative platform status."""
+    if not platform_alphas:
+        return 0
+    factory = _get_session_factory()
+    updated = 0
+    async with factory() as session:
+        for alpha_id, info in platform_alphas.items():
+            if (info or {}).get("ok") is False:
+                continue
+            attempt_result = await session.execute(
+                select(WQSubmissionAttempt)
+                .where(
+                    WQSubmissionAttempt.account == account,
+                    WQSubmissionAttempt.alpha_id == str(alpha_id),
+                    WQSubmissionAttempt.status.in_(["RESERVED", "RESERVATION_EXPIRED"]),
+                )
+                .order_by(WQSubmissionAttempt.created_at.desc())
+                .limit(1)
+            )
+            attempt = attempt_result.scalar_one_or_none()
+            if attempt is None:
+                continue
+            platform_status = str((info or {}).get("status") or "").upper()
+            sc_result = str((info or {}).get("sc_result") or "").upper()
+            if platform_status == "ACTIVE":
+                attempt.status = "ACTIVE"
+                attempt.score_state = "PENDING"
+                attempt.detail = "recovered stale reservation: platform reports ACTIVE"
+            elif sc_result == "FAIL":
+                attempt.status = "SC_FAIL"
+                attempt.score_state = "NOT_ELIGIBLE"
+                attempt.detail = "recovered stale reservation: platform SELF_CORRELATION failed"
+            elif platform_status == "UNSUBMITTED":
+                attempt.status = "RESERVATION_EXPIRED"
+                attempt.score_state = "NOT_ELIGIBLE"
+                attempt.detail = "recovered stale reservation: platform confirms UNSUBMITTED; safe to revalidate"
+            elif platform_status:
+                attempt.status = "SC_PENDING"
+                attempt.score_state = "PENDING"
+                attempt.detail = f"recovered stale reservation: platform status={platform_status}"
+            else:
+                continue
+            updated += 1
+        await session.commit()
+    return updated
+
+
 async def record_research_candidates(
     account: str,
     candidates: list[dict[str, Any]],
@@ -356,6 +551,15 @@ async def record_research_candidates(
                     local_correlation_at = datetime.fromisoformat(str(local_proxy["calculated_at"]).replace("Z", "+00:00"))
                 except (TypeError, ValueError):
                     local_correlation_at = None
+            submission_evidence_blockers = _submission_evidence_blockers(
+                local_proxy,
+                validation.get("overfitting_evidence"),
+            )
+            validation["submission_gate"] = {
+                "ready": not submission_evidence_blockers,
+                "blockers": list(submission_evidence_blockers),
+                "policy": _configured_submission_evidence_policy(),
+            }
             peer_result = await session.execute(
                 select(WQResearchCandidate.expression).where(
                     WQResearchCandidate.account == account,
@@ -437,7 +641,7 @@ async def record_research_candidates(
             # candidates retain their old queue semantics and are still rechecked before submit.
             if validation_status == "robustness_fail":
                 target_status = "robustness_fail"
-            elif validation_status in {"validation_pending", "robustness_unavailable"}:
+            elif validation_status in {"validation_pending", "robustness_unavailable"} or submission_evidence_blockers:
                 target_status = "validation_pending"
             else:
                 target_status = "queued"
@@ -598,6 +802,14 @@ async def reconcile_candidate_platform_statuses(
                     )
                     candidate.status = "queued" if ready else "validation_pending"
                     candidate.validation_status = "ready" if ready else "platform_readiness_failed"
+                    if ready:
+                        evidence_blockers = [
+                            blocker
+                            for blocker in _candidate_submission_blockers(candidate)
+                            if blocker in {"local_correlation_high", "overfitting_evidence_weak"}
+                        ]
+                        if evidence_blockers:
+                            candidate.status = "validation_pending"
                 evidence = {
                     "expression": candidate.expression,
                     "family": candidate.family,
@@ -656,6 +868,7 @@ async def reserve_submission(
         state = await _get_or_create_state(session, account)
         budget = _configured_daily_budget()
         state.daily_budget = budget
+        await _expire_stale_reservations(session, account)
 
         readiness_result = await session.execute(
             select(WQResearchCandidate).where(
@@ -664,13 +877,24 @@ async def reserve_submission(
             )
         )
         readiness_candidate = readiness_result.scalar_one_or_none()
-        if readiness_candidate is not None and readiness_candidate.status in {"robustness_fail", "validation_pending"}:
+        if readiness_candidate is None:
+            await session.commit()
+            return {
+                "allowed": False,
+                "reason": "candidate_not_tracked",
+                "alpha_id": alpha_id,
+                "detail": "formal submission requires a tracked Candidate Queue entry",
+            }
+        blockers = _candidate_submission_blockers(readiness_candidate)
+        if blockers:
+            await session.commit()
             return {
                 "allowed": False,
                 "reason": "candidate_not_ready",
                 "alpha_id": alpha_id,
                 "candidate_status": readiness_candidate.status,
                 "validation_status": readiness_candidate.validation_status,
+                "blockers": blockers,
             }
 
         prior_result = await session.execute(
@@ -683,7 +907,7 @@ async def reserve_submission(
             .limit(1)
         )
         prior = prior_result.scalar_one_or_none()
-        if prior is not None:
+        if prior is not None and str(prior.status or "").upper() != "RESERVATION_EXPIRED":
             return {
                 "allowed": False,
                 "reason": "alpha_already_submitted_or_pending",
@@ -712,26 +936,36 @@ async def reserve_submission(
                 "remaining_slots": 0,
             }
 
-        attempt = WQSubmissionAttempt(
-            account=account,
-            alpha_id=alpha_id,
-            submission_day=day,
-            status="RESERVED",
-            score_state="PENDING",
-            points_at_reservation=points,
-            points_status_at_reservation=points_status,
-        )
-        session.add(attempt)
-
-        candidate_result = await session.execute(
-            select(WQResearchCandidate).where(
-                WQResearchCandidate.account == account,
-                WQResearchCandidate.alpha_id == alpha_id,
+        if prior is not None and str(prior.status or "").upper() == "RESERVATION_EXPIRED":
+            # The DB intentionally keeps one audit row per Alpha/day. After an
+            # authoritative UNSUBMITTED recheck, renew that row instead of
+            # inserting a duplicate that violates the uniqueness constraint.
+            attempt = prior
+            now = datetime.now(timezone.utc)
+            attempt.status = "RESERVED"
+            attempt.score_state = "PENDING"
+            attempt.detail = "reservation lease renewed after platform confirmed UNSUBMITTED"
+            attempt.points_at_reservation = points
+            attempt.points_status_at_reservation = points_status
+            attempt.attributed_points_share = None
+            attempt.attribution_confidence = None
+            attempt.attribution_details = None
+            attempt.settled_at = None
+            attempt.created_at = now
+            attempt.updated_at = now
+        else:
+            attempt = WQSubmissionAttempt(
+                account=account,
+                alpha_id=alpha_id,
+                submission_day=day,
+                status="RESERVED",
+                score_state="PENDING",
+                points_at_reservation=points,
+                points_status_at_reservation=points_status,
             )
-        )
-        candidate = candidate_result.scalar_one_or_none()
-        if candidate is not None:
-            candidate.status = "reserved"
+            session.add(attempt)
+
+        readiness_candidate.status = "reserved"
 
         await session.commit()
         return {
@@ -822,10 +1056,17 @@ async def observe_account_status(account: str, status: dict[str, Any]) -> dict[s
     points = status.get("points")
     points_status = str(status.get("points_status") or "UNAVAILABLE").upper()
     leaderboard = status.get("leaderboard") or {}
+    raw_active_alpha_gap = leaderboard.get("active_alpha_gap")
+    if points_status == "CURRENT" and raw_active_alpha_gap is None:
+        # Reconciliation must independently require synchronization evidence;
+        # never trust a CURRENT label without a known ACTIVE-vs-leaderboard gap.
+        points_status = "SYNC_UNKNOWN"
     try:
-        active_alpha_gap = max(0, int(leaderboard.get("active_alpha_gap") or 0))
+        active_alpha_gap = max(0, int(raw_active_alpha_gap)) if raw_active_alpha_gap is not None else 0
     except (TypeError, ValueError):
         active_alpha_gap = 0
+        if points_status == "CURRENT":
+            points_status = "SYNC_UNKNOWN"
     try:
         points_value = float(points) if points is not None else None
     except (TypeError, ValueError):
@@ -877,6 +1118,10 @@ async def observe_account_status(account: str, status: dict[str, Any]) -> dict[s
                         "delta": delta,
                         "points_status": points_status,
                         "active_alpha_gap": active_alpha_gap,
+                        "sync_evidence": {
+                            "active_alpha_gap_known": raw_active_alpha_gap is not None,
+                            "active_alpha_gap": active_alpha_gap,
+                        },
                         "untracked_active_gap": uncertainty_slots,
                         "first_active_at": min(active_times).isoformat() if active_times else None,
                         "last_active_at": max(active_times).isoformat() if active_times else None,
@@ -915,6 +1160,7 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
     factory = _get_session_factory()
     async with factory() as session:
         state = await _get_or_create_state(session, account)
+        expired_reservation_ids = await _expire_stale_reservations(session, account)
 
         attempts_result = await session.execute(
             select(func.count()).where(
@@ -958,6 +1204,9 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             .order_by(*candidate_order)
         )
         queued_candidates = list(queue_result.scalars().all())
+        queued_candidates.sort(
+            key=lambda candidate: (not _candidate_research_ready(candidate),),
+        )
         queue_count = len(queued_candidates)
         top_candidates = [
             {
@@ -993,6 +1242,7 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
                 "provenance_state": item.provenance_state,
                 "provenance_reason": item.provenance_reason,
                 "research_readiness_eligible": _candidate_research_ready(item),
+                "submission_blockers": _candidate_submission_blockers(item),
                 "tag": item.tag,
             }
             for item in queued_candidates[:5]
@@ -1032,13 +1282,16 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
         else:
             research_mode = "NORMAL"
 
-        leaderboard_lagging = str(state.last_points_status or "").upper() == "LEADERBOARD_LAGGING"
+        last_points_status = str(state.last_points_status or "").upper()
+        leaderboard_lagging = last_points_status == "LEADERBOARD_LAGGING"
+        points_sync_unknown = last_points_status == "SYNC_UNKNOWN"
         untracked_active_gap = int(state.untracked_active_gap or 0)
-        submission_warning = (
-            "leaderboard_lagging_with_untracked_active_alphas"
-            if leaderboard_lagging and untracked_active_gap > 0
-            else None
-        )
+        if points_sync_unknown:
+            submission_warning = "points_sync_unknown_alpha_counts_unavailable"
+        elif leaderboard_lagging and untracked_active_gap > 0:
+            submission_warning = "leaderboard_lagging_with_untracked_active_alphas"
+        else:
+            submission_warning = None
         submission_frozen = False
         budget_remaining = max(0, daily_budget - used_slots)
         inventory_status = {
@@ -1070,6 +1323,8 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             "budget_remaining_slots": budget_remaining,
             "remaining_submission_slots": budget_remaining,
             "pending_score_submissions": pending_score,
+            "expired_reservation_ids": expired_reservation_ids,
+            "reservation_ttl_seconds": _configured_reservation_ttl_seconds(),
             "candidate_queue_count": queue_count,
             "candidate_confidence_counts": confidence_counts,
             "candidate_confidence_thresholds": {
@@ -1091,6 +1346,7 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             "last_settled_submission_count": state.last_settled_submission_count,
             "untracked_active_gap": untracked_active_gap,
             "leaderboard_lagging": leaderboard_lagging,
+            "points_sync_unknown": points_sync_unknown,
             "submission_warning": submission_warning,
             "submission_frozen": submission_frozen,
             "rule": "submission_budget_and_candidate_inventory_are_independent_control_loops",

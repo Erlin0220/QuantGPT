@@ -66,12 +66,17 @@ def scheduler_learning_gate(
     *,
     trials: int,
     provenance_resolved: int,
+    provenance_classified: int | None = None,
     active_gate: dict[str, Any],
 ) -> dict[str, Any]:
     thresholds = configured_learning_thresholds()
     trials = max(0, int(trials))
     provenance_resolved = max(0, int(provenance_resolved))
-    provenance_rate = provenance_resolved / max(1, trials)
+    provenance_classified = max(
+        provenance_resolved,
+        int(provenance_classified if provenance_classified is not None else provenance_resolved),
+    )
+    provenance_rate = provenance_classified / max(1, trials)
     reasons: list[str] = []
     if trials < int(thresholds["scheduler_trials"]):
         reasons.append("insufficient_research_trials")
@@ -86,7 +91,9 @@ def scheduler_learning_gate(
         "trials": trials,
         "minimum_trials": int(thresholds["scheduler_trials"]),
         "provenance_resolved": provenance_resolved,
+        "provenance_classified": provenance_classified,
         "provenance_rate": round(provenance_rate, 4),
+        "provenance_rate_basis": "classified_resolved_or_partial",
         "minimum_provenance_rate": float(thresholds["scheduler_provenance_rate"]),
         "reasons": reasons,
         "policy": "adaptive" if ready else "coverage_first",
@@ -97,6 +104,7 @@ def build_learning_maturity(
     *,
     trials: int,
     provenance_resolved: int,
+    provenance_classified: int | None = None,
     active_feedback: dict[str, Any] | None,
     points_coverage: dict[str, Any] | None,
 ) -> dict[str, Any]:
@@ -105,6 +113,7 @@ def build_learning_maturity(
     scheduler = scheduler_learning_gate(
         trials=trials,
         provenance_resolved=provenance_resolved,
+        provenance_classified=provenance_classified,
         active_gate=active,
     )
     return {

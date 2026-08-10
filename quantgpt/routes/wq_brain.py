@@ -22,7 +22,7 @@ from ..task_store import (
     tasks_lock,
 )
 from ..wq_brain_client import SUBMIT_THRESHOLDS, configured_accounts, get_client, is_configured
-from ..wq_brain_service import fitness_to_grade, run_list_alphas, run_single_simulation, safe_float
+from ..wq_brain_service import fitness_to_grade, run_check_alphas, run_list_alphas, run_single_simulation, safe_float
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +117,11 @@ async def wq_brain_status():
 
 
 @router.get("/user-info")
-async def wq_brain_user_info(account: str = "primary"):
+async def wq_brain_user_info(
+    account: str = "primary",
+    user: User = Depends(get_current_user),
+):
+    _ = user
     if not is_configured(account):
         raise HTTPException(status_code=503, detail=f"WQ BRAIN 未配置 (account={account})")
     client = get_client(account)
@@ -265,12 +269,18 @@ async def submit_alpha_from_task(
     if not client.authenticate():
         raise HTTPException(status_code=502, detail=f"WQ BRAIN 认证失败 (account={account})")
 
-    from ..wq_submission_policy import finalize_submission_attempt_sync, reserve_submission_sync
+    from ..wq_submission_policy import (
+        finalize_submission_attempt_sync,
+        reconcile_candidate_platform_statuses,
+        reserve_submission_sync,
+    )
 
+    preflight = await asyncio.to_thread(run_check_alphas, client, [alpha_id])
+    await reconcile_candidate_platform_statuses(account, preflight.get("alphas", {}))
     decision = await asyncio.to_thread(reserve_submission_sync, account, alpha_id)
     if not decision.get("allowed"):
         client.close()
-        raise HTTPException(status_code=429, detail={"message": "达到本地 WQ 每日提交预算或 Alpha 已在提交中", "submission_policy": decision})
+        raise HTTPException(status_code=429, detail={"message": "达到本地 WQ 每日提交预算或 Alpha 尚未满足提交门槛", "submission_policy": decision})
 
     submit_result = await asyncio.to_thread(client.submit_alpha, alpha_id)
     await asyncio.to_thread(finalize_submission_attempt_sync, account, alpha_id, submit_result)
@@ -336,12 +346,18 @@ async def submit_alpha_by_id(
     client = get_client(account)
     if not client.authenticate():
         raise HTTPException(status_code=502, detail=f"WQ BRAIN 认证失败 (account={account})")
-    from ..wq_submission_policy import finalize_submission_attempt_sync, reserve_submission_sync
+    from ..wq_submission_policy import (
+        finalize_submission_attempt_sync,
+        reconcile_candidate_platform_statuses,
+        reserve_submission_sync,
+    )
 
+    preflight = await asyncio.to_thread(run_check_alphas, client, [alpha_id])
+    await reconcile_candidate_platform_statuses(account, preflight.get("alphas", {}))
     decision = await asyncio.to_thread(reserve_submission_sync, account, alpha_id)
     if not decision.get("allowed"):
         client.close()
-        raise HTTPException(status_code=429, detail={"message": "达到本地 WQ 每日提交预算或 Alpha 已在提交中", "submission_policy": decision})
+        raise HTTPException(status_code=429, detail={"message": "达到本地 WQ 每日提交预算或 Alpha 尚未满足提交门槛", "submission_policy": decision})
 
     result = await asyncio.to_thread(client.submit_alpha, alpha_id)
     await asyncio.to_thread(finalize_submission_attempt_sync, account, alpha_id, result)

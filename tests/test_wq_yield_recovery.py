@@ -34,6 +34,15 @@ async def recovery_db(monkeypatch):
 @pytest.mark.asyncio
 async def test_full_yield_recovery_grows_inventory_with_submission_slots_exhausted(recovery_db, monkeypatch):
     for alpha_id in ("already-live-1", "already-live-2"):
+        await record_research_candidates(
+            "primary",
+            [{
+                "alpha_id": alpha_id,
+                "expression": f"rank(ts_mean(field_{alpha_id[-1]}, 20))",
+                "is_metrics": {"sharpe": 1.6, "fitness": 1.2, "returns": 0.08, "turnover": 0.2},
+                "validation": {"status": "ready", "robustness_score": 1.0},
+            }],
+        )
         assert (await reserve_submission("primary", alpha_id))["allowed"] is True
         await finalize_submission_attempt("primary", alpha_id, {"ok": True, "final_status": "ACTIVE"})
     before = await get_submission_policy_status("primary")

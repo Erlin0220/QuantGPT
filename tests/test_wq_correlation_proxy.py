@@ -4,9 +4,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from quantgpt.models import Base
+from quantgpt.models import Base, WQResearchCandidate
 from quantgpt.wq_correlation_proxy import (
     correlation_evidence_is_fresh,
     correlation_priority_multiplier,
@@ -101,8 +102,17 @@ async def test_correlation_evidence_persists_and_is_exposed_in_status(correlatio
         "local_correlation_proxy": {"status": "available", "max_correlation": 0.81, "matching_alpha_id": "active-9", "sample_length": 120, "calculated_at": calculated_at, "official_sc": False},
     }])
     status = await get_submission_policy_status("primary")
-    evidence = status["candidate_queue_top"][0]["local_correlation_proxy"]
-    assert evidence["max_correlation"] == pytest.approx(0.81)
-    assert evidence["matching_alpha_id"] == "active-9"
-    assert evidence["sample_length"] == 120
-    assert evidence["official_sc"] is False
+    assert status["candidate_queue_count"] == 0
+
+    import quantgpt.db as db
+    factory = db._get_session_factory()
+    async with factory() as session:
+        candidate = (await session.execute(
+            select(WQResearchCandidate).where(WQResearchCandidate.alpha_id == "corr-1")
+        )).scalar_one()
+
+    assert candidate.status == "validation_pending"
+    assert candidate.local_correlation == pytest.approx(0.81)
+    assert candidate.local_correlation_alpha_id == "active-9"
+    assert candidate.local_correlation_samples == 120
+    assert "local_correlation_high" in candidate.validation_details["submission_gate"]["blockers"]

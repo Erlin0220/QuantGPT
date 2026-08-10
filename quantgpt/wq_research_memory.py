@@ -455,6 +455,8 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
     provenance_counts = Counter(str(row.provenance_state or "unresolved").lower() for row in rows)
     provenance_reason_counts = Counter(str(row.provenance_reason or "unspecified") for row in rows if str(row.provenance_state or "").lower() != "resolved")
     provenance_resolved = int(provenance_counts.get("resolved", 0))
+    provenance_partial = int(provenance_counts.get("partial", 0))
+    provenance_classified = provenance_resolved + provenance_partial
     metadata_completeness["dataset_id"] = {
         "present": dataset_present,
         "missing": len(rows) - dataset_present,
@@ -463,9 +465,12 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
     }
     provenance_summary = {
         "resolved": provenance_resolved,
-        "partial": int(provenance_counts.get("partial", 0)),
+        "partial": provenance_partial,
         "unresolved": int(provenance_counts.get("unresolved", 0)),
         "resolved_rate": round(provenance_resolved / max(1, len(rows)), 4),
+        "classified": provenance_classified,
+        "classified_rate": round(provenance_classified / max(1, len(rows)), 4),
+        "classified_note": "resolved_and_truthfully_partial_rows_are_valid_provenance;_only_resolved_rows_feed_dataset_specific_learning",
         "unresolved_reasons": dict(provenance_reason_counts),
     }
     min_points_confidence, min_points_samples = _points_feedback_thresholds()
@@ -559,6 +564,7 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
     learning_maturity = build_learning_maturity(
         trials=len(rows),
         provenance_resolved=provenance_resolved,
+        provenance_classified=provenance_classified,
         active_feedback=conversion_feedback,
         points_coverage=points_coverage,
     )

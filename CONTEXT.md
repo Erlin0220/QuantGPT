@@ -66,6 +66,18 @@ _Avoid_: Research slot, simulation quota
 Selecting the next best eligible High-Confidence Candidate after a terminal submission failure so the daily Live Submission target can still be reached.
 _Avoid_: Retry the same Alpha
 
+**Submission-Ready Candidate**:
+A tracked Candidate Inventory entry that is fresh, passes deterministic Sharpe/Fitness/Turnover and robustness readiness, has no official self-correlation failure, and has no fresh high local-correlation or available weak overfitting evidence. Only Submission-Ready Candidates may reserve a formal Submission Slot.
+_Avoid_: Any simulated A-grade Alpha, arbitrary alpha_id
+
+**Submission Reservation Lease**:
+A short-lived local claim on a Submission Slot made immediately before the remote formal submit. The default lease is 15 minutes; an expired lease releases the local slot but the Alpha must be reconciled against BRAIN before it may be retried, preventing both stuck quotas and blind duplicate submissions.
+_Avoid_: Permanent reservation, automatic retry
+
+**Points Sync State**:
+The evidence state for delayed leaderboard Points. `CURRENT` is valid only when both the platform ACTIVE count and leaderboard Alpha count are known and their gap is zero; missing count evidence is `SYNC_UNKNOWN` and must not settle Pending Points attribution.
+_Avoid_: Assume current when counts are missing
+
 ### Research operation
 
 **Replenishment Mode**:

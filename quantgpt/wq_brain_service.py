@@ -638,17 +638,24 @@ def run_account_status(client) -> dict:
             offset += 100
         alpha_summary = fallback_counts
 
+    competition_results = competitions.get("results", []) if isinstance(competitions, dict) else []
+    if not isinstance(competition_results, list):
+        competition_results = []
     challenge = next(
         (
             item
-            for item in competitions.get("results", [])
+            for item in competition_results
             if isinstance(item, dict) and str(item.get("id", "")).lower() == "challenge"
         ),
         {},
     )
-    leaderboard = challenge.get("leaderboard") if isinstance(challenge.get("leaderboard"), dict) else {}
-    progress = challenge.get("progress") if isinstance(challenge.get("progress"), dict) else {}
-    progress_score = progress.get("score") if isinstance(progress.get("score"), dict) else {}
+    challenge = challenge if isinstance(challenge, dict) else {}
+    raw_leaderboard = challenge.get("leaderboard")
+    leaderboard = raw_leaderboard if isinstance(raw_leaderboard, dict) else {}
+    raw_progress = challenge.get("progress")
+    progress = raw_progress if isinstance(raw_progress, dict) else {}
+    raw_progress_score = progress.get("score")
+    progress_score = raw_progress_score if isinstance(raw_progress_score, dict) else {}
 
     points = safe_float(leaderboard.get("score"))
     points_source = "challenge.leaderboard.score" if points is not None else None
@@ -711,6 +718,11 @@ def run_account_status(client) -> dict:
     gold_reached = genius_level == "GOLD"
     if points is None:
         points_status = "UNAVAILABLE"
+    elif active is None or leaderboard_alpha_count is None:
+        # Points can only be considered settled when both platform ACTIVE count
+        # and Challenge leaderboard Alpha count are known. Treat missing count
+        # evidence as an explicit sync-unknown state instead of assuming gap=0.
+        points_status = "SYNC_UNKNOWN"
     elif active_alpha_gap:
         points_status = "LEADERBOARD_LAGGING"
     else:

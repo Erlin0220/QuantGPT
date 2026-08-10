@@ -83,6 +83,25 @@ def test_local_field_registry_resolves_truthful_dataset_without_fabrication():
     assert recovered["provenance_reason"] == "resolved_from_local_field_registry"
 
 
+def test_multi_dataset_expression_is_truthfully_partial_not_unresolved():
+    registry = build_field_metadata_registry(
+        [
+            {"data_fields": ["field_a"], "dataset_id": "dataset-a", "dataset_category": "analyst"},
+            {"data_fields": ["field_b"], "dataset_id": "dataset-b", "dataset_category": "sentiment"},
+        ]
+    )
+    recovered = recover_research_metadata(
+        "rank(ts_corr(field_a, field_b, 20))",
+        {},
+        field_registry=registry,
+    )
+
+    assert recovered["dataset_id"] is None
+    assert recovered["dataset_category"] == "multi_dataset"
+    assert recovered["provenance_state"] == "partial"
+    assert recovered["provenance_reason"] == "multiple_dataset_ids_in_expression"
+
+
 def test_conflicting_registry_evidence_is_discarded_conservatively():
     registry = build_field_metadata_registry(
         [
@@ -242,6 +261,61 @@ async def test_conservative_backfill_enriches_old_rows_without_dataset_fabricati
     assert candidate.data_fields == ["close"]
     assert candidate.dataset_id is None
     assert candidate.lineage_id
+
+
+@pytest.mark.asyncio
+async def test_reconcile_reclassifies_legacy_multi_dataset_rows_as_partial(lineage_db):
+    factory = lineage_db
+    async with factory() as session:
+        session.add_all(
+            [
+                WQResearchTrial(
+                    account="primary",
+                    alpha_id="legacy-multi",
+                    expression="rank(ts_corr(field_a, field_b, 20))",
+                    expression_normalized="rank(ts_corr(field_a,field_b,20))",
+                    family="other",
+                    status="rejected",
+                    data_fields=["field_a", "field_b"],
+                    dataset_id=None,
+                    provenance_state="unresolved",
+                    provenance_reason="multiple_dataset_ids_in_expression",
+                ),
+                WQResearchCandidate(
+                    account="primary",
+                    alpha_id="registry-a",
+                    expression="rank(field_a)",
+                    family="other",
+                    data_fields=["field_a"],
+                    dataset_id="dataset-a",
+                    dataset_category="analyst",
+                    provenance_state="resolved",
+                ),
+                WQResearchCandidate(
+                    account="primary",
+                    alpha_id="registry-b",
+                    expression="rank(field_b)",
+                    family="other",
+                    data_fields=["field_b"],
+                    dataset_id="dataset-b",
+                    dataset_category="sentiment",
+                    provenance_state="resolved",
+                ),
+            ]
+        )
+        await session.commit()
+
+    assert await reconcile_research_metadata("primary") >= 1
+
+    async with factory() as session:
+        row = (
+            await session.execute(select(WQResearchTrial).where(WQResearchTrial.alpha_id == "legacy-multi"))
+        ).scalar_one()
+
+    assert row.dataset_id is None
+    assert row.dataset_category == "multi_dataset"
+    assert row.provenance_state == "partial"
+    assert row.provenance_reason == "multiple_dataset_ids_in_expression"
 
 
 @pytest.mark.asyncio

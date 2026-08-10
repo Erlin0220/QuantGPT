@@ -1,5 +1,7 @@
 """Tests for the local WQ submission budget and delayed-points reconciliation."""
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 import pytest_asyncio
 from sqlalchemy import select
@@ -12,6 +14,7 @@ from quantgpt.wq_submission_policy import (
     get_submission_policy_status,
     observe_account_status,
     reconcile_candidate_platform_statuses,
+    reconcile_submission_reservations,
     record_platform_candidates,
     record_research_candidates,
     reserve_submission,
@@ -34,8 +37,46 @@ async def policy_db(monkeypatch):
     await engine.dispose()
 
 
+def _current_points(points: float, *, active_alpha_gap: int = 0) -> dict:
+    return {
+        "points": points,
+        "points_status": "CURRENT",
+        "leaderboard": {"active_alpha_gap": active_alpha_gap},
+    }
+
+
+async def _seed_ready_candidate(
+    alpha_id: str,
+    *,
+    family: str = "test_family",
+    dataset_id: str = "test_dataset",
+    expression: str | None = None,
+    validation: dict | None = None,
+    local_correlation_proxy: dict | None = None,
+) -> None:
+    field = "field_" + "".join(ch if ch.isalnum() else "_" for ch in alpha_id).lower()
+    candidate = {
+        "alpha_id": alpha_id,
+        "expression": expression or f"rank(ts_mean({field}, 20))",
+        "is_metrics": {
+            "sharpe": 1.6,
+            "fitness": 1.2,
+            "returns": 0.07,
+            "turnover": 0.2,
+            "checks": [{"name": "SELF_CORRELATION", "result": "PASS", "value": 0.3}],
+        },
+        "research_meta": {"family": family, "dataset_id": dataset_id, "data_fields": [field]},
+        "validation": validation or {"status": "ready", "robustness_score": 1.0},
+    }
+    if local_correlation_proxy is not None:
+        candidate["local_correlation_proxy"] = local_correlation_proxy
+    await record_research_candidates("primary", [candidate])
+
+
 @pytest.mark.asyncio
 async def test_daily_budget_blocks_third_submission(policy_db):
+    for alpha_id in ("alpha-1", "alpha-2", "alpha-3"):
+        await _seed_ready_candidate(alpha_id)
     first = await reserve_submission("primary", "alpha-1")
     assert first["allowed"] is True
     await finalize_submission_attempt("primary", "alpha-1", {"ok": True, "final_status": "ACTIVE"})
@@ -91,6 +132,7 @@ async def test_cold_start_inventory_uses_research_readiness_not_probability_tier
 
 @pytest.mark.asyncio
 async def test_lagging_points_do_not_settle_until_leaderboard_is_current(policy_db):
+    await _seed_ready_candidate("alpha-1")
     await reserve_submission("primary", "alpha-1")
     await finalize_submission_attempt("primary", "alpha-1", {"ok": True, "final_status": "ACTIVE"})
 
@@ -102,10 +144,7 @@ async def test_lagging_points_do_not_settle_until_leaderboard_is_current(policy_
     assert lagging["last_settled_delta"] is None
     assert lagging["daily_submission_budget"] == 2
 
-    current = await observe_account_status(
-        "primary",
-        {"points": 4000, "points_status": "CURRENT"},
-    )
+    current = await observe_account_status("primary", _current_points(4000))
     assert current["pending_score_submissions"] == 0
     assert current["last_settled_delta"] == 2000
     assert current["last_settled_submission_count"] == 1
@@ -116,7 +155,7 @@ async def test_lagging_points_do_not_settle_until_leaderboard_is_current(policy_
 async def test_points_settlement_records_confidence_weighted_research_feedback(policy_db):
     import quantgpt.db as db
 
-    await observe_account_status("primary", {"points": 1000, "points_status": "CURRENT"})
+    await observe_account_status("primary", _current_points(1000))
     await record_research_candidates(
         "primary",
         [
@@ -125,12 +164,14 @@ async def test_points_settlement_records_confidence_weighted_research_feedback(p
                 "expression": "rank(ts_mean(field_a, 20))",
                 "is_metrics": {"sharpe": 1.6, "fitness": 1.2, "returns": 0.07, "turnover": 0.2},
                 "research_meta": {"family": "family_a", "dataset_id": "dataset_a", "data_fields": ["field_a"]},
+                "validation": {"status": "ready", "robustness_score": 1.0},
             },
             {
                 "alpha_id": "points-b",
                 "expression": "rank(ts_mean(field_b, 20))",
                 "is_metrics": {"sharpe": 1.7, "fitness": 1.3, "returns": 0.08, "turnover": 0.2},
                 "research_meta": {"family": "family_b", "dataset_id": "dataset_b", "data_fields": ["field_b"]},
+                "validation": {"status": "ready", "robustness_score": 1.0},
             },
         ],
     )
@@ -138,7 +179,7 @@ async def test_points_settlement_records_confidence_weighted_research_feedback(p
         assert (await reserve_submission("primary", alpha_id))["allowed"] is True
         await finalize_submission_attempt("primary", alpha_id, {"ok": True, "final_status": "ACTIVE"})
 
-    settled = await observe_account_status("primary", {"points": 3000, "points_status": "CURRENT"})
+    settled = await observe_account_status("primary", _current_points(3000))
     assert settled["last_settled_delta"] == 2000
     assert settled["last_settled_submission_count"] == 2
 
@@ -173,6 +214,7 @@ async def test_untracked_leaderboard_gap_warns_but_does_not_freeze_new_submissio
     assert lagging["untracked_active_gap"] == 1
     assert lagging["submission_warning"] == "leaderboard_lagging_with_untracked_active_alphas"
 
+    await _seed_ready_candidate("alpha-new")
     allowed_while_lagging = await reserve_submission("primary", "alpha-new")
     assert allowed_while_lagging["allowed"] is True
 
@@ -186,6 +228,7 @@ async def test_untracked_leaderboard_gap_warns_but_does_not_freeze_new_submissio
     )
     assert current["submission_frozen"] is False
 
+    await _seed_ready_candidate("alpha-second")
     second = await reserve_submission("primary", "alpha-second")
     assert second["allowed"] is True
 
@@ -310,6 +353,7 @@ async def test_research_candidate_is_queued_then_removed_when_reserved(policy_db
                     "returns": 0.12,
                     "turnover": 0.25,
                 },
+                "validation": {"status": "ready", "robustness_score": 1.0},
             }
         ],
         settings={"region": "USA", "universe": "TOP3000", "delay": 1},
@@ -453,11 +497,12 @@ async def test_research_memory_persists_family_lineage_and_failure_feedback(poli
 async def test_points_settlement_persists_exact_cohort_and_timing_assumptions(policy_db):
     import quantgpt.db as db
 
-    await observe_account_status("primary", {"points": 1000, "points_status": "CURRENT"})
+    await observe_account_status("primary", _current_points(1000))
     for alpha_id in ("cohort-a", "cohort-b"):
+        await _seed_ready_candidate(alpha_id)
         assert (await reserve_submission("primary", alpha_id))["allowed"] is True
         await finalize_submission_attempt("primary", alpha_id, {"ok": True, "final_status": "ACTIVE"})
-    await observe_account_status("primary", {"points": 3000, "points_status": "CURRENT"})
+    await observe_account_status("primary", _current_points(3000))
 
     factory = db._get_session_factory()
     async with factory() as session:
@@ -471,6 +516,7 @@ async def test_points_settlement_persists_exact_cohort_and_timing_assumptions(po
         details = attempt.attribution_details
         assert details["cohort_alpha_ids"] == ["cohort-a", "cohort-b"]
         assert details["delta"] == 2000.0
+        assert details["sync_evidence"] == {"active_alpha_gap_known": True, "active_alpha_gap": 0}
         assert details["attribution_rule"] == "equal_share_confidence_weighted"
 
 
@@ -478,7 +524,8 @@ async def test_points_settlement_persists_exact_cohort_and_timing_assumptions(po
 async def test_untracked_active_gap_reduces_attribution_confidence(policy_db):
     import quantgpt.db as db
 
-    await observe_account_status("primary", {"points": 1000, "points_status": "CURRENT"})
+    await observe_account_status("primary", _current_points(1000))
+    await _seed_ready_candidate("ambiguous-a")
     assert (await reserve_submission("primary", "ambiguous-a"))["allowed"] is True
     await finalize_submission_attempt("primary", "ambiguous-a", {"ok": True, "final_status": "ACTIVE"})
     await observe_account_status(
@@ -498,7 +545,7 @@ async def test_untracked_active_gap_reduces_attribution_confidence(policy_db):
 async def test_points_feedback_gate_exposes_operator_feedback(policy_db, monkeypatch):
     monkeypatch.setenv("WQ_POINTS_FEEDBACK_MIN_CONFIDENCE", "0.5")
     monkeypatch.setenv("WQ_POINTS_FEEDBACK_MIN_SAMPLES", "1")
-    await observe_account_status("primary", {"points": 1000, "points_status": "CURRENT"})
+    await observe_account_status("primary", _current_points(1000))
     await record_research_candidates(
         "primary",
         [{
@@ -506,11 +553,12 @@ async def test_points_feedback_gate_exposes_operator_feedback(policy_db, monkeyp
             "expression": "rank(ts_mean(field_feedback, 20))",
             "is_metrics": {"sharpe": 1.8, "fitness": 1.3, "returns": 0.09, "turnover": 0.2},
             "research_meta": {"family": "feedback_family", "dataset_id": "feedback_dataset"},
+            "validation": {"status": "ready", "robustness_score": 1.0},
         }],
     )
     assert (await reserve_submission("primary", "feedback-a"))["allowed"] is True
     await finalize_submission_attempt("primary", "feedback-a", {"ok": True, "final_status": "ACTIVE"})
-    await observe_account_status("primary", {"points": 1800, "points_status": "CURRENT"})
+    await observe_account_status("primary", _current_points(1800))
     memory = await load_research_memory("primary")
     assert memory["family_points_feedback_usable"]["feedback_family"] == 800.0
     assert memory["dataset_points_feedback_usable"]["feedback_dataset"] == 800.0
@@ -520,14 +568,147 @@ async def test_points_feedback_gate_exposes_operator_feedback(policy_db, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_zero_delta_lineage_missing_settlement_keeps_uncertainty_visible(policy_db):
-    await observe_account_status("primary", {"points": 1000, "points_status": "CURRENT"})
-    assert (await reserve_submission("primary", "historical-no-lineage"))["allowed"] is True
-    await finalize_submission_attempt("primary", "historical-no-lineage", {"ok": True, "final_status": "ACTIVE"})
-    await observe_account_status("primary", {"points": 1000, "points_status": "CURRENT"})
+async def test_zero_delta_settlement_keeps_uncertainty_visible(policy_db):
+    await observe_account_status("primary", _current_points(1000))
+    await _seed_ready_candidate("historical-zero-delta")
+    assert (await reserve_submission("primary", "historical-zero-delta"))["allowed"] is True
+    await finalize_submission_attempt("primary", "historical-zero-delta", {"ok": True, "final_status": "ACTIVE"})
+    await observe_account_status("primary", _current_points(1000))
     memory = await load_research_memory("primary")
     assert memory["points_feedback_coverage"]["settled_attempts"] == 1
     assert memory["points_feedback_coverage"]["usable_attempts"] == 0
     assert memory["family_points_feedback_usable"] == {}
     assert memory["dataset_points_feedback_usable"] == {}
     assert memory["operator_points_feedback_usable"] == {}
+
+
+@pytest.mark.asyncio
+async def test_current_without_active_gap_never_settles_points(policy_db):
+    await observe_account_status("primary", _current_points(1000))
+    await _seed_ready_candidate("sync-unknown-a")
+    assert (await reserve_submission("primary", "sync-unknown-a"))["allowed"] is True
+    await finalize_submission_attempt("primary", "sync-unknown-a", {"ok": True, "final_status": "ACTIVE"})
+
+    status = await observe_account_status(
+        "primary",
+        {"points": 1500, "points_status": "CURRENT", "leaderboard": {}},
+    )
+
+    assert status["last_points_status"] == "SYNC_UNKNOWN"
+    assert status["points_sync_unknown"] is True
+    assert status["pending_score_submissions"] == 1
+    assert status["last_settled_delta"] is None
+
+
+@pytest.mark.asyncio
+async def test_untracked_alpha_cannot_consume_submission_slot(policy_db):
+    decision = await reserve_submission("primary", "not-in-candidate-queue")
+
+    assert decision["allowed"] is False
+    assert decision["reason"] == "candidate_not_tracked"
+    status = await get_submission_policy_status("primary")
+    assert status["used_submission_slots"] == 0
+
+
+@pytest.mark.asyncio
+async def test_high_local_correlation_is_blocked_before_submission(policy_db):
+    now = datetime.now(timezone.utc).isoformat()
+    await _seed_ready_candidate(
+        "corr-risk",
+        local_correlation_proxy={
+            "status": "available",
+            "max_correlation": 0.82,
+            "matching_alpha_id": "active-peer",
+            "sample_length": 120,
+            "calculated_at": now,
+        },
+    )
+
+    status = await get_submission_policy_status("primary")
+    assert status["candidate_queue_count"] == 0
+    decision = await reserve_submission("primary", "corr-risk")
+    assert decision["allowed"] is False
+    assert "local_correlation_high" in decision["blockers"]
+    assert status["used_submission_slots"] == 0
+
+
+@pytest.mark.asyncio
+async def test_weak_overfitting_evidence_is_blocked_before_submission(policy_db):
+    await _seed_ready_candidate(
+        "overfit-risk",
+        validation={
+            "status": "ready",
+            "robustness_score": 1.0,
+            "overfitting_evidence": {"status": "available", "score": 0.2, "sample_count": 252},
+        },
+    )
+
+    status = await get_submission_policy_status("primary")
+    assert status["candidate_queue_count"] == 0
+    decision = await reserve_submission("primary", "overfit-risk")
+    assert decision["allowed"] is False
+    assert "overfitting_evidence_weak" in decision["blockers"]
+    assert status["used_submission_slots"] == 0
+
+
+@pytest.mark.asyncio
+async def test_stale_reservation_releases_slot_but_requires_platform_recovery(policy_db, monkeypatch):
+    import quantgpt.db as db
+
+    monkeypatch.setenv("WQ_SUBMISSION_RESERVATION_TTL_SECONDS", "120")
+    await _seed_ready_candidate("stale-reservation")
+    assert (await reserve_submission("primary", "stale-reservation"))["allowed"] is True
+
+    factory = db._get_session_factory()
+    async with factory() as session:
+        attempt = (await session.execute(
+            select(WQSubmissionAttempt).where(WQSubmissionAttempt.alpha_id == "stale-reservation")
+        )).scalar_one()
+        attempt.created_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+        await session.commit()
+
+    status = await get_submission_policy_status("primary")
+    assert status["used_submission_slots"] == 0
+    assert "stale-reservation" in status["expired_reservation_ids"]
+    assert status["reservation_ttl_seconds"] == 120
+
+    retry = await reserve_submission("primary", "stale-reservation")
+    assert retry["allowed"] is False
+    assert retry["reason"] == "candidate_not_ready"
+    assert "validation_not_ready" in retry["blockers"]
+
+
+@pytest.mark.asyncio
+async def test_expired_reservation_can_be_revalidated_after_platform_confirms_unsubmitted(policy_db, monkeypatch):
+    import quantgpt.db as db
+
+    monkeypatch.setenv("WQ_SUBMISSION_RESERVATION_TTL_SECONDS", "120")
+    await _seed_ready_candidate("recovered-unsubmitted")
+    assert (await reserve_submission("primary", "recovered-unsubmitted"))["allowed"] is True
+
+    factory = db._get_session_factory()
+    async with factory() as session:
+        attempt = (await session.execute(
+            select(WQSubmissionAttempt).where(WQSubmissionAttempt.alpha_id == "recovered-unsubmitted")
+        )).scalar_one()
+        attempt.created_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+        await session.commit()
+    await get_submission_policy_status("primary")
+
+    platform = {
+        "recovered-unsubmitted": {
+            "ok": True,
+            "status": "UNSUBMITTED",
+            "sc_result": "PASS",
+            "sc_value": 0.3,
+            "sharpe": 1.6,
+            "fitness": 1.2,
+            "returns": 0.08,
+            "turnover": 0.2,
+        }
+    }
+    assert await reconcile_submission_reservations("primary", platform) == 1
+    assert await reconcile_candidate_platform_statuses("primary", platform) == 1
+
+    decision = await reserve_submission("primary", "recovered-unsubmitted")
+    assert decision["allowed"] is True

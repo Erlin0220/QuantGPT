@@ -277,7 +277,12 @@ async def wq_brain_batch_submit(
 
 
 def _run_batch_submit_by_id(task_id: str, alpha_ids: list[str], account: str, user_id: str):
-    from ..wq_submission_policy import finalize_submission_attempt_sync, reserve_submission_sync
+    from ..wq_submission_policy import (
+        _run_coro_sync,
+        finalize_submission_attempt_sync,
+        reconcile_candidate_platform_statuses,
+        reserve_submission_sync,
+    )
 
     task = tasks.get(task_id)
     if not task:
@@ -293,6 +298,11 @@ def _run_batch_submit_by_id(task_id: str, alpha_ids: list[str], account: str, us
             task["error"] = f"WQ BRAIN 认证失败 (account={account})"
             return
 
+        task["status"] = "finalizing"
+        task["progress_message"] = "preflight: refreshing BRAIN metrics and SC state"
+        preflight = run_check_alphas(client, alpha_ids)
+        _run_coro_sync(reconcile_candidate_platform_statuses(account, preflight.get("alphas", {})))
+        task["preflight"] = preflight
         task["status"] = "running"
 
         def on_progress(current, total, aid):
@@ -320,7 +330,7 @@ def _run_batch_submit_by_id(task_id: str, alpha_ids: list[str], account: str, us
             task["status"] = "cancelled"
         else:
             task["status"] = "completed"
-            task["result"] = result
+            task["result"] = {"preflight": preflight, **result}
 
         logger.info(
             f"[{task_id}] batch submit done: "

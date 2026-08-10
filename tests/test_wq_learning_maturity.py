@@ -52,7 +52,8 @@ def test_scheduler_can_return_to_adaptive_after_all_gates_are_ready(monkeypatch)
     monkeypatch.setenv("WQ_SCHEDULER_MIN_PROVENANCE_RATE", "0.80")
     maturity = build_learning_maturity(
         trials=100,
-        provenance_resolved=90,
+        provenance_resolved=60,
+        provenance_classified=90,
         active_feedback={"global": {"samples": 25, "rate": 0.4}},
         points_coverage={"settled_attempts": 3, "usable_attempts": 2},
     )
@@ -64,6 +65,10 @@ def test_scheduler_can_return_to_adaptive_after_all_gates_are_ready(monkeypatch)
     allocation = allocate_research_cells(cells, budget=10, learning_maturity=maturity)
 
     assert maturity["scheduler_adaptation"]["ready"] is True
+    assert maturity["scheduler_adaptation"]["provenance_resolved"] == 60
+    assert maturity["scheduler_adaptation"]["provenance_classified"] == 90
+    assert maturity["scheduler_adaptation"]["provenance_rate"] == 0.9
+    assert maturity["scheduler_adaptation"]["provenance_rate_basis"] == "classified_resolved_or_partial"
     assert allocation["policy"] == "adaptive"
     assert allocation["cooldown_enabled"] is True
     assert allocation["exploitation_slots"] > 0

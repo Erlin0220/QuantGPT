@@ -47,6 +47,11 @@ marketing/
 # Research notes (runtime artifacts, not source code)
 research_notes/
 docs/factor_research/
+.scratch/**/.runtime/
+
+# Local investigation/probe scripts and Windows reserved-name artifacts
+/tmp_*.py
+/NUL
 
 # IDE
 .vscode/

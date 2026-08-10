@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from quantgpt.models import Base, WQResearchTrial
 from quantgpt.wq_failure_taxonomy import classify_research_failure
 from quantgpt.wq_research_memory import load_research_memory, record_research_trials
-from quantgpt.wq_submission_policy import finalize_submission_attempt, reserve_submission
+from quantgpt.wq_submission_policy import finalize_submission_attempt, record_research_candidates, reserve_submission
 
 
 @pytest_asyncio.fixture
@@ -187,6 +187,15 @@ async def test_terminal_submission_failure_updates_latest_research_trial(researc
             ],
             "candidates": [{"alpha_id": "sc-fail-alpha"}],
         },
+    )
+    await record_research_candidates(
+        "primary",
+        [{
+            "alpha_id": "sc-fail-alpha",
+            "expression": "rank(close)",
+            "is_metrics": {"sharpe": 1.6, "fitness": 1.3, "returns": 0.08, "turnover": 0.2},
+            "validation": {"status": "ready", "robustness_score": 1.0},
+        }],
     )
     reservation = await reserve_submission("primary", "sc-fail-alpha")
     assert reservation["allowed"] is True

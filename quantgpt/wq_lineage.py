@@ -159,7 +159,10 @@ def _resolve_registry_provenance(
         return None, None, "unresolved", f"field_registry_miss:{missing}/{len(non_core)}"
     dataset_ids = {str(item.get("dataset_id")) for item in resolved if item}
     if len(dataset_ids) != 1:
-        return None, None, "unresolved", "multiple_dataset_ids_in_expression"
+        # The provenance is still classified even though no truthful single
+        # dataset_id can represent the expression. Keep it out of dataset-level
+        # learning without treating a valid multi-dataset expression as dirty.
+        return None, "multi_dataset", "partial", "multiple_dataset_ids_in_expression"
     categories = {str(item.get("dataset_category")) for item in resolved if item and item.get("dataset_category")}
     return (
         next(iter(dataset_ids)),

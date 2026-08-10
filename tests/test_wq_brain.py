@@ -1,12 +1,11 @@
 """Tests for wq_brain_client.py and routes/wq_brain.py."""
 
 import os
-import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from quantgpt.wq_brain_client import SUBMIT_THRESHOLDS, WQBrainClient, configured_accounts, get_client, is_configured
+from quantgpt.wq_brain_client import WQBrainClient, configured_accounts, get_client, is_configured
 from quantgpt.wq_brain_service import run_account_status, run_list_alphas
 
 pytestmark = pytest.mark.asyncio
@@ -259,6 +258,23 @@ class TestAccountStatusService:
         assert result["challenge"]["submissions"] is False
 
     @patch("quantgpt.wq_brain_service.run_list_alphas")
+    def test_missing_platform_alpha_counts_never_claims_points_current(self, mock_list_alphas):
+        client = MagicMock()
+        client.get_user_info.return_value = {"id": "U1", "geniusLevel": "BRONZE", "level": "BRONZE"}
+        client.get_user_competitions.return_value = {
+            "results": [{"id": "challenge", "leaderboard": {"score": 3949.0, "alphas": 5, "level": "BRONZE"}}],
+        }
+        client.get_user_alpha_summary.return_value = {}
+        mock_list_alphas.return_value = {"ok": False, "error": "platform unavailable"}
+
+        result = run_account_status(client)
+
+        assert result["points"] == 3949
+        assert result["alpha_counts"]["active"] is None
+        assert result["leaderboard"]["active_alpha_gap"] is None
+        assert result["points_status"] == "SYNC_UNKNOWN"
+
+    @patch("quantgpt.wq_brain_service.run_list_alphas")
     def test_falls_back_to_paginated_alpha_counts(self, mock_list_alphas):
         client = MagicMock()
         client.get_user_info.return_value = {"id": "U1", "geniusLevel": None, "level": "NONE"}
@@ -308,16 +324,18 @@ class TestWQBrainSubmitEndpoint:
             assert resp.status_code == 503
 
     async def test_submit_creates_task(self, client):
-        with patch.dict(os.environ, {"WQ_BRAIN_EMAIL": "a@b.com", "WQ_BRAIN_PASSWORD": "pw"}, clear=False):
-            with patch("quantgpt.routes.wq_brain._run_wq_brain_task"):
-                resp = await client.post("/api/v1/wq-brain/submit", json={
-                    "expression": "rank(close)",
-                    "tag": "test-agent",
-                })
-                assert resp.status_code == 202
-                data = resp.json()
-                assert "task_id" in data
-                assert data["status"] == "pending"
+        with (
+            patch.dict(os.environ, {"WQ_BRAIN_EMAIL": "a@b.com", "WQ_BRAIN_PASSWORD": "pw"}, clear=False),
+            patch("quantgpt.routes.wq_brain._run_wq_brain_task"),
+        ):
+            resp = await client.post("/api/v1/wq-brain/submit", json={
+                "expression": "rank(close)",
+                "tag": "test-agent",
+            })
+            assert resp.status_code == 202
+            data = resp.json()
+            assert "task_id" in data
+            assert data["status"] == "pending"
 
 
 class TestSubmittedAlphasEndpoint:
