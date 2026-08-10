@@ -135,7 +135,10 @@ def test_live_dataset_selection_uses_points_feedback_as_weak_tiebreaker():
         {"id": "news_b", "category": {"id": "news"}},
         {"id": "pv1", "category": {"id": "pv"}},
     ]
-    memory = {"dataset_points_feedback": {"news_b": 1500.0}}
+    memory = {
+        "dataset_points_feedback": {"news_b": 1500.0},
+        "learning_maturity": {"points_planner_weighting": {"ready": True}},
+    }
 
     selected = autonomous._select_live_datasets(datasets, memory, limit=2)
 
@@ -143,6 +146,28 @@ def test_live_dataset_selection_uses_points_feedback_as_weak_tiebreaker():
     assert "news_b" in ids
     assert "news_a" not in ids
     assert "pv1" in ids
+
+
+def test_seed_plan_softly_avoids_repeated_negative_structural_motif():
+    memory = {
+        "family_counts": {family: 100 for family in autonomous.FAMILY_SEEDS if family != "price_volume"},
+        "research_memory_guidance": {
+            "negative": [
+                {
+                    "family": "price_volume",
+                    "operator_pattern": "rank>ts_decay_linear",
+                    "failure_reason": "low_fitness",
+                    "count": 40,
+                }
+            ],
+            "overused_structures": [{"operator_pattern": "rank>ts_decay_linear", "trials": 80}],
+        },
+    }
+
+    plan = autonomous.build_seed_plan(memory, limit=2, family_count=1)
+
+    assert plan
+    assert all("ts_decay_linear" not in item["expression"] for item in plan)
 
 
 def test_live_dataset_selection_spreads_across_categories_and_avoids_overused_dataset():
@@ -254,6 +279,34 @@ def test_llm_live_plan_rejects_invented_fields_and_keeps_catalog_expression(monk
     assert plan[0]["data_fields"] == ["real_field"]
 
 
+def test_llm_live_plan_receives_bounded_positive_negative_memory(monkeypatch):
+    from quantgpt import iteration
+
+    class FakeClient:
+        def list_operator_names(self):
+            return {"rank"}
+
+    prompts = []
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setattr(iteration, "_call_llm", lambda _system, user, **_kwargs: prompts.append(user) or "rank(real_field)")
+    memory = {
+        "research_memory_guidance": {
+            "positive": [{"family": "analyst_revision", "dataset_id": "analyst4", "operator_pattern": "rank>ts_mean"}],
+            "negative": [{"family": "price_volume", "dataset_id": "pv1", "operator_pattern": "rank>ts_decay_linear", "failure_reason": "low_fitness", "count": 20}],
+            "overused_structures": [{"operator_pattern": "rank>ts_decay_linear", "trials": 80}],
+        }
+    }
+    fields = [{"id": "real_field", "type": "MATRIX", "dataset": {"id": "analyst4", "category": {"id": "analyst"}}}]
+
+    plan = autonomous.build_llm_live_plan(FakeClient(), fields, seen=set(), limit=1, hypothesis="memory-guided", memory=memory)
+
+    assert len(plan) == 1
+    assert "analyst_revision|analyst4|rank>ts_mean" in prompts[0]
+    assert "price_volume|pv1|rank>ts_decay_linear|low_fitness" in prompts[0]
+    assert plan[0]["dataset_id"] == "analyst4"
+    assert plan[0]["provenance_state"] == "resolved"
+
+
 def test_memory_mutation_plan_reuses_recent_failure_across_runs():
     parent = "rank(ts_mean(returns, 10))"
     memory = {
@@ -278,7 +331,7 @@ def test_memory_mutation_plan_reuses_recent_failure_across_runs():
     assert {item["mutation_type"] for item in plan} == {"widen_windows", "smooth_signal"}
 
 
-def test_targeted_mutations_follow_diagnostics_and_preserve_lineage():
+def test_targeted_mutations_follow_diagnostics_and_preserve_lineage(monkeypatch):
     expression = "rank(ts_mean(returns, 10))"
     result = {
         "expression": expression,
@@ -291,6 +344,7 @@ def test_targeted_mutations_follow_diagnostics_and_preserve_lineage():
         },
     }
 
+    monkeypatch.setenv("WQ_MUTATION_MAX_CHILDREN", "3")
     mutations = autonomous.build_targeted_mutations(result, seen=set(), limit=3)
 
     assert any(item["mutation_type"] == "widen_windows" for item in mutations)

@@ -9,6 +9,7 @@ from collections import Counter
 from typing import Any, Callable
 
 from .wq_brain_service import run_batch_simulation, run_list_alphas
+from .wq_lineage import extract_expression_metadata
 from .wq_mutation_policy import preferred_mutation_classes
 from .wq_operator_registry import validate_wq_expression
 from .wq_research_agent import run_research_batch
@@ -100,10 +101,13 @@ def _family_priority(memory: dict[str, Any], family: str) -> tuple[float, str]:
     promise = sum(top_promises) / len(top_promises) if top_promises else 0.0
     candidate_rate = candidates / max(1.0, trials)
     self_corr_rate = self_corr / max(1.0, trials)
-    points_feedback = max(
-        0.0,
-        float((memory.get("family_points_feedback_usable") or {}).get(family, 0.0) or 0.0),
-    )
+    points_gate = ((memory.get("learning_maturity") or {}).get("points_planner_weighting") or {})
+    points_feedback = 0.0
+    if points_gate.get("ready"):
+        points_feedback = max(
+            0.0,
+            float((memory.get("family_points_feedback_usable") or {}).get(family, 0.0) or 0.0),
+        )
     points_reward = min(1.0, math.log1p(points_feedback / 500.0) * 0.4)
     # Lower is better: retain exploration pressure while exploiting families that
     # have produced candidates, several near-threshold trials, or conservative
@@ -120,7 +124,12 @@ def select_research_families(memory: dict[str, Any] | None = None, count: int = 
         family = str(cell.get("family") or "")
         if family in FAMILY_SEEDS and family not in selected:
             selected.append(family)
-    ordered = sorted(FAMILY_SEEDS, key=lambda family: _family_priority(memory, family))
+    scheduler_gate = ((memory.get("learning_maturity") or {}).get("scheduler_adaptation") or {})
+    if scheduler_gate and not scheduler_gate.get("ready"):
+        family_counts = memory.get("family_counts") or {}
+        ordered = sorted(FAMILY_SEEDS, key=lambda family: (int(family_counts.get(family, 0)), family))
+    else:
+        ordered = sorted(FAMILY_SEEDS, key=lambda family: _family_priority(memory, family))
     for family in ordered:
         if family not in selected:
             selected.append(family)
@@ -190,10 +199,15 @@ def _dataset_category(dataset: dict[str, Any]) -> str:
 def _select_live_datasets(datasets: list[dict[str, Any]], memory: dict[str, Any], *, limit: int = 6) -> list[dict[str, Any]]:
     """Prefer underused datasets while spreading a research round across categories."""
     usage = Counter(str(item.get("dataset_id") or "") for item in (memory.get("recent_trials") or []))
-    points_feedback = {
-        str(key): max(0.0, float(value or 0.0))
-        for key, value in (memory.get("dataset_points_feedback") or {}).items()
-    }
+    points_gate = ((memory.get("learning_maturity") or {}).get("points_planner_weighting") or {})
+    points_feedback = (
+        {
+            str(key): max(0.0, float(value or 0.0))
+            for key, value in (memory.get("dataset_points_feedback") or {}).items()
+        }
+        if points_gate.get("ready")
+        else {}
+    )
     by_category: dict[str, list[dict[str, Any]]] = {}
     for dataset in datasets:
         dataset_id = str(dataset.get("id") or "").strip()
@@ -356,6 +370,7 @@ def build_live_field_plan(
             seen.add(normalized)
             dataset = field.get("dataset") or {}
             dataset_id = dataset.get("id") if isinstance(dataset, dict) else dataset
+            dataset_category = _dataset_category(dataset) if isinstance(dataset, dict) else None
             plan.append(
                 {
                     "expression": expression,
@@ -364,8 +379,12 @@ def build_live_field_plan(
                     "hypothesis": hypothesis,
                     "parent_expression": None,
                     "mutation_type": "live_field_seed",
+                    "planner_strategy": "live_catalog_coverage",
                     "data_fields": [field_id],
                     "dataset_id": dataset_id,
+                    "dataset_category": dataset_category,
+                    "provenance_state": "resolved" if dataset_id else "unresolved",
+                    "provenance_reason": "live_field_catalog" if dataset_id else "live_field_missing_dataset_id",
                 }
             )
             if len(plan) >= limit:
@@ -386,6 +405,7 @@ def build_llm_live_plan(
     seen: set[str],
     limit: int,
     hypothesis: str,
+    memory: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Use the existing DeepSeek/OpenAI-compatible provider as a bounded WQ idea generator."""
     if limit <= 0 or not os.environ.get("DEEPSEEK_API_KEY") or not fields:
@@ -408,6 +428,16 @@ def build_llm_live_plan(
         "Use only the supplied data fields/operators. Prefer simple economically interpretable structures, 2-5 operator calls, "
         "and avoid pure lookback parameter tuning. Do not use assignments, semicolons, local-only indicators, or invented fields."
     )
+    guidance = (memory or {}).get("research_memory_guidance") or {}
+    positive = [
+        f"{item.get('family')}|{item.get('dataset_id') or 'unresolved'}|{item.get('operator_pattern')}"
+        for item in (guidance.get("positive") or [])[:6]
+    ]
+    negative = [
+        f"{item.get('family')}|{item.get('dataset_id') or 'unresolved'}|{item.get('operator_pattern')}|{item.get('failure_reason')}"
+        for item in (guidance.get("negative") or [])[:8]
+    ]
+    overused = [str(item.get("operator_pattern") or "") for item in (guidance.get("overused_structures") or [])[:6]]
     out: list[dict[str, Any]] = []
     for index in range(limit):
         avoid = [item for item in list(seen)[-8:]]
@@ -415,6 +445,9 @@ def build_llm_live_plan(
             f"Research objective: {hypothesis}\n"
             f"Allowed MATRIX fields: {field_text}\n"
             f"Allowed operators: {operator_text}\n"
+            f"Positive structural memory to learn from (do not copy literally): {positive}\n"
+            f"Negative structural memory to avoid repeating: {negative}\n"
+            f"Overused operator structures to diversify away from softly: {overused}\n"
             f"Already researched normalized expressions to avoid: {avoid}\n"
             f"Generate idea {index + 1} with a distinct structural hypothesis."
         )
@@ -438,15 +471,33 @@ def build_llm_live_plan(
             continue
         seen.add(normalized)
         used = [field for field in usable_fields if re.search(rf"(?<![a-z0-9_]){re.escape(field.lower())}(?![a-z0-9_])", normalized)]
+        used_items = [item for item in fields if _live_field_id(item) in used]
+        dataset_ids = {
+            str((item.get("dataset") or {}).get("id") or "")
+            for item in used_items
+            if isinstance(item.get("dataset") or {}, dict) and (item.get("dataset") or {}).get("id")
+        }
+        categories = {
+            _dataset_category(item.get("dataset") or {})
+            for item in used_items
+            if isinstance(item.get("dataset") or {}, dict)
+        }
+        dataset_id = next(iter(dataset_ids)) if len(dataset_ids) == 1 else None
+        dataset_category = next(iter(categories)) if len(categories) == 1 else None
         out.append(
             {
                 "expression": expression,
-                "family": _classify_live_field(next((item for item in fields if _live_field_id(item) in used), {})),
+                "family": _classify_live_field(used_items[0] if used_items else {}),
                 "generation": 1,
                 "hypothesis": hypothesis,
                 "parent_expression": None,
                 "mutation_type": "llm_live_field_seed",
+                "planner_strategy": "positive_negative_memory_llm",
                 "data_fields": used,
+                "dataset_id": dataset_id,
+                "dataset_category": dataset_category,
+                "provenance_state": "resolved" if dataset_id else "unresolved",
+                "provenance_reason": "live_field_catalog" if dataset_id else "llm_uses_multiple_or_unresolved_datasets",
             }
         )
     return out
@@ -525,6 +576,32 @@ def build_seed_plan(
     plan: list[dict[str, Any]] = []
     offsets = Counter()
     pools = {family: _family_seed_pool(family, generation, hypothesis) for family in families}
+    guidance = memory.get("research_memory_guidance") or {}
+    negative_counts = Counter(
+        str(item.get("operator_pattern") or "")
+        for item in (guidance.get("negative") or [])
+        for _ in range(max(1, int(item.get("count") or 1)))
+        if item.get("operator_pattern")
+    )
+    positive_patterns = Counter(
+        str(item.get("operator_pattern") or "")
+        for item in (guidance.get("positive") or [])
+        if item.get("operator_pattern")
+    )
+    overused_counts = {
+        str(item.get("operator_pattern") or ""): int(item.get("trials") or 0)
+        for item in (guidance.get("overused_structures") or [])
+        if item.get("operator_pattern")
+    }
+
+    def memory_penalty(item: dict[str, Any]) -> tuple[float, str]:
+        pattern = str(extract_expression_metadata(item["expression"]).get("operator_pattern") or "")
+        penalty = negative_counts.get(pattern, 0) * 2.0 + min(5.0, overused_counts.get(pattern, 0) / 20.0)
+        penalty -= min(2.0, positive_patterns.get(pattern, 0) * 0.5)
+        return penalty, normalize_wq_expression(item["expression"])
+
+    for family in pools:
+        pools[family].sort(key=memory_penalty)
 
     while len(plan) < max(1, int(limit)):
         added = False
@@ -602,10 +679,22 @@ def build_targeted_mutations(
     expression = str(result.get("expression") or "").strip()
     if not expression or limit <= 0:
         return []
+    try:
+        max_children = max(1, min(4, int(os.environ.get("WQ_MUTATION_MAX_CHILDREN", "2"))))
+    except (TypeError, ValueError):
+        max_children = 2
+    try:
+        max_generation = max(1, min(5, int(os.environ.get("WQ_MUTATION_MAX_GENERATION", "3"))))
+    except (TypeError, ValueError):
+        max_generation = 3
+    limit = min(int(limit), max_children)
 
     meta = result.get("research_meta") or {}
     family = str(meta.get("family") or classify_wq_family(expression))
     generation = int(meta.get("generation") or 1) + 1
+    if generation > max_generation:
+        result["mutation_route_terminal_reason"] = "mutation_generation_budget_exhausted"
+        return []
     targets = list(result.get("mutation_targets") or [])
     metrics = result.get("is_metrics") or {}
     sharpe = _safe_metric(metrics.get("sharpe"))
@@ -663,6 +752,11 @@ def build_targeted_mutations(
                 "mutation_type": mutation_type,
                 "mutation_reason": rationale,
                 "planner_strategy": "failure_directed",
+                "data_fields": [] if family_override else list(meta.get("data_fields") or []),
+                "dataset_id": None if family_override else meta.get("dataset_id"),
+                "dataset_category": None if family_override else meta.get("dataset_category"),
+                "provenance_state": "unresolved" if family_override else meta.get("provenance_state"),
+                "provenance_reason": "economic_reseed_requires_new_provenance" if family_override else meta.get("provenance_reason"),
                 "failure_trigger": sorted({entry["reason"] if isinstance(entry, dict) else str(entry) for entry in (result.get("failure_reasons") or [])} | ({str(result.get("failure_reason"))} if result.get("failure_reason") else set())),
             }
         )
@@ -714,6 +808,7 @@ def build_memory_mutation_plan(
                 "fitness": trial.get("fitness"),
                 "returns": trial.get("returns"),
                 "turnover": trial.get("turnover"),
+                "checks": list(((trial.get("failure_evidence") or {}).get("checks")) or []),
             },
             "mutation_targets": targets,
             "failure_reason": trial.get("failure_reason"),
@@ -724,6 +819,12 @@ def build_memory_mutation_plan(
                 "generation": generation,
                 "hypothesis": trial.get("hypothesis") or hypothesis,
                 "lineage_id": trial.get("lineage_id"),
+                "data_fields": list(trial.get("data_fields") or []),
+                "dataset_id": trial.get("dataset_id"),
+                "dataset_category": trial.get("dataset_category"),
+                "provenance_state": trial.get("provenance_state"),
+                "provenance_reason": trial.get("provenance_reason"),
+                "operator_pattern": trial.get("operator_pattern"),
             },
         }
         variants = build_targeted_mutations(
@@ -757,6 +858,14 @@ def _build_next_generation_plan(
                 limit=per_parent_limit,
                 hypothesis=hypothesis,
             )
+            if mutations:
+                item["directed_mutation_routed"] = True
+                item["mutation_children"] = int(item.get("mutation_children") or 0) + len(mutations)
+                item["mutation_route_reason"] = ",".join(
+                    sorted({str(value.get("mutation_reason") or "") for value in mutations if value.get("mutation_reason")})
+                )[:500]
+            elif item.get("mutation_targets") and not item.get("mutation_route_terminal_reason"):
+                item["mutation_route_terminal_reason"] = "no_novel_actionable_mutation"
             for mutation in mutations:
                 if mutation not in plan:
                     plan.append(mutation)
@@ -900,6 +1009,7 @@ def run_autonomous_research(
         memory.get("research_cells") or [],
         budget=first_budget,
         inventory_mode=inventory_mode,
+        learning_maturity=memory.get("learning_maturity") or {},
     )
     memory["adaptive_allocation"] = adaptive_allocation
     seen = set(normalized)
@@ -907,7 +1017,10 @@ def run_autonomous_research(
     # Exploit promising failures, but reserve most first-generation budget for
     # genuinely new account-visible BRAIN fields and a small number of LLM ideas.
     # Static seeds remain a safe fallback when Data Explorer or the LLM is unavailable.
-    memory_parent_budget = min(first_budget, max(0, first_budget // 3))
+    memory_parent_budget = min(
+        first_budget,
+        max(0, math.ceil(first_budget * (0.45 if inventory_mode == "REPLENISHMENT" else 1 / 3))),
+    )
     memory_plan = build_memory_mutation_plan(
         memory,
         seen=seen,
@@ -935,6 +1048,7 @@ def run_autonomous_research(
         seen=seen,
         limit=llm_budget,
         hypothesis=goal,
+        memory=memory,
     )
     seed_memory = dict(memory)
     seed_memory["normalized_expressions"] = sorted(seen)
@@ -1054,8 +1168,14 @@ def run_autonomous_research(
     validation_simulations = 0
     ranked_primary_candidates = sorted(all_candidates, key=_rank_result, reverse=True)
     result_by_alpha = {str(item.get("alpha_id")): item for item in all_results if item.get("alpha_id")}
+    try:
+        base_validation_cap = max(1, min(8, int(os.environ.get("WQ_RESEARCH_VALIDATION_CAP", "2"))))
+        replenishment_cap = max(base_validation_cap, min(8, int(os.environ.get("WQ_REPLENISHMENT_VALIDATION_CAP", "4"))))
+    except (TypeError, ValueError):
+        base_validation_cap, replenishment_cap = 2, 4
+    validation_cap = replenishment_cap if inventory_mode == "REPLENISHMENT" else base_validation_cap
     for index, candidate in enumerate(ranked_primary_candidates):
-        if index < 2 and not (check_cancelled and check_cancelled()):
+        if index < validation_cap and not (check_cancelled and check_cancelled()):
             validation = validate_candidate_robustness(
                 client,
                 candidate,
@@ -1072,7 +1192,7 @@ def run_autonomous_research(
                 "status": "validation_pending",
                 "robustness_score": None,
                 "validation_simulations": 0,
-                "reason": "per-round validation cap",
+                "reason": f"per-round validation cap:{validation_cap}",
             }
         candidate["validation"] = validation
         validation_simulations += int(validation.get("validation_simulations") or 0)
@@ -1106,6 +1226,9 @@ def run_autonomous_research(
         "tag": tag,
         "selected_families": selected_families,
         "adaptive_allocation": adaptive_allocation,
+        "learning_maturity": memory.get("learning_maturity") or {},
+        "research_memory_guidance": memory.get("research_memory_guidance") or {},
+        "inventory_mode": inventory_mode,
         "live_catalog": live_catalog,
         "memory_before": {
             "trials": int(memory.get("trials") or 0),
@@ -1126,6 +1249,8 @@ def run_autonomous_research(
             "validation_pending": sum(1 for item in ranked_primary_candidates if (item.get("validation") or {}).get("status") == "validation_pending"),
             "robustness_failed": sum(1 for item in ranked_primary_candidates if (item.get("validation") or {}).get("status") == "robustness_fail"),
             "validation_simulations": validation_simulations,
+            "validation_cap": validation_cap,
+            "directed_mutation_routes": sum(1 for item in all_results if item.get("directed_mutation_routed")),
             "simulation_failed": len(all_failed),
             "invalid": len(all_invalid),
             "formally_submitted": 0,

@@ -28,6 +28,7 @@ from .wq_candidate_calibration import (
 )
 from .wq_correlation_proxy import correlation_priority_multiplier
 from .wq_failure_taxonomy import classify_research_failure
+from .wq_learning_maturity import active_feedback_gate
 from .wq_lineage import lineage_id_for, parent_lineage_id_for, recover_research_metadata
 from .wq_overfitting import overfitting_priority_multiplier
 from .wq_research_scheduler import research_cell_key
@@ -106,6 +107,19 @@ def _candidate_is_fresh(candidate: WQResearchCandidate, *, now: datetime | None 
     current = _normalized_datetime(now or datetime.now(timezone.utc)) or datetime.now(timezone.utc)
     age_hours = max(0.0, (current - validated_at).total_seconds() / 3600.0)
     return age_hours <= float(_configured_inventory_policy()["freshness_hours"])
+
+
+def _candidate_research_ready(candidate: WQResearchCandidate) -> bool:
+    """Cold-start inventory eligibility from deterministic research-readiness evidence."""
+    return (
+        str(candidate.status or "").lower() == "queued"
+        and str(candidate.validation_status or "").lower() == "ready"
+        and float(candidate.sharpe or 0.0) >= 1.25
+        and float(candidate.fitness or 0.0) >= 1.0
+        and 0.01 <= float(candidate.turnover or 0.0) <= 0.7
+        and str(candidate.sc_status or "").upper() != "FAIL"
+        and _candidate_is_fresh(candidate)
+    )
 
 
 def _structure_signature(expression: str) -> str:
@@ -231,14 +245,15 @@ async def _load_conversion_feedback(session, account: str) -> dict[str, Any]:
     for attempt, candidate in grouped_result.all():
         is_positive = int(str(attempt.status or "").upper() in _TERMINAL_POSITIVE_STATUSES)
         cell_key = research_cell_key(candidate)
-        for mapping, key in (
-            (family_counts, str(candidate.family or "unknown")),
-            (dataset_counts, str(candidate.dataset_id or "unknown")),
-            (cell_counts, cell_key),
-        ):
-            values = mapping.setdefault(key, [0, 0])
-            values[0] += is_positive
-            values[1] += 1
+        family_key = str(candidate.family or "unknown")
+        values = family_counts.setdefault(family_key, [0, 0])
+        values[0] += is_positive
+        values[1] += 1
+        if str(candidate.provenance_state or "").lower() == "resolved" and candidate.dataset_id:
+            for mapping, key in ((dataset_counts, str(candidate.dataset_id)), (cell_counts, cell_key)):
+                grouped = mapping.setdefault(key, [0, 0])
+                grouped[0] += is_positive
+                grouped[1] += 1
         if candidate.active_probability is not None:
             resolved_predictions.append((float(candidate.active_probability), bool(is_positive)))
 
@@ -353,7 +368,9 @@ async def record_research_candidates(
             candidate["research_meta"] = meta
             calibration = calibrate_active_probability(candidate, conversion_feedback)
             active_probability = float(calibration["probability"])
-            priority_score = _priority_score(candidate) * (0.75 + active_probability * 0.5)
+            priority_score = _priority_score(candidate)
+            if calibration.get("decision_weight_enabled"):
+                priority_score *= 0.75 + active_probability * 0.5
             structure_signature = str(meta.get("structure_signature") or _structure_signature(expression))
             lineage_id = str(meta.get("lineage_id") or "") or lineage_id_for(expression, settings=settings, metadata=meta)
             parent_lineage_id = str(meta.get("parent_lineage_id") or "") or parent_lineage_id_for(
@@ -391,6 +408,9 @@ async def record_research_candidates(
                 "structure_signature": structure_signature,
                 "data_fields": list(meta.get("data_fields") or []),
                 "dataset_id": str(meta.get("dataset_id") or "") or None,
+                "dataset_category": str(meta.get("dataset_category") or "") or None,
+                "provenance_state": str(meta.get("provenance_state") or "") or None,
+                "provenance_reason": str(meta.get("provenance_reason") or "") or None,
                 "lineage_id": lineage_id,
                 "parent_lineage_id": parent_lineage_id,
                 "operator_pattern": str(meta.get("operator_pattern") or "") or None,
@@ -610,7 +630,9 @@ async def reconcile_candidate_platform_statuses(
                 candidate.probability_support = int(calibration["support"])
                 candidate.probability_provenance = str(calibration["provenance"])
                 candidate.calibration_details = calibration
-                candidate.priority_score = _priority_score(evidence) * (0.75 + candidate.active_probability * 0.5)
+                candidate.priority_score = _priority_score(evidence)
+                if calibration.get("decision_weight_enabled"):
+                    candidate.priority_score *= 0.75 + candidate.active_probability * 0.5
                 updated += 1
         await session.commit()
     return updated
@@ -921,6 +943,11 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             )
         )
         pending_score = int(pending_result.scalar() or 0)
+        conversion_feedback = await _load_conversion_feedback(session, account)
+        active_gate = active_feedback_gate(conversion_feedback)
+        candidate_order = [WQResearchCandidate.priority_score.desc(), WQResearchCandidate.created_at.asc()]
+        if active_gate["ready"]:
+            candidate_order.insert(0, WQResearchCandidate.active_probability.desc())
 
         queue_result = await session.execute(
             select(WQResearchCandidate)
@@ -928,11 +955,7 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
                 WQResearchCandidate.account == account,
                 WQResearchCandidate.status == "queued",
             )
-            .order_by(
-                WQResearchCandidate.active_probability.desc(),
-                WQResearchCandidate.priority_score.desc(),
-                WQResearchCandidate.created_at.asc(),
-            )
+            .order_by(*candidate_order)
         )
         queued_candidates = list(queue_result.scalars().all())
         queue_count = len(queued_candidates)
@@ -966,6 +989,10 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
                 },
                 "data_fields": list(item.data_fields or []),
                 "dataset_id": item.dataset_id,
+                "dataset_category": item.dataset_category,
+                "provenance_state": item.provenance_state,
+                "provenance_reason": item.provenance_reason,
+                "research_readiness_eligible": _candidate_research_ready(item),
                 "tag": item.tag,
             }
             for item in queued_candidates[:5]
@@ -973,8 +1000,9 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
 
         confidence_counts = {"S": 0, "A": 0, "B": 0}
         ready_confidence_counts = {"S": 0, "A": 0, "B": 0}
-        high_confidence_count = 0
+        calibrated_high_confidence_count = 0
         stale_high_confidence_count = 0
+        research_readiness_eligible_count = 0
         for candidate in queued_candidates:
             tier = str(candidate.confidence_tier or "B").upper()
             if tier not in confidence_counts:
@@ -982,12 +1010,16 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             confidence_counts[tier] += 1
             if str(candidate.validation_status or "").lower() == "ready":
                 ready_confidence_counts[tier] += 1
+                if _candidate_research_ready(candidate):
+                    research_readiness_eligible_count += 1
                 if tier in {"S", "A"}:
                     if _candidate_is_fresh(candidate):
-                        high_confidence_count += 1
+                        calibrated_high_confidence_count += 1
                     else:
                         stale_high_confidence_count += 1
 
+        eligibility_mode = "calibrated_active_probability" if active_gate["ready"] else "research_readiness"
+        high_confidence_count = calibrated_high_confidence_count if active_gate["ready"] else research_readiness_eligible_count
         inventory_policy = _configured_inventory_policy()
         inventory_floor = int(inventory_policy["floor"])
         target_low = int(inventory_policy["target_low"])
@@ -1015,6 +1047,9 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             "target_high": target_high,
             "freshness_hours": float(inventory_policy["freshness_hours"]),
             "high_confidence_count": high_confidence_count,
+            "calibrated_high_confidence_count": calibrated_high_confidence_count,
+            "research_readiness_eligible_count": research_readiness_eligible_count,
+            "eligibility_mode": eligibility_mode,
             "stale_high_confidence_count": stale_high_confidence_count,
             "deficit": inventory_deficit,
             "mode": research_mode,
@@ -1022,6 +1057,7 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             "ready_tier_counts": ready_confidence_counts,
             "queue_count": queue_count,
             "top_candidates": top_candidates,
+            "active_outcome_learning_gate": active_gate,
         }
 
         await session.commit()
@@ -1042,6 +1078,9 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             },
             "candidate_queue_top": top_candidates,
             "high_confidence_candidate_count": high_confidence_count,
+            "research_readiness_eligible_count": research_readiness_eligible_count,
+            "candidate_eligibility_mode": eligibility_mode,
+            "active_outcome_learning_gate": active_gate,
             "inventory_deficit": inventory_deficit,
             "research_mode": research_mode,
             "inventory": inventory_status,

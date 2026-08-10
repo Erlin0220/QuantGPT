@@ -104,6 +104,18 @@ def _migrate_add_columns(connection):
         "ALTER TABLE wq_research_candidates ADD COLUMN dataset_id VARCHAR(100)",
     )
     _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "dataset_category",
+        "ALTER TABLE wq_research_candidates ADD COLUMN dataset_category VARCHAR(100)",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "provenance_state",
+        "ALTER TABLE wq_research_candidates ADD COLUMN provenance_state VARCHAR(20)",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_candidates", "provenance_reason",
+        "ALTER TABLE wq_research_candidates ADD COLUMN provenance_reason VARCHAR(200)",
+    )
+    _add_column_if_missing(
         connection, inspector, "wq_research_candidates", "validation_status",
         "ALTER TABLE wq_research_candidates ADD COLUMN validation_status VARCHAR(30) NOT NULL DEFAULT 'research_pass'",
     )
@@ -174,6 +186,18 @@ def _migrate_add_columns(connection):
     _add_column_if_missing(
         connection, inspector, "wq_research_trials", "dataset_id",
         "ALTER TABLE wq_research_trials ADD COLUMN dataset_id VARCHAR(100)",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_trials", "dataset_category",
+        "ALTER TABLE wq_research_trials ADD COLUMN dataset_category VARCHAR(100)",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_trials", "provenance_state",
+        "ALTER TABLE wq_research_trials ADD COLUMN provenance_state VARCHAR(20)",
+    )
+    _add_column_if_missing(
+        connection, inspector, "wq_research_trials", "provenance_reason",
+        "ALTER TABLE wq_research_trials ADD COLUMN provenance_reason VARCHAR(200)",
     )
     _add_column_if_missing(
         connection, inspector, "wq_research_trials", "failure_stage",

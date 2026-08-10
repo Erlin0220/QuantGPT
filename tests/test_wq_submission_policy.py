@@ -66,6 +66,30 @@ async def test_empty_inventory_enters_replenishment_mode(policy_db):
 
 
 @pytest.mark.asyncio
+async def test_cold_start_inventory_uses_research_readiness_not_probability_tier(policy_db):
+    await record_research_candidates(
+        "primary",
+        [
+            {
+                "alpha_id": "cold-ready",
+                "expression": "rank(ts_mean(volume, 20))",
+                "is_metrics": {"sharpe": 1.3, "fitness": 1.02, "returns": 0.03, "turnover": 0.2, "checks": []},
+                "research_meta": {"family": "price_volume", "dataset_id": "pv1", "data_fields": ["volume"]},
+                "validation": {"status": "ready", "robustness_score": 0.4},
+            }
+        ],
+    )
+    status = await get_submission_policy_status("primary")
+
+    assert status["active_outcome_learning_gate"]["ready"] is False
+    assert status["candidate_eligibility_mode"] == "research_readiness"
+    assert status["research_readiness_eligible_count"] == 1
+    assert status["inventory"]["high_confidence_count"] == 1
+    assert status["inventory"]["deficit"] == 29
+    assert status["candidate_queue_top"][0]["research_readiness_eligible"] is True
+
+
+@pytest.mark.asyncio
 async def test_lagging_points_do_not_settle_until_leaderboard_is_current(policy_db):
     await reserve_submission("primary", "alpha-1")
     await finalize_submission_attempt("primary", "alpha-1", {"ok": True, "final_status": "ACTIVE"})

@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from quantgpt.models import Base, WQResearchCandidate, WQResearchTrial
 from quantgpt.wq_lineage import (
+    build_field_metadata_registry,
     extract_expression_metadata,
     lineage_id_for,
     recover_research_metadata,
@@ -59,6 +60,38 @@ def test_metadata_recovery_never_invents_dataset():
     assert recovered["family"] == "price_volume"
     assert recovered["data_fields"] == ["volume"]
     assert recovered["dataset_id"] is None
+    assert recovered["provenance_state"] == "partial"
+    assert recovered["provenance_reason"] == "core_or_derived_fields_have_no_truthful_platform_dataset"
+
+
+def test_local_field_registry_resolves_truthful_dataset_without_fabrication():
+    registry = build_field_metadata_registry(
+        [
+            {"data_fields": ["analyst_eps_revision"], "dataset_id": "analyst42", "dataset_category": "analyst"},
+            {"data_fields": ["close"], "dataset_id": None},
+        ]
+    )
+    recovered = recover_research_metadata(
+        "rank(ts_mean(analyst_eps_revision, 20))",
+        {},
+        field_registry=registry,
+    )
+
+    assert recovered["dataset_id"] == "analyst42"
+    assert recovered["dataset_category"] == "analyst"
+    assert recovered["provenance_state"] == "resolved"
+    assert recovered["provenance_reason"] == "resolved_from_local_field_registry"
+
+
+def test_conflicting_registry_evidence_is_discarded_conservatively():
+    registry = build_field_metadata_registry(
+        [
+            {"data_fields": ["shared_field"], "dataset_id": "dataset-a"},
+            {"data_fields": ["shared_field"], "dataset_id": "dataset-b"},
+        ]
+    )
+
+    assert "shared_field" not in registry
 
 
 def test_explicit_dataset_and_fields_win_over_derived_evidence():
@@ -241,3 +274,5 @@ async def test_memory_reports_metadata_completeness(lineage_db):
     assert completeness["operator_pattern"]["rate"] == 1.0
     assert completeness["dataset_id"]["present"] == 1
     assert completeness["dataset_id"]["missing"] == 1
+    assert memory["provenance"]["resolved"] == 1
+    assert memory["provenance"]["partial"] == 1

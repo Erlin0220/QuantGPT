@@ -5,6 +5,7 @@ import os
 from typing import Any
 
 from .wq_correlation_proxy import correlation_evidence_is_fresh, correlation_priority_multiplier
+from .wq_learning_maturity import active_feedback_gate
 from .wq_overfitting import overfitting_priority_multiplier
 from .wq_research_scheduler import research_cell_key
 
@@ -145,12 +146,25 @@ def _feedback_choice(candidate: dict[str, Any], feedback: dict[str, Any]) -> tup
 
 
 def calibrate_active_probability(candidate: dict[str, Any], feedback: dict[str, Any] | None = None) -> dict[str, Any]:
+    feedback = feedback or {}
     baseline = quality_baseline(candidate)
+    gate = active_feedback_gate(feedback)
     if baseline.get("hard_fail"):
         probability = 0.0
-        return {"probability": probability, "tier": confidence_tier(probability), "baseline": baseline, "support": 0, "provenance": baseline["hard_fail"], "empirical_rate": None, "outcome_weight": 0.0}
-    empirical_rate, support, provenance = _feedback_choice(candidate, feedback or {})
-    outcome_weight = min(0.45, 0.45 * support / (support + 8.0)) if support > 0 else 0.0
+        return {
+            "probability": probability,
+            "tier": confidence_tier(probability),
+            "baseline": baseline,
+            "support": 0,
+            "provenance": baseline["hard_fail"],
+            "empirical_rate": None,
+            "outcome_weight": 0.0,
+            "decision_weight_enabled": False,
+            "learning_gate": gate,
+        }
+    empirical_rate, support, provenance = _feedback_choice(candidate, feedback)
+    raw_outcome_weight = min(0.45, 0.45 * support / (support + 8.0)) if support > 0 else 0.0
+    outcome_weight = raw_outcome_weight if gate["ready"] else 0.0
     probability = _clamp01(float(baseline["score"]) * (1.0 - outcome_weight) + empirical_rate * outcome_weight)
     return {
         "probability": round(probability, 4),
@@ -160,6 +174,9 @@ def calibrate_active_probability(candidate: dict[str, Any], feedback: dict[str, 
         "provenance": provenance,
         "empirical_rate": round(empirical_rate, 4),
         "outcome_weight": round(outcome_weight, 4),
+        "raw_outcome_weight": round(raw_outcome_weight, 4),
+        "decision_weight_enabled": bool(gate["ready"]),
+        "learning_gate": gate,
     }
 
 

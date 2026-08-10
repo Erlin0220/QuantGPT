@@ -13,8 +13,11 @@ from .db import _get_session_factory
 from .models import WQResearchCandidate, WQResearchStageEvent, WQResearchTrial, WQSubmissionAttempt
 from .wq_candidate_funnel import funnel_events_for_trial, summarize_funnel
 from .wq_failure_taxonomy import classify_research_failure
+from .wq_learning_maturity import build_learning_maturity
 from .wq_lineage import (
+    build_field_metadata_registry,
     classify_family_from_metadata,
+    extract_expression_metadata,
     lineage_id_for,
     parent_lineage_id_for,
     recover_research_metadata,
@@ -127,6 +130,9 @@ def _trial_from_item(
         settings=dict(item.get("settings") or settings or {}),
         data_fields=list(meta.get("data_fields") or []),
         dataset_id=str(meta.get("dataset_id") or "") or None,
+        dataset_category=str(meta.get("dataset_category") or "") or None,
+        provenance_state=str(meta.get("provenance_state") or "") or None,
+        provenance_reason=str(meta.get("provenance_reason") or "") or None,
         lineage_id=lineage_id,
         parent_lineage_id=parent_lineage_id,
         operator_pattern=str(meta.get("operator_pattern") or "") or None,
@@ -233,17 +239,23 @@ async def record_research_trials(
 
 
 async def reconcile_research_metadata(account: str = "primary") -> int:
-    """Conservatively backfill lineage/metadata only when stored evidence is sufficient."""
+    """Conservatively backfill lineage/provenance from persisted truthful evidence."""
     factory = _get_session_factory()
     updated = 0
     async with factory() as session:
         trial_result = await session.execute(select(WQResearchTrial).where(WQResearchTrial.account == account))
-        for row in trial_result.scalars().all():
+        candidate_result = await session.execute(select(WQResearchCandidate).where(WQResearchCandidate.account == account))
+        trials = list(trial_result.scalars().all())
+        candidates = list(candidate_result.scalars().all())
+        field_registry = build_field_metadata_registry([*trials, *candidates])
+
+        def apply(row: Any, *, settings: dict[str, Any]) -> bool:
             recovered = recover_research_metadata(
                 row.expression,
                 {
                     "family": row.family,
                     "dataset_id": row.dataset_id,
+                    "dataset_category": getattr(row, "dataset_category", None),
                     "data_fields": list(row.data_fields or []),
                     "hypothesis": row.hypothesis,
                     "parent_expression": row.parent_expression,
@@ -254,86 +266,52 @@ async def reconcile_research_metadata(account: str = "primary") -> int:
                     "allocation_cell": row.allocation_cell,
                     "parent_lineage_id": row.parent_lineage_id,
                 },
+                field_registry=field_registry,
             )
             values = {
                 "family": recovered.get("family"),
                 "data_fields": list(recovered.get("data_fields") or []),
-                "lineage_id": row.lineage_id or lineage_id_for(row.expression, settings=dict(row.settings or {}), metadata=recovered),
-                "parent_lineage_id": row.parent_lineage_id
-                or parent_lineage_id_for(row.parent_expression, settings=dict(row.settings or {})),
+                "dataset_id": recovered.get("dataset_id"),
+                "dataset_category": recovered.get("dataset_category"),
+                "provenance_state": recovered.get("provenance_state"),
+                "provenance_reason": recovered.get("provenance_reason"),
+                "lineage_id": row.lineage_id or lineage_id_for(row.expression, settings=settings, metadata=recovered),
+                "parent_lineage_id": row.parent_lineage_id or parent_lineage_id_for(row.parent_expression, settings=settings),
                 "operator_pattern": row.operator_pattern or recovered.get("operator_pattern"),
                 "operators": list(row.operators or recovered.get("operators") or []),
             }
+            if hasattr(row, "structure_signature"):
+                values["structure_signature"] = row.structure_signature or recovered.get("structure_signature")
             changed = False
             for key, value in values.items():
                 current = getattr(row, key)
-                if key == "family":
-                    if str(current or "unknown") not in {"", "unknown"}:
-                        continue
-                    if value not in (None, "", "unknown"):
-                        setattr(row, key, value)
-                        changed = True
+                if key == "family" and str(current or "unknown") not in {"", "unknown"}:
                     continue
                 if key == "data_fields" and current:
                     continue
-                if current in (None, "", []) and value not in (None, "", []):
+                if key in {"dataset_id", "dataset_category"} and current not in (None, "", "unknown"):
+                    continue
+                if key in {"provenance_state", "provenance_reason"}:
+                    if current != value and value not in (None, ""):
+                        setattr(row, key, value)
+                        changed = True
+                    continue
+                if current in (None, "", [], "unknown") and value not in (None, "", [], "unknown"):
                     setattr(row, key, value)
                     changed = True
-            updated += int(changed)
+            return changed
 
-        candidate_result = await session.execute(
-            select(WQResearchCandidate).where(WQResearchCandidate.account == account)
-        )
-        for row in candidate_result.scalars().all():
-            settings = {
+        for row in trials:
+            updated += int(apply(row, settings=dict(row.settings or {})))
+        for row in candidates:
+            updated += int(apply(row, settings={
                 "region": row.region,
                 "universe": row.universe,
                 "delay": row.delay,
                 "decay": row.decay,
                 "neutralization": row.neutralization,
                 "truncation": row.truncation,
-            }
-            recovered = recover_research_metadata(
-                row.expression,
-                {
-                    "family": row.family,
-                    "dataset_id": row.dataset_id,
-                    "data_fields": list(row.data_fields or []),
-                    "hypothesis": row.hypothesis,
-                    "parent_expression": row.parent_expression,
-                    "generation": row.generation,
-                    "mutation_type": row.mutation_type,
-                    "mutation_reason": row.mutation_reason,
-                    "planner_strategy": row.planner_strategy,
-                    "allocation_cell": row.allocation_cell,
-                    "parent_lineage_id": row.parent_lineage_id,
-                },
-            )
-            values = {
-                "family": recovered.get("family"),
-                "data_fields": list(recovered.get("data_fields") or []),
-                "lineage_id": row.lineage_id or lineage_id_for(row.expression, settings=settings, metadata=recovered),
-                "parent_lineage_id": row.parent_lineage_id or parent_lineage_id_for(row.parent_expression, settings=settings),
-                "operator_pattern": row.operator_pattern or recovered.get("operator_pattern"),
-                "operators": list(row.operators or recovered.get("operators") or []),
-                "structure_signature": row.structure_signature or recovered.get("structure_signature"),
-            }
-            changed = False
-            for key, value in values.items():
-                current = getattr(row, key)
-                if key == "family":
-                    if str(current or "unknown") not in {"", "unknown"}:
-                        continue
-                    if value not in (None, "", "unknown"):
-                        setattr(row, key, value)
-                        changed = True
-                    continue
-                if key == "data_fields" and current:
-                    continue
-                if current in (None, "", []) and value not in (None, "", []):
-                    setattr(row, key, value)
-                    changed = True
-            updated += int(changed)
+            }))
         if updated:
             await session.commit()
     return updated
@@ -452,7 +430,8 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
             continue
         reason = str(row.failure_reason)
         failure_reason_family_counts.setdefault(reason, Counter())[str(row.family or "unknown")] += 1
-        failure_reason_dataset_counts.setdefault(reason, Counter())[str(row.dataset_id or "unknown")] += 1
+        if str(row.provenance_state or "").lower() == "resolved" and row.dataset_id:
+            failure_reason_dataset_counts.setdefault(reason, Counter())[str(row.dataset_id)] += 1
     normalized = {str(row.expression_normalized or "") for row in rows if row.expression_normalized}
     metadata_fields = (
         "lineage_id",
@@ -473,11 +452,21 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
         for field, count in completeness_counts.items()
     }
     dataset_present = sum(1 for row in rows if row.dataset_id)
+    provenance_counts = Counter(str(row.provenance_state or "unresolved").lower() for row in rows)
+    provenance_reason_counts = Counter(str(row.provenance_reason or "unspecified") for row in rows if str(row.provenance_state or "").lower() != "resolved")
+    provenance_resolved = int(provenance_counts.get("resolved", 0))
     metadata_completeness["dataset_id"] = {
         "present": dataset_present,
         "missing": len(rows) - dataset_present,
         "rate": round(dataset_present / max(1, len(rows)), 4),
-        "note": "unknown_is_valid_when_dataset_provenance_is_not_derivable",
+        "note": "unresolved_dataset_identity_is_excluded_from_dataset_specific_learning",
+    }
+    provenance_summary = {
+        "resolved": provenance_resolved,
+        "partial": int(provenance_counts.get("partial", 0)),
+        "unresolved": int(provenance_counts.get("unresolved", 0)),
+        "resolved_rate": round(provenance_resolved / max(1, len(rows)), 4),
+        "unresolved_reasons": dict(provenance_reason_counts),
     }
     min_points_confidence, min_points_samples = _points_feedback_thresholds()
     family_points_attribution: Counter[str] = Counter()
@@ -510,21 +499,24 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
         if candidate is None:
             continue
         family = str(candidate.family or "unknown")
-        dataset_id = str(candidate.dataset_id or "unknown")
+        dataset_id = str(candidate.dataset_id or "")
+        dataset_resolved = str(candidate.provenance_state or "").lower() == "resolved" and bool(dataset_id)
         operator_pattern = str(candidate.operator_pattern or "unknown")
         family_points_attribution[family] += share
         family_points_feedback[family] += weighted
-        dataset_points_attribution[dataset_id] += share
-        dataset_points_feedback[dataset_id] += weighted
+        if dataset_resolved:
+            dataset_points_attribution[dataset_id] += share
+            dataset_points_feedback[dataset_id] += weighted
         operator_points_attribution[operator_pattern] += share
         operator_points_feedback[operator_pattern] += weighted
         if share > 0.0 and confidence >= min_points_confidence:
             usable_attempts += 1
             usable_family_feedback[family] += weighted
-            usable_dataset_feedback[dataset_id] += weighted
+            if dataset_resolved:
+                usable_dataset_feedback[dataset_id] += weighted
+                usable_dataset_samples[dataset_id] += 1
             usable_operator_feedback[operator_pattern] += weighted
             usable_family_samples[family] += 1
-            usable_dataset_samples[dataset_id] += 1
             usable_operator_samples[operator_pattern] += 1
 
     def usable_groups(feedback: Counter[str], samples: Counter[str]) -> dict[str, float]:
@@ -553,6 +545,76 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
     prevention_rules = compile_prevention_rules(mutation_rows)
     mutation_outcomes = summarize_mutation_outcomes(mutation_rows)
 
+    points_coverage = {
+        "settled_attempts": len(attribution_rows),
+        "settlement_cohorts": len(settlement_cohorts),
+        "settled_points_total": round(settled_points_total, 4),
+        "confidence_weighted_points_total": round(confidence_weighted_points_total, 4),
+        "mean_confidence": round(confidence_total / max(1, len(attribution_rows)), 4),
+        "usable_attempts": usable_attempts,
+        "usable_family_groups": len(family_points_feedback_usable),
+        "usable_dataset_groups": len(dataset_points_feedback_usable),
+        "usable_operator_groups": len(operator_points_feedback_usable),
+    }
+    learning_maturity = build_learning_maturity(
+        trials=len(rows),
+        provenance_resolved=provenance_resolved,
+        active_feedback=conversion_feedback,
+        points_coverage=points_coverage,
+    )
+    field_registry = build_field_metadata_registry([*rows, *candidate_rows])
+
+    positive_rows = sorted(
+        [row for row in rows if str(row.status or "").lower() == "candidate" or (float(row.fitness or 0.0) >= 0.85 and float(row.sharpe or 0.0) >= 1.0)],
+        key=lambda row: (float(row.fitness or 0.0), float(row.sharpe or 0.0)),
+        reverse=True,
+    )[:16]
+    positive_memory = [
+        {
+            "family": row.family,
+            "dataset_id": row.dataset_id if str(row.provenance_state or "").lower() == "resolved" else None,
+            "operator_pattern": row.operator_pattern,
+            "structure_signature": extract_expression_metadata(row.expression).get("structure_signature"),
+            "mutation_type": row.mutation_type,
+            "status": row.status,
+            "fitness": row.fitness,
+            "sharpe": row.sharpe,
+        }
+        for row in positive_rows
+    ]
+    negative_counter: Counter[tuple[str, str | None, str, str]] = Counter()
+    for row in rows:
+        if not row.failure_reason:
+            continue
+        negative_counter[(
+            str(row.family or "unknown"),
+            str(row.dataset_id) if str(row.provenance_state or "").lower() == "resolved" and row.dataset_id else None,
+            str(row.operator_pattern or extract_expression_metadata(row.expression).get("operator_pattern") or "unknown"),
+            str(row.failure_reason),
+        )] += 1
+    negative_memory = [
+        {
+            "family": family,
+            "dataset_id": dataset_id,
+            "operator_pattern": operator_pattern,
+            "failure_reason": failure_reason,
+            "count": count,
+        }
+        for (family, dataset_id, operator_pattern, failure_reason), count in negative_counter.most_common(16)
+        if count >= 2
+    ]
+    structure_counts = Counter(str(row.operator_pattern or extract_expression_metadata(row.expression).get("operator_pattern") or "unknown") for row in rows)
+    research_memory_guidance = {
+        "positive": positive_memory,
+        "negative": negative_memory,
+        "overused_structures": [
+            {"operator_pattern": pattern, "trials": count}
+            for pattern, count in structure_counts.most_common(12)
+            if pattern != "unknown"
+        ],
+        "policy": "bounded_positive_negative_structural_memory",
+    }
+
     recent_trials = [
         {
             "expression": row.expression,
@@ -574,6 +636,9 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
             "mutation_targets": list(row.mutation_targets or []),
             "data_fields": list(row.data_fields or []),
             "dataset_id": row.dataset_id,
+            "dataset_category": row.dataset_category,
+            "provenance_state": row.provenance_state,
+            "provenance_reason": row.provenance_reason,
             "lineage_id": row.lineage_id,
             "parent_lineage_id": row.parent_lineage_id,
             "operator_pattern": row.operator_pattern,
@@ -602,8 +667,12 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
             reason: dict(counts) for reason, counts in failure_reason_dataset_counts.items()
         },
         "metadata_completeness": metadata_completeness,
+        "provenance": provenance_summary,
+        "field_registry": field_registry,
         "research_cells": research_cells,
         "learning_funnel": learning_funnel,
+        "learning_maturity": learning_maturity,
+        "research_memory_guidance": research_memory_guidance,
         "local_correlation_risk": {
             "available": local_correlation_available,
             "high_risk": local_correlation_high_risk,
@@ -643,17 +712,7 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
             "planner_uses_only_gated_feedback": True,
             "high_capacity_models_deferred": ["RUDDER", "ARES", "QR_DQN"],
         },
-        "points_feedback_coverage": {
-            "settled_attempts": len(attribution_rows),
-            "settlement_cohorts": len(settlement_cohorts),
-            "settled_points_total": round(settled_points_total, 4),
-            "confidence_weighted_points_total": round(confidence_weighted_points_total, 4),
-            "mean_confidence": round(confidence_total / max(1, len(attribution_rows)), 4),
-            "usable_attempts": usable_attempts,
-            "usable_family_groups": len(family_points_feedback_usable),
-            "usable_dataset_groups": len(dataset_points_feedback_usable),
-            "usable_operator_groups": len(operator_points_feedback_usable),
-        },
+        "points_feedback_coverage": points_coverage,
         "active_conversion": conversion_feedback,
         "active_conversion_rate": (conversion_feedback.get("global") or {}).get("rate"),
         "terminal_submission_samples": (conversion_feedback.get("global") or {}).get("samples", 0),

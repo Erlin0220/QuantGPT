@@ -83,11 +83,6 @@ def funnel_events_for_trial(trial: Any, item: dict[str, Any]) -> list[dict[str, 
         )
     )
 
-    if failure_stage == "metrics":
-        events.append(_event(STAGE_DIAGNOSIS, "failed", reason=failure_reason))
-        return events
-    events.append(_event(STAGE_DIAGNOSIS, "passed"))
-
     generation = int(getattr(trial, "generation", 0) or 0)
     mutation_type = str(getattr(trial, "mutation_type", "") or "") or None
     if generation > 0 or mutation_type:
@@ -103,6 +98,24 @@ def funnel_events_for_trial(trial: Any, item: dict[str, Any]) -> list[dict[str, 
                 },
             )
         )
+
+    if failure_stage == "metrics":
+        if item.get("directed_mutation_routed"):
+            events.append(
+                _event(
+                    STAGE_DIAGNOSIS,
+                    "routed",
+                    reason=failure_reason,
+                    details={
+                        "mutation_children": int(item.get("mutation_children") or 0),
+                        "route_reason": item.get("mutation_route_reason"),
+                    },
+                )
+            )
+            return events
+        events.append(_event(STAGE_DIAGNOSIS, "failed", reason=failure_reason))
+        return events
+    events.append(_event(STAGE_DIAGNOSIS, "passed"))
 
     validation = item.get("validation") if isinstance(item.get("validation"), dict) else {}
     validation_status = str((validation or {}).get("status") or "").lower()
@@ -143,7 +156,7 @@ def summarize_funnel(events: Iterable[Any]) -> dict[str, Any]:
         if stage not in counts:
             continue
         counts[stage]["entered"] += 1
-        if outcome in {"passed", "failed"}:
+        if outcome in {"passed", "failed", "routed"}:
             counts[stage][outcome] += 1
 
     stages: dict[str, dict[str, Any]] = {}
@@ -153,13 +166,15 @@ def summarize_funnel(events: Iterable[Any]) -> dict[str, Any]:
         entered = int(counts[stage]["entered"])
         passed = int(counts[stage]["passed"])
         failed = int(counts[stage]["failed"])
-        pass_rate = round(passed / entered, 4) if entered else None
+        routed = int(counts[stage]["routed"])
+        pass_rate = round((passed + routed) / entered, 4) if entered else None
         failure_rate = failed / entered if entered else 0.0
         stages[stage] = {
             "label": STAGE_LABELS[stage],
             "entered": entered,
             "passed": passed,
             "failed": failed,
+            "routed": routed,
             "pass_rate": pass_rate,
         }
         if entered and failed and failure_rate > bottleneck_failure_rate:

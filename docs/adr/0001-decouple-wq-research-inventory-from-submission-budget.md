@@ -1,0 +1,3 @@
+# Decouple WorldQuant research inventory from the daily submission budget
+
+WorldQuant research must continue independently of formal submission completion. Reaching the daily target of two Live Submissions stops additional formal submissions for that day, but it must not stop research: QuantGPT maintains an Inventory Floor of 30 High-Confidence Candidates, targets 40–50 during normal operation, and continues in Exploration Mode above that band so submission failures can be refilled quickly and future inventory quality can improve. This deliberately trades additional Simulation work for lower submission-day latency and resilience to a high SC/terminal-failure rate.

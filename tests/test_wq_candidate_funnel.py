@@ -85,7 +85,7 @@ async def test_compile_failure_terminates_at_compile(funnel_db):
 
 
 @pytest.mark.asyncio
-async def test_metric_rejection_terminates_at_failure_diagnosis(funnel_db):
+async def test_unrouted_metric_rejection_terminates_at_failure_diagnosis(funnel_db):
     await record_research_trials(
         "primary",
         {
@@ -104,6 +104,32 @@ async def test_metric_rejection_terminates_at_failure_diagnosis(funnel_db):
     assert stages[-1] == (STAGE_DIAGNOSIS, "failed")
     assert events[-1].failure_reason in {"low_fitness", "low_sharpe"}
     assert STAGE_CANDIDATE not in [event.stage for event in events]
+
+
+@pytest.mark.asyncio
+async def test_metric_rejection_can_route_into_directed_mutation(funnel_db):
+    await record_research_trials(
+        "primary",
+        {
+            "results": [
+                {
+                    "alpha_id": "repairable",
+                    "expression": "rank(ts_mean(close, 20))",
+                    "is_metrics": {"sharpe": 1.3, "fitness": 0.8, "turnover": 0.55, "checks": []},
+                    "directed_mutation_routed": True,
+                    "mutation_children": 2,
+                    "mutation_route_reason": "reduce trading intensity",
+                }
+            ]
+        },
+    )
+    events = await _events(funnel_db)
+    diagnosis = next(event for event in events if event.stage == STAGE_DIAGNOSIS)
+
+    assert diagnosis.outcome == "routed"
+    assert diagnosis.details["mutation_children"] == 2
+    memory = await load_research_memory("primary")
+    assert memory["candidate_funnel"]["all_time"]["stages"][STAGE_DIAGNOSIS]["routed"] == 1
 
 
 @pytest.mark.asyncio

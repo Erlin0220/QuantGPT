@@ -63,6 +63,7 @@ def preferred_mutation_classes(item: dict[str, Any]) -> list[dict[str, str]]:
     sharpe = _safe_float(metrics.get("sharpe") if isinstance(metrics, dict) else item.get("sharpe"))
     fitness = _safe_float(metrics.get("fitness") if isinstance(metrics, dict) else item.get("fitness"))
     turnover = _safe_float(metrics.get("turnover") if isinstance(metrics, dict) else item.get("turnover"))
+    returns = _safe_float(metrics.get("returns") if isinstance(metrics, dict) else item.get("returns"))
     out: list[dict[str, str]] = []
 
     def add(mutation_class: str, rationale: str) -> None:
@@ -89,12 +90,21 @@ def preferred_mutation_classes(item: dict[str, Any]) -> list[dict[str, str]]:
     high_turnover = "turnover_high" in reasons or (turnover is not None and turnover > 0.7)
     if high_turnover:
         add("widen_windows", "high turnover should first be reduced through slower lookbacks/decay-equivalent smoothing")
+    if "weight_concentration" in reasons:
+        add("weight_control", "concentration failure should first reduce extreme cross-sectional weights")
     if "low_fitness" in reasons or (fitness is not None and fitness < 1.0):
-        add("smooth_signal", "low Fitness should first test lower trading intensity while preserving the hypothesis")
-        if sharpe is not None and sharpe >= 1.25:
-            add("cost_reduction", "acceptable Sharpe with low Fitness is usually a turnover/cost problem")
+        if high_turnover or (turnover is not None and turnover > 0.5):
+            add("smooth_signal", "low Fitness with elevated turnover should first lower trading intensity")
+            if sharpe is not None and sharpe < 0:
+                add("signal_quality", "negative Sharpe needs signal-direction/quality repair in parallel with turnover control")
+            add("cost_reduction", "preserve the signal while testing a lower-cost implementation")
+        elif sharpe is not None and sharpe >= 1.25 and returns is not None and returns <= 0:
+            add("economic_reseed", "acceptable Sharpe but non-positive returns calls for a different economic/data formulation")
+        elif sharpe is not None and sharpe >= 1.25:
+            add("smooth_signal", "acceptable Sharpe with low Fitness should first test lower trading intensity without changing the hypothesis")
+            add("cost_reduction", "then improve implementation efficiency without assuming one decay tweak is universally correct")
         else:
-            add("signal_quality", "if smoothing does not rescue Fitness, improve signal quality next")
+            add("signal_quality", "weak Sharpe and low Fitness indicate signal-quality repair before parameter tuning")
     if high_turnover:
         add("conditional_execution", "trade only in informative regimes before unrelated random mutation")
     if "turnover_low" in reasons or (turnover is not None and 0 < turnover < 0.01):
