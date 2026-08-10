@@ -43,6 +43,8 @@ _DEFAULT_FRESHNESS_HOURS = 24.0
 _DEFAULT_RESERVATION_TTL_SECONDS = 15 * 60
 _TERMINAL_POSITIVE_STATUSES = {"ACTIVE"}
 _TERMINAL_NEGATIVE_STATUSES = {"SC_FAIL", "OTHER_FAIL"}
+_SLOT_CONSUMING_STATUSES = {"RESERVED", "RESERVATION_EXPIRED", "SUBMIT_UNKNOWN", "SC_PENDING", "ACTIVE"}
+_RECONCILIATION_REQUIRED_STATUSES = {"RESERVATION_EXPIRED", "SUBMIT_UNKNOWN"}
 _CONVERSION_PRIOR_ALPHA = 2.0
 _CONVERSION_PRIOR_BETA = 2.0
 _CONVERSION_GROUP_PRIOR_STRENGTH = 4.0
@@ -380,7 +382,7 @@ async def get_submission_reservation_recovery_ids(account: str = "primary", *, l
             select(WQSubmissionAttempt.alpha_id)
             .where(
                 WQSubmissionAttempt.account == account,
-                WQSubmissionAttempt.status == "RESERVATION_EXPIRED",
+                WQSubmissionAttempt.status.in_(sorted(_RECONCILIATION_REQUIRED_STATUSES)),
             )
             .order_by(WQSubmissionAttempt.created_at.desc())
             .limit(max(1, min(100, int(limit))))
@@ -408,7 +410,7 @@ async def reconcile_submission_reservations(
                 .where(
                     WQSubmissionAttempt.account == account,
                     WQSubmissionAttempt.alpha_id == str(alpha_id),
-                    WQSubmissionAttempt.status.in_(["RESERVED", "RESERVATION_EXPIRED"]),
+                    WQSubmissionAttempt.status.in_(["RESERVED", "RESERVATION_EXPIRED", "SUBMIT_UNKNOWN", "SC_PENDING"]),
                 )
                 .order_by(WQSubmissionAttempt.created_at.desc())
                 .limit(1)
@@ -427,9 +429,9 @@ async def reconcile_submission_reservations(
                 attempt.score_state = "NOT_ELIGIBLE"
                 attempt.detail = "recovered stale reservation: platform SELF_CORRELATION failed"
             elif platform_status == "UNSUBMITTED":
-                attempt.status = "RESERVATION_EXPIRED"
+                attempt.status = "UNSUBMITTED_CONFIRMED"
                 attempt.score_state = "NOT_ELIGIBLE"
-                attempt.detail = "recovered stale reservation: platform confirms UNSUBMITTED; safe to revalidate"
+                attempt.detail = "platform confirms UNSUBMITTED; formal slot released and candidate may be revalidated"
             elif platform_status:
                 attempt.status = "SC_PENDING"
                 attempt.score_state = "PENDING"
@@ -721,7 +723,13 @@ async def reconcile_candidate_platform_statuses(
                 select(WQResearchCandidate).where(
                     WQResearchCandidate.account == account,
                     WQResearchCandidate.alpha_id == str(alpha_id),
-                    WQResearchCandidate.status.in_(["queued", "reserved", "validation_pending", "robustness_fail"]),
+                    WQResearchCandidate.status.in_([
+                        "queued",
+                        "reserved",
+                        "validation_pending",
+                        "robustness_fail",
+                        "submission_unknown",
+                    ]),
                 )
             )
             candidate = result.scalar_one_or_none()
@@ -945,6 +953,23 @@ async def reserve_submission(
         state.daily_budget = budget
         await _expire_stale_reservations(session, account)
 
+        unresolved_result = await session.execute(
+            select(WQSubmissionAttempt.alpha_id).where(
+                WQSubmissionAttempt.account == account,
+                WQSubmissionAttempt.status.in_(sorted(_RECONCILIATION_REQUIRED_STATUSES)),
+            )
+        )
+        unresolved_ids = [str(value) for value in unresolved_result.scalars().all() if value]
+        if unresolved_ids:
+            await session.commit()
+            return {
+                "allowed": False,
+                "reason": "submission_reconciliation_required",
+                "alpha_id": alpha_id,
+                "recovery_alpha_ids": sorted(set(unresolved_ids)),
+                "detail": "unresolved prior formal submissions must be reconciled with BRAIN before reserving another slot",
+            }
+
         readiness_result = await session.execute(
             select(WQResearchCandidate).where(
                 WQResearchCandidate.account == account,
@@ -982,7 +1007,8 @@ async def reserve_submission(
             .limit(1)
         )
         prior = prior_result.scalar_one_or_none()
-        if prior is not None and str(prior.status or "").upper() != "RESERVATION_EXPIRED":
+        prior_status = str(prior.status or "").upper() if prior is not None else ""
+        if prior is not None and prior_status != "UNSUBMITTED_CONFIRMED":
             return {
                 "allowed": False,
                 "reason": "alpha_already_submitted_or_pending",
@@ -996,7 +1022,7 @@ async def reserve_submission(
             select(func.count()).where(
                 WQSubmissionAttempt.account == account,
                 WQSubmissionAttempt.submission_day == day,
-                WQSubmissionAttempt.status.in_(["RESERVED", "ACTIVE", "SC_PENDING"]),
+                WQSubmissionAttempt.status.in_(sorted(_SLOT_CONSUMING_STATUSES)),
             )
         )
         used = int(count_result.scalar() or 0)
@@ -1011,15 +1037,15 @@ async def reserve_submission(
                 "remaining_slots": 0,
             }
 
-        if prior is not None and str(prior.status or "").upper() == "RESERVATION_EXPIRED":
-            # The DB intentionally keeps one audit row per Alpha/day. After an
-            # authoritative UNSUBMITTED recheck, renew that row instead of
-            # inserting a duplicate that violates the uniqueness constraint.
+        if prior is not None and prior_status == "UNSUBMITTED_CONFIRMED" and prior.submission_day == day:
+            # Keep one audit row per Alpha/day. A platform-confirmed UNSUBMITTED
+            # attempt did not consume a remote slot, so the same-day row can be
+            # safely renewed. Cross-day retries get a new audit row.
             attempt = prior
             now = datetime.now(timezone.utc)
             attempt.status = "RESERVED"
             attempt.score_state = "PENDING"
-            attempt.detail = "reservation lease renewed after platform confirmed UNSUBMITTED"
+            attempt.detail = "reservation renewed after platform-confirmed UNSUBMITTED"
             attempt.points_at_reservation = points
             attempt.points_status_at_reservation = points_status
             attempt.attributed_points_share = None
@@ -1054,8 +1080,48 @@ async def reserve_submission(
         }
 
 
+def _normalized_submission_result_status(result: dict[str, Any]) -> str:
+    """Map remote submission observations to fail-closed local ledger states."""
+    explicit = str(result.get("final_status") or "").upper()
+    platform_status = str(result.get("platform_status") or "").upper()
+    detail = str(result.get("detail") or "")
+
+    if explicit in {"UNSUBMITTED", "UNSUBMITTED_CONFIRMED"}:
+        return "UNSUBMITTED_CONFIRMED"
+    if explicit in {"ERROR", "TIMEOUT", "UNKNOWN", "SUBMIT_UNKNOWN"}:
+        return "SUBMIT_UNKNOWN"
+    if explicit == "OTHER_FAIL" and not result.get("confirmed_not_submitted"):
+        return "SUBMIT_UNKNOWN"
+    if explicit:
+        return explicit
+    if result.get("ok"):
+        return "ACTIVE"
+    if "SC FAIL" in detail.upper():
+        return "SC_FAIL"
+    if result.get("confirmed_not_submitted") or platform_status == "UNSUBMITTED":
+        return "UNSUBMITTED_CONFIRMED"
+    return "SUBMIT_UNKNOWN"
+
+
+def _monotonic_submission_status(current: str, incoming: str) -> str:
+    """Prevent uncertain observations from downgrading authoritative terminal states."""
+    current = str(current or "").upper()
+    incoming = str(incoming or "").upper()
+    if current == "ACTIVE":
+        return "ACTIVE"
+    if incoming == "ACTIVE":
+        return "ACTIVE"
+    if current == "SC_FAIL" and incoming != "ACTIVE":
+        return "SC_FAIL"
+    if incoming == "SC_FAIL":
+        return "SC_FAIL"
+    if current == "SC_PENDING" and incoming == "SUBMIT_UNKNOWN":
+        return "SC_PENDING"
+    return incoming or current or "SUBMIT_UNKNOWN"
+
+
 async def finalize_submission_attempt(account: str, alpha_id: str, result: dict[str, Any]) -> None:
-    """Persist the remote outcome for a previously reserved submission slot."""
+    """Persist a remote outcome without letting uncertainty release or corrupt a formal slot."""
     factory = _get_session_factory()
     async with factory() as session:
         attempt_result = await session.execute(
@@ -1071,21 +1137,19 @@ async def finalize_submission_attempt(account: str, alpha_id: str, result: dict[
         if attempt is None:
             return
 
-        final_status = str(result.get("final_status") or "").upper()
-        if not final_status:
-            detail = str(result.get("detail") or "")
-            if result.get("ok"):
-                final_status = "ACTIVE"
-            elif "SC FAIL" in detail.upper():
-                final_status = "SC_FAIL"
-            elif str(result.get("platform_status") or "").upper() == "TIMEOUT":
-                final_status = "SC_PENDING"
-            else:
-                final_status = "OTHER_FAIL"
+        observed_status = _normalized_submission_result_status(result)
+        previous_status = str(attempt.status or "").upper()
+        final_status = _monotonic_submission_status(previous_status, observed_status)
+        transition_applied = final_status != previous_status or final_status == observed_status
 
         attempt.status = final_status
-        attempt.detail = str(result.get("detail") or "")[:4000]
-        attempt.score_state = "PENDING" if final_status in {"ACTIVE", "SC_PENDING"} else "NOT_ELIGIBLE"
+        if transition_applied:
+            attempt.detail = str(result.get("detail") or "")[:4000]
+        attempt.score_state = (
+            "PENDING"
+            if final_status in {"ACTIVE", "SC_PENDING", "SUBMIT_UNKNOWN"}
+            else "NOT_ELIGIBLE"
+        )
 
         candidate_result = await session.execute(
             select(WQResearchCandidate).where(
@@ -1097,6 +1161,11 @@ async def finalize_submission_attempt(account: str, alpha_id: str, result: dict[
         if candidate is not None:
             if final_status in {"ACTIVE", "SC_PENDING"}:
                 candidate.status = "submitted"
+            elif final_status == "SUBMIT_UNKNOWN":
+                candidate.status = "submission_unknown"
+            elif final_status == "UNSUBMITTED_CONFIRMED":
+                candidate.status = "validation_pending"
+                candidate.validation_status = "platform_recheck"
             elif final_status == "SC_FAIL":
                 candidate.status = "sc_fail"
             else:
@@ -1236,12 +1305,19 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
     async with factory() as session:
         state = await _get_or_create_state(session, account)
         expired_reservation_ids = await _expire_stale_reservations(session, account)
+        recovery_result = await session.execute(
+            select(WQSubmissionAttempt.alpha_id).where(
+                WQSubmissionAttempt.account == account,
+                WQSubmissionAttempt.status.in_(sorted(_RECONCILIATION_REQUIRED_STATUSES)),
+            )
+        )
+        reconciliation_required_ids = sorted({str(value) for value in recovery_result.scalars().all() if value})
 
         attempts_result = await session.execute(
             select(func.count()).where(
                 WQSubmissionAttempt.account == account,
                 WQSubmissionAttempt.submission_day == day,
-                WQSubmissionAttempt.status.in_(["RESERVED", "ACTIVE", "SC_PENDING"]),
+                WQSubmissionAttempt.status.in_(sorted(_SLOT_CONSUMING_STATUSES)),
             )
         )
         used_slots = int(attempts_result.scalar() or 0)
@@ -1260,7 +1336,7 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             select(func.count()).where(
                 WQSubmissionAttempt.account == account,
                 WQSubmissionAttempt.score_state == "PENDING",
-                WQSubmissionAttempt.status.in_(["RESERVED", "ACTIVE", "SC_PENDING"]),
+                WQSubmissionAttempt.status.in_(sorted(_SLOT_CONSUMING_STATUSES)),
             )
         )
         pending_score = int(pending_result.scalar() or 0)
@@ -1368,7 +1444,9 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             and state.last_settled_points is not None
             and float(state.last_observed_points) <= float(state.last_settled_points)
         )
-        if points_sync_unknown:
+        if reconciliation_required_ids:
+            submission_warning = "submission_reconciliation_required_before_new_formal_submit"
+        elif points_sync_unknown:
             submission_warning = "points_sync_unknown_alpha_counts_unavailable"
         elif points_score_unchanged_pending:
             submission_warning = "leaderboard_alpha_count_current_but_score_unchanged_pending_points"
@@ -1408,6 +1486,8 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             "remaining_submission_slots": budget_remaining,
             "pending_score_submissions": pending_score,
             "expired_reservation_ids": expired_reservation_ids,
+            "submission_reconciliation_required": bool(reconciliation_required_ids),
+            "submission_reconciliation_alpha_ids": reconciliation_required_ids,
             "reservation_ttl_seconds": _configured_reservation_ttl_seconds(),
             "candidate_queue_count": queue_count,
             "candidate_confidence_counts": confidence_counts,
@@ -1453,6 +1533,24 @@ def get_candidate_robustness_revalidation_payloads_sync(
     alpha_ids: list[str],
 ) -> list[dict[str, Any]]:
     return _run_coro_sync(get_candidate_robustness_revalidation_payloads(account, alpha_ids))
+
+
+def get_submission_reservation_recovery_ids_sync(account: str = "primary", *, limit: int = 20) -> list[str]:
+    return _run_coro_sync(get_submission_reservation_recovery_ids(account, limit=limit))
+
+
+def reconcile_submission_reservations_sync(
+    account: str,
+    platform_alphas: dict[str, dict[str, Any]],
+) -> int:
+    return _run_coro_sync(reconcile_submission_reservations(account, platform_alphas))
+
+
+def reconcile_candidate_platform_statuses_sync(
+    account: str,
+    platform_alphas: dict[str, dict[str, Any]],
+) -> int:
+    return _run_coro_sync(reconcile_candidate_platform_statuses(account, platform_alphas))
 
 
 def reserve_submission_sync(account: str, alpha_id: str) -> dict[str, Any]:

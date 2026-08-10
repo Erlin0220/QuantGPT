@@ -647,21 +647,25 @@ class WQBrainClient:
         s = self._get_session()
 
         for submit_try in range(3):
-            r = None
-            for attempt in range(3):
-                try:
-                    r = s.post(
-                        f"{API_BASE}/alphas/{alpha_id}/submit",
-                        timeout=HTTP_TIMEOUT,
-                    )
-                    body = r.text[:500]
-                    logger.info(f"Submit {alpha_id}: HTTP {r.status_code}, body={body}")
-                    break
-                except (requests.ConnectionError, requests.Timeout) as e:
-                    logger.warning(f"Submit {alpha_id}: connection error (attempt {attempt + 1}): {e}")
-                    time.sleep(5 * (attempt + 1))
-            else:
-                return {"status_code": 0, "ok": False, "detail": "connection failed after retries"}
+            try:
+                r = s.post(
+                    f"{API_BASE}/alphas/{alpha_id}/submit",
+                    timeout=HTTP_TIMEOUT,
+                )
+                body = r.text[:500]
+                logger.info(f"Submit {alpha_id}: HTTP {r.status_code}, body={body}")
+            except (requests.ConnectionError, requests.Timeout) as e:
+                logger.warning(f"Submit {alpha_id}: connection outcome unknown: {e}")
+                # A POST timeout does not prove the platform rejected the request.
+                # Never retry the formal POST blindly or release the local slot;
+                # reconciliation must query BRAIN before any later submission.
+                return {
+                    "status_code": 0,
+                    "ok": False,
+                    "detail": f"submit request outcome unknown after connection error: {e}",
+                    "platform_status": "UNKNOWN",
+                    "submission_uncertain": True,
+                }
 
             if r.status_code == 403:
                 try:
@@ -699,27 +703,63 @@ class WQBrainClient:
                 return poll_result
 
             if poll_result.get("platform_status") == "TIMEOUT":
-                alpha_data = self._fetch_alpha(alpha_id)
+                try:
+                    alpha_data = self._fetch_alpha(alpha_id)
+                except (requests.ConnectionError, requests.Timeout):
+                    alpha_data = {}
                 actual_status = (alpha_data.get("status") or "").upper()
+                if actual_status == "ACTIVE":
+                    return {
+                        "status_code": 200,
+                        "ok": True,
+                        "detail": "poll timeout but platform now confirms ACTIVE",
+                        "platform_status": "ACTIVE",
+                    }
                 if actual_status == "UNSUBMITTED":
                     logger.warning(
-                        f"Submit {alpha_id}: platform still UNSUBMITTED after poll, retrying submit (try {submit_try + 1})"
+                        f"Submit {alpha_id}: platform confirms UNSUBMITTED after poll, retrying submit (try {submit_try + 1})"
                     )
                     time.sleep(10)
                     continue
-                logger.info(
-                    f"Submit {alpha_id}: poll timeout but platform status={actual_status}, treating as submitted"
+                logger.warning(
+                    f"Submit {alpha_id}: poll timeout with unresolved platform status={actual_status or 'UNKNOWN'}"
                 )
-                poll_result["ok"] = True
-                poll_result["detail"] = f"poll timeout but platform accepted (status={actual_status})"
-                return poll_result
+                return {
+                    **poll_result,
+                    "ok": False,
+                    "detail": f"submission outcome unresolved after poll timeout (status={actual_status or 'UNKNOWN'})",
+                    "platform_status": actual_status or "UNKNOWN",
+                    "submission_uncertain": True,
+                }
 
             return poll_result
 
+        try:
+            alpha_data = self._fetch_alpha(alpha_id)
+        except (requests.ConnectionError, requests.Timeout):
+            alpha_data = {}
+        actual_status = (alpha_data.get("status") or "").upper()
+        if actual_status == "UNSUBMITTED":
+            return {
+                "status_code": 200,
+                "ok": False,
+                "detail": "platform confirms alpha remains UNSUBMITTED after submit retries",
+                "platform_status": "UNSUBMITTED",
+                "confirmed_not_submitted": True,
+            }
+        if actual_status == "ACTIVE":
+            return {
+                "status_code": 200,
+                "ok": True,
+                "detail": "platform confirms ACTIVE after submit retries",
+                "platform_status": "ACTIVE",
+            }
         return {
-            "status_code": 200,
+            "status_code": 0,
             "ok": False,
-            "detail": "submit failed after 3 outer retries, alpha still UNSUBMITTED",
+            "detail": f"submission outcome unresolved after retries (status={actual_status or 'UNKNOWN'})",
+            "platform_status": actual_status or "UNKNOWN",
+            "submission_uncertain": True,
         }
 
     def _poll_alpha_submission(self, alpha_id: str, max_polls: int = 12, interval: int = 10) -> dict:

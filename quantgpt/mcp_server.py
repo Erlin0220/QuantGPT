@@ -49,6 +49,7 @@ from .task_executor import _run_backtest_in_process, get_executor
 from .wq_autonomous_research import run_autonomous_research
 from .wq_brain_service import (
     prepare_wq_expression,
+    reconcile_submission_uncertainty,
     run_account_status,
     run_batch_simulation,
     run_check_alphas,
@@ -1265,6 +1266,21 @@ def _run_wq_submit_by_ids_mcp_task(task_id: str, params: dict) -> dict:
             task_id,
             status="finalizing",
             progress=0,
+            progress_message="正式提交前对账历史不确定提交状态",
+            persist=True,
+        )
+        submission_recovery = reconcile_submission_uncertainty(client, params["account"])
+        if not submission_recovery.get("ok"):
+            return {
+                "ok": False,
+                "error": "存在尚未与 BRAIN 对账完成的正式提交；为避免超额提交，本次提交已冻结",
+                "submission_recovery": submission_recovery,
+            }
+
+        update_mcp_task(
+            task_id,
+            status="finalizing",
+            progress=0,
             progress_message="正式提交前刷新 BRAIN 指标与 SC 状态",
             persist=True,
         )
@@ -1341,6 +1357,7 @@ def _run_wq_submit_by_ids_mcp_task(task_id: str, params: dict) -> dict:
         )
         return {
             "ok": True,
+            "submission_recovery": submission_recovery,
             "preflight": preflight,
             "robustness_revalidation": robustness_revalidation,
             **result,

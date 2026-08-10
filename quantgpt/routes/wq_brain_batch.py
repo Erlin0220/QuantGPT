@@ -22,6 +22,7 @@ from ..task_store import (
 )
 from ..wq_brain_client import get_client, is_configured
 from ..wq_brain_service import (
+    reconcile_submission_uncertainty,
     run_batch_simulation,
     run_check_alphas,
     run_submit_by_ids,
@@ -304,6 +305,14 @@ def _run_batch_submit_by_id(task_id: str, alpha_ids: list[str], account: str, us
             return
 
         task["status"] = "finalizing"
+        task["progress_message"] = "preflight: reconciling unresolved formal submissions"
+        submission_recovery = reconcile_submission_uncertainty(client, account)
+        task["submission_recovery"] = submission_recovery
+        if not submission_recovery.get("ok"):
+            task["status"] = "failed"
+            task["error"] = "存在尚未与 BRAIN 对账完成的正式提交；为避免超额提交，本次提交已冻结"
+            return
+
         task["progress_message"] = "preflight: refreshing BRAIN metrics and SC state"
         preflight = run_check_alphas(client, alpha_ids)
         _run_coro_sync(reconcile_candidate_platform_statuses(account, preflight.get("alphas", {})))

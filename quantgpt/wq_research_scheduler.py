@@ -117,7 +117,7 @@ def summarize_research_cells(
         if cell is None:
             continue
         status = str(_get(attempt, "status") or "").upper()
-        if status in {"RESERVED", "SC_PENDING", "ACTIVE", *terminal_failures}:
+        if status in {"RESERVED", "RESERVATION_EXPIRED", "SUBMIT_UNKNOWN", "SC_PENDING", "ACTIVE", *terminal_failures}:
             cell["formal_submissions"] += 1
         if status == "ACTIVE":
             cell["active"] += 1

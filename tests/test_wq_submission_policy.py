@@ -699,7 +699,7 @@ async def test_weak_overfitting_evidence_is_blocked_before_submission(policy_db)
 
 
 @pytest.mark.asyncio
-async def test_stale_reservation_releases_slot_but_requires_platform_recovery(policy_db, monkeypatch):
+async def test_stale_reservation_keeps_slot_until_platform_recovery(policy_db, monkeypatch):
     import quantgpt.db as db
 
     monkeypatch.setenv("WQ_SUBMISSION_RESERVATION_TTL_SECONDS", "120")
@@ -715,14 +715,14 @@ async def test_stale_reservation_releases_slot_but_requires_platform_recovery(po
         await session.commit()
 
     status = await get_submission_policy_status("primary")
-    assert status["used_submission_slots"] == 0
+    assert status["used_submission_slots"] == 1
     assert "stale-reservation" in status["expired_reservation_ids"]
     assert status["reservation_ttl_seconds"] == 120
 
     retry = await reserve_submission("primary", "stale-reservation")
     assert retry["allowed"] is False
-    assert retry["reason"] == "candidate_not_ready"
-    assert "validation_not_ready" in retry["blockers"]
+    assert retry["reason"] == "submission_reconciliation_required"
+    assert retry["recovery_alpha_ids"] == ["stale-reservation"]
 
 
 @pytest.mark.asyncio
@@ -757,5 +757,107 @@ async def test_expired_reservation_can_be_revalidated_after_platform_confirms_un
     assert await reconcile_submission_reservations("primary", platform) == 1
     assert await reconcile_candidate_platform_statuses("primary", platform) == 1
 
+    factory = db._get_session_factory()
+    async with factory() as session:
+        attempt = (await session.execute(
+            select(WQSubmissionAttempt).where(WQSubmissionAttempt.alpha_id == "recovered-unsubmitted")
+        )).scalar_one()
+        assert attempt.status == "UNSUBMITTED_CONFIRMED"
+
     decision = await reserve_submission("primary", "recovered-unsubmitted")
     assert decision["allowed"] is True
+
+
+@pytest.mark.asyncio
+async def test_unknown_submit_outcome_is_fail_closed_until_platform_reconciliation(policy_db):
+    import quantgpt.db as db
+
+    await _seed_ready_candidate("unknown-submit")
+    await _seed_ready_candidate("next-alpha")
+    assert (await reserve_submission("primary", "unknown-submit"))["allowed"] is True
+
+    await finalize_submission_attempt(
+        "primary",
+        "unknown-submit",
+        {
+            "ok": False,
+            "platform_status": "UNKNOWN",
+            "submission_uncertain": True,
+            "detail": "POST timed out after request body was sent",
+        },
+    )
+
+    factory = db._get_session_factory()
+    async with factory() as session:
+        attempt = (await session.execute(
+            select(WQSubmissionAttempt).where(WQSubmissionAttempt.alpha_id == "unknown-submit")
+        )).scalar_one()
+        assert attempt.status == "SUBMIT_UNKNOWN"
+        assert attempt.score_state == "PENDING"
+
+    status = await get_submission_policy_status("primary")
+    assert status["used_submission_slots"] == 1
+    assert status["pending_score_submissions"] == 1
+    assert status["submission_reconciliation_required"] is True
+    assert status["submission_reconciliation_alpha_ids"] == ["unknown-submit"]
+
+    blocked = await reserve_submission("primary", "next-alpha")
+    assert blocked["allowed"] is False
+    assert blocked["reason"] == "submission_reconciliation_required"
+    assert blocked["recovery_alpha_ids"] == ["unknown-submit"]
+
+    platform = {
+        "unknown-submit": {
+            "ok": True,
+            "status": "UNSUBMITTED",
+            "sc_result": "PASS",
+            "sc_value": 0.2,
+            "sharpe": 1.6,
+            "fitness": 1.2,
+            "returns": 0.08,
+            "turnover": 0.2,
+        }
+    }
+    assert await reconcile_submission_reservations("primary", platform) == 1
+    assert await reconcile_candidate_platform_statuses("primary", platform) == 1
+
+    status = await get_submission_policy_status("primary")
+    assert status["used_submission_slots"] == 0
+    assert (await reserve_submission("primary", "next-alpha"))["allowed"] is True
+
+
+@pytest.mark.asyncio
+async def test_active_submission_is_monotonic_against_later_uncertain_or_unsubmitted_observations(policy_db):
+    import quantgpt.db as db
+
+    await _seed_ready_candidate("monotonic-active")
+    assert (await reserve_submission("primary", "monotonic-active"))["allowed"] is True
+    await finalize_submission_attempt(
+        "primary",
+        "monotonic-active",
+        {"ok": True, "final_status": "ACTIVE", "detail": "platform confirmed ACTIVE"},
+    )
+
+    await finalize_submission_attempt(
+        "primary",
+        "monotonic-active",
+        {"ok": False, "final_status": "ERROR", "detail": "temporary platform read failure"},
+    )
+    await finalize_submission_attempt(
+        "primary",
+        "monotonic-active",
+        {"ok": False, "final_status": "UNSUBMITTED", "detail": "stale platform observation"},
+    )
+
+    factory = db._get_session_factory()
+    async with factory() as session:
+        attempt = (await session.execute(
+            select(WQSubmissionAttempt).where(WQSubmissionAttempt.alpha_id == "monotonic-active")
+        )).scalar_one()
+        assert attempt.status == "ACTIVE"
+        assert attempt.score_state == "PENDING"
+        assert attempt.detail == "platform confirmed ACTIVE"
+
+    status = await get_submission_policy_status("primary")
+    assert status["used_submission_slots"] == 1
+    assert status["pending_score_submissions"] == 1

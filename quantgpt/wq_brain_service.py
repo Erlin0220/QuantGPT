@@ -512,6 +512,33 @@ def run_batch_simulation(
     return out
 
 
+def reconcile_submission_uncertainty(client, account: str = "primary") -> dict[str, Any]:
+    """Reconcile fail-closed formal-submit outcomes before allowing another reservation."""
+    from .wq_submission_policy import (
+        get_submission_reservation_recovery_ids_sync,
+        reconcile_candidate_platform_statuses_sync,
+        reconcile_submission_reservations_sync,
+    )
+
+    recovery_ids = get_submission_reservation_recovery_ids_sync(account, limit=100)
+    if not recovery_ids:
+        return {"ok": True, "checked": 0, "reconciled": 0, "remaining": []}
+
+    checked = run_check_alphas(client, recovery_ids)
+    platform_alphas = checked.get("alphas", {})
+    reconciled = reconcile_submission_reservations_sync(account, platform_alphas)
+    candidates_reconciled = reconcile_candidate_platform_statuses_sync(account, platform_alphas)
+    remaining = get_submission_reservation_recovery_ids_sync(account, limit=100)
+    return {
+        "ok": not remaining,
+        "checked": len(recovery_ids),
+        "reconciled": reconciled,
+        "candidates_reconciled": candidates_reconciled,
+        "remaining": remaining,
+        "platform": checked,
+    }
+
+
 def run_submit_by_ids(
     client,
     alpha_ids: list[str],
@@ -567,11 +594,13 @@ def run_submit_by_ids(
         elif "SC FAIL" in result.get("detail", ""):
             sc_fail += 1
             entry["final_status"] = "SC_FAIL"
-        elif result.get("platform_status") == "TIMEOUT":
-            timeout += 1
-            entry["final_status"] = "SC_PENDING"
+        elif result.get("confirmed_not_submitted") or str(result.get("platform_status") or "").upper() == "UNSUBMITTED":
+            entry["final_status"] = "UNSUBMITTED_CONFIRMED"
+            entry["confirmed_not_submitted"] = True
         else:
-            entry["final_status"] = "OTHER_FAIL"
+            timeout += 1
+            entry["final_status"] = "SUBMIT_UNKNOWN"
+            entry["submission_uncertain"] = True
 
         results[alpha_id] = entry
 

@@ -22,7 +22,14 @@ from ..task_store import (
     tasks_lock,
 )
 from ..wq_brain_client import SUBMIT_THRESHOLDS, configured_accounts, get_client, is_configured
-from ..wq_brain_service import fitness_to_grade, run_check_alphas, run_list_alphas, run_single_simulation, safe_float
+from ..wq_brain_service import (
+    fitness_to_grade,
+    reconcile_submission_uncertainty,
+    run_check_alphas,
+    run_list_alphas,
+    run_single_simulation,
+    safe_float,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +287,17 @@ async def submit_alpha_from_task(
         reserve_submission_sync,
     )
 
+    submission_recovery = await asyncio.to_thread(reconcile_submission_uncertainty, client, account)
+    if not submission_recovery.get("ok"):
+        client.close()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "存在尚未与 BRAIN 对账完成的正式提交；为避免超额提交，本次提交已冻结",
+                "submission_recovery": submission_recovery,
+            },
+        )
+
     preflight = await asyncio.to_thread(run_check_alphas, client, [alpha_id])
     await reconcile_candidate_platform_statuses(account, preflight.get("alphas", {}))
     decision = await asyncio.to_thread(reserve_submission_sync, account, alpha_id)
@@ -356,6 +374,17 @@ async def submit_alpha_by_id(
         reconcile_candidate_platform_statuses,
         reserve_submission_sync,
     )
+
+    submission_recovery = await asyncio.to_thread(reconcile_submission_uncertainty, client, account)
+    if not submission_recovery.get("ok"):
+        client.close()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "存在尚未与 BRAIN 对账完成的正式提交；为避免超额提交，本次提交已冻结",
+                "submission_recovery": submission_recovery,
+            },
+        )
 
     preflight = await asyncio.to_thread(run_check_alphas, client, [alpha_id])
     await reconcile_candidate_platform_statuses(account, preflight.get("alphas", {}))

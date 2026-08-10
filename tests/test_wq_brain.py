@@ -4,9 +4,10 @@ import os
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from quantgpt.wq_brain_client import WQBrainClient, configured_accounts, get_client, is_configured
-from quantgpt.wq_brain_service import run_account_status, run_list_alphas
+from quantgpt.wq_brain_service import run_account_status, run_list_alphas, run_submit_by_ids
 
 
 class TestIsConfigured:
@@ -107,6 +108,39 @@ class TestWQBrainClient:
         c._session = mock_session
         assert c.authenticate() is False
 
+    def test_submit_connection_timeout_is_unknown_and_never_blindly_retried(self):
+        c = WQBrainClient(email="a@b.com", password="pw")
+        mock_session = MagicMock()
+        mock_session.post.side_effect = requests.Timeout("socket timed out")
+        c._session = mock_session
+
+        result = c.submit_alpha("alpha-timeout")
+
+        assert result["ok"] is False
+        assert result["platform_status"] == "UNKNOWN"
+        assert result["submission_uncertain"] is True
+        assert mock_session.post.call_count == 1
+
+    def test_submit_poll_timeout_with_unknown_platform_status_is_not_marked_active(self):
+        c = WQBrainClient(email="a@b.com", password="pw")
+        mock_session = MagicMock()
+        submit_response = MagicMock(status_code=201, text="accepted")
+        mock_session.post.return_value = submit_response
+        c._session = mock_session
+        c._poll_alpha_submission = MagicMock(return_value={
+            "status_code": 200,
+            "ok": False,
+            "detail": "poll timed out",
+            "platform_status": "TIMEOUT",
+        })
+        c._fetch_alpha = MagicMock(return_value={})
+
+        result = c.submit_alpha("alpha-unknown")
+
+        assert result["ok"] is False
+        assert result["platform_status"] == "UNKNOWN"
+        assert result["submission_uncertain"] is True
+
     def test_account_metadata_endpoints(self):
         c = WQBrainClient(email="a@b.com", password="pw")
         mock_session = MagicMock()
@@ -121,6 +155,28 @@ class TestWQBrainClient:
         assert c.get_user_alpha_summary()["active"] == 1
         assert mock_session.get.call_args_list[0].args[0].endswith("/users/U1/competitions")
         assert mock_session.get.call_args_list[1].args[0].endswith("/users/self/alphas/summary")
+
+
+class TestSubmitByIdsService:
+    def test_uncertain_remote_result_maps_to_fail_closed_submit_unknown(self):
+        client = MagicMock()
+        client.submit_alpha.return_value = {
+            "ok": False,
+            "platform_status": "UNKNOWN",
+            "submission_uncertain": True,
+            "detail": "network outcome unknown",
+        }
+
+        result = run_submit_by_ids(
+            client,
+            ["alpha-unknown"],
+            submission_guard=lambda _alpha_id: {"allowed": True},
+        )
+
+        assert result["active"] == 0
+        assert result["timeout"] == 1
+        assert result["results"]["alpha-unknown"]["final_status"] == "SUBMIT_UNKNOWN"
+        assert result["results"]["alpha-unknown"]["submission_uncertain"] is True
 
 
 class TestListAlphasService:
