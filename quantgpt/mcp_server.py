@@ -22,6 +22,7 @@ import time
 import traceback
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
+from typing import cast
 
 import pandas as pd
 from mcp.server.fastmcp import FastMCP
@@ -458,9 +459,10 @@ def _run_compute_factor_values_mcp_task(task_id: str, params: dict) -> dict:
         except Exception as exc:
             return {"ok": False, "error": f"Expression evaluation failed: {exc}"}
 
-        result_df = df[df["trade_date"] >= start_dt][["trade_date", "stock_code", "factor_value"]].dropna(
-            subset=["factor_value"]
-        )
+        result_df = cast(
+            pd.DataFrame,
+            df.loc[df["trade_date"] >= start_dt, ["trade_date", "stock_code", "factor_value"]],
+        ).dropna(subset=["factor_value"])
         grouped = result_df.groupby("trade_date")
         total_days = grouped.ngroups
 
@@ -474,10 +476,12 @@ def _run_compute_factor_values_mcp_task(task_id: str, params: dict) -> dict:
                 for index, (trade_date, group) in enumerate(grouped, start=1):
                     if is_mcp_task_cancelled(task_id):
                         return {"ok": False, "cancelled": True, "error": "任务已取消"}
+                    stock_values = cast(pd.Series, group["stock_code"])
+                    factor_values = cast(pd.Series, group["factor_value"])
                     values = {
-                        row.stock_code: round(float(row.factor_value), 6)
-                        for row in group.itertuples(index=False)
-                        if np.isfinite(row.factor_value)
+                        str(stock_code): round(float(factor_value), 6)
+                        for stock_code, factor_value in zip(stock_values, factor_values, strict=False)
+                        if np.isfinite(factor_value)
                     }
                     if values:
                         output.write(
@@ -1240,11 +1244,14 @@ def _run_wq_autonomous_research_mcp_task(task_id: str, params: dict) -> dict:
 
 
 def _run_wq_submit_by_ids_mcp_task(task_id: str, params: dict) -> dict:
+    from .wq_autonomous_research import validate_candidate_robustness
     from .wq_brain_client import get_client
     from .wq_submission_policy import (
         _run_coro_sync,
         finalize_submission_attempt_sync,
+        get_candidate_robustness_revalidation_payloads_sync,
         reconcile_candidate_platform_statuses,
+        record_research_candidates_sync,
         reserve_submission_sync,
     )
 
@@ -1269,6 +1276,49 @@ def _run_wq_submit_by_ids_mcp_task(task_id: str, params: dict) -> dict:
             )
         )
 
+        robustness_revalidation: dict[str, dict] = {}
+        pending_robustness = get_candidate_robustness_revalidation_payloads_sync(
+            params["account"],
+            params["alpha_ids"],
+        )
+        for index, payload in enumerate(pending_robustness, start=1):
+            if is_mcp_task_cancelled(task_id):
+                break
+            alpha_id = str(payload.get("alpha_id") or "")
+            settings = dict(payload.get("settings") or {})
+            update_mcp_task(
+                task_id,
+                status="finalizing",
+                progress=0,
+                progress_message=f"提交前稳健性复核 {index}/{len(pending_robustness)}: {alpha_id}",
+            )
+            robustness = validate_candidate_robustness(
+                client,
+                payload,
+                region=str(settings.get("region") or "USA"),
+                universe=str(settings.get("universe") or "TOP3000"),
+                delay=int(settings.get("delay") or 1),
+                decay=int(settings.get("decay") or 0),
+                neutralization=str(settings.get("neutralization") or "SUBINDUSTRY"),
+                truncation=float(settings.get("truncation") or 0.08),
+                check_cancelled=lambda: is_mcp_task_cancelled(task_id),
+            )
+            merged_validation = dict(payload.get("validation") or {})
+            merged_validation.update(robustness)
+            payload["validation"] = merged_validation
+            saved = record_research_candidates_sync(
+                params["account"],
+                [payload],
+                settings=settings,
+                tag=payload.get("tag"),
+            )
+            robustness_revalidation[alpha_id] = {
+                "status": robustness.get("status"),
+                "robustness_score": robustness.get("robustness_score"),
+                "validation_simulations": robustness.get("validation_simulations"),
+                "candidate_rows_saved": saved,
+            }
+
         def on_progress(current: int, total: int, alpha_id: str) -> None:
             pct = int((current - 1) * 100 / total) if total else 0
             update_mcp_task(
@@ -1289,7 +1339,12 @@ def _run_wq_submit_by_ids_mcp_task(task_id: str, params: dict) -> dict:
             submission_guard=lambda alpha_id: reserve_submission_sync(params["account"], alpha_id),
             submission_result_callback=lambda alpha_id, entry: finalize_submission_attempt_sync(params["account"], alpha_id, entry),
         )
-        return {"ok": True, "preflight": preflight, **result}
+        return {
+            "ok": True,
+            "preflight": preflight,
+            "robustness_revalidation": robustness_revalidation,
+            **result,
+        }
     finally:
         client.close()
 
@@ -1393,7 +1448,7 @@ async def wq_brain_submit(
         decay: Alpha 衰减 (0-20)
         neutralization: 中性化 (SUBINDUSTRY, INDUSTRY, SECTOR, MARKET, NONE)
         truncation: 权重截断 (0-0.5)
-        auto_submit: 如果检查全部通过，自动提交到 WQ 审核
+        auto_submit: 已弃用；正式提交必须走 Research/Candidate → wq_brain_submit_by_ids
 
     Returns:
         JSON with task_id. Simulation runs in the background; poll with get_task_status.
@@ -1402,6 +1457,14 @@ async def wq_brain_submit(
 
     if not _wq_configured("primary"):
         return json.dumps({"error": "WQ BRAIN 未配置 — 请设置 WQ_BRAIN_EMAIL 和 WQ_BRAIN_PASSWORD"})
+    if auto_submit:
+        return json.dumps(
+            {
+                "error": "auto_submit 已停用；请先研究并进入 Candidate Queue，再调用 wq_brain_submit_by_ids",
+                "reason": "auto_submit_disabled_use_candidate_pipeline",
+            },
+            ensure_ascii=False,
+        )
 
     params = {
         "expression": expression,
@@ -1449,7 +1512,7 @@ async def wq_brain_batch_submit(
         neutralizations: 中性化列表 (默认 ["SUBINDUSTRY"])
         decay: Alpha 衰减 (0-20, 共用)
         truncation: 权重截断 (0-0.5, 共用)
-        auto_submit: 全部检查通过时自动提交
+        auto_submit: 已弃用；正式提交必须走 Research/Candidate → wq_brain_submit_by_ids
 
     Returns:
         JSON with task_id. The parameter sweep runs in the background; poll with get_task_status.
@@ -1463,6 +1526,14 @@ async def wq_brain_batch_submit(
 
     if not _wq_configured("primary"):
         return json.dumps({"error": "WQ BRAIN 未配置 — 请设置 WQ_BRAIN_EMAIL 和 WQ_BRAIN_PASSWORD"})
+    if auto_submit:
+        return json.dumps(
+            {
+                "error": "auto_submit 已停用；请先研究并进入 Candidate Queue，再调用 wq_brain_submit_by_ids",
+                "reason": "auto_submit_disabled_use_candidate_pipeline",
+            },
+            ensure_ascii=False,
+        )
 
     total = len(regions) * len(delays) * len(universes) * len(neutralizations)
     if total > 36:
@@ -1587,8 +1658,9 @@ async def wq_brain_autonomous_research(
 
     自动读取 Research Memory、近期 BRAIN Alpha 和账号实时 Data Explorer 字段；在可用时
     使用现有 DeepSeek/OpenAI-compatible provider 生成少量结构创新 FASTEXPR，并以真实
-    BRAIN Simulation 验证。Primary Pass 还会经过有限的跨 Universe/Neutralization
-    Robustness Funnel，只有 READY Candidate 才进入正式候选库存。工具永远不会正式提交
+    BRAIN Simulation 验证。``max_simulations`` 是主研究 generations 的 Simulation 预算；
+    Robustness Validation 使用独立、显式上报的有界预算。Primary Pass 还会经过有限的跨
+    Universe/Neutralization Robustness Funnel，只有 READY Candidate 才进入正式候选库存。工具永远不会正式提交
     Alpha，正式提交仍由 Submission Gate 控制。
 
     Returns:

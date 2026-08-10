@@ -2,6 +2,7 @@
 
 import json
 import logging
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -249,4 +250,4 @@ def compute_industry_signals(
     logger.info(
         f"[industry_signals] Computed signals for {len(results)} industries"
     )
-    return sanitize_for_json(json.loads(json.dumps(results, default=json_default)))
+    return cast(list[dict], sanitize_for_json(json.loads(json.dumps(results, default=json_default))))

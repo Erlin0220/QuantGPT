@@ -5,6 +5,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from typing import cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
@@ -129,7 +130,7 @@ def _run_composite_task(task_id: str, req: CompositeBacktestRequest, user_id: st
     """Background worker for composite backtest."""
     import traceback
 
-    from ..composite import run_composite_backtest
+    from ..composite import CombineMethod, run_composite_backtest
     from ..market_data import fetch_benchmark_returns
     from ..report import generate_report
     from ..task_store import cleanup_reports as _cleanup_reports
@@ -165,7 +166,7 @@ def _run_composite_task(task_id: str, req: CompositeBacktestRequest, user_id: st
         result = run_composite_backtest(
             market_df=market_df,
             factors=factors_list,
-            method=req.combination_method,
+            method=cast(CombineMethod, req.combination_method),
             n_groups=req.n_groups,
             holding_period=req.holding_period,
         )

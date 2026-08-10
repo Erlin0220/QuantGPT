@@ -156,6 +156,13 @@ def classify_research_failure(item: dict[str, Any], *, status: str) -> dict[str,
         _append_unique(findings, "robustness", "robustness_instability", "validation")
     if validation_status in {"correlation_fail", "local_correlation_fail"}:
         _append_unique(findings, "diversity", "local_correlation_risk", "validation")
+    raw_submission_gate = validation.get("submission_gate")
+    submission_gate: dict[str, Any] = dict(raw_submission_gate) if isinstance(raw_submission_gate, dict) else {}
+    for blocker in submission_gate.get("blockers") or []:
+        if blocker == "overfitting_evidence_weak":
+            _append_unique(findings, "robustness", "overfitting_evidence_weak", "submission_gate")
+        elif blocker == "local_correlation_high":
+            _append_unique(findings, "diversity", "local_correlation_risk", "submission_gate")
 
     joined_targets = " ".join(mutation_targets).lower()
     if "self_correlation" in joined_targets:

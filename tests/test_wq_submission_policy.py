@@ -11,6 +11,7 @@ from quantgpt.models import Base, WQSubmissionAttempt
 from quantgpt.wq_research_memory import load_research_memory, record_research_trials
 from quantgpt.wq_submission_policy import (
     finalize_submission_attempt,
+    get_candidate_robustness_revalidation_payloads,
     get_submission_policy_status,
     observe_account_status,
     reconcile_candidate_platform_statuses,
@@ -396,6 +397,48 @@ async def test_platform_active_reconciles_stale_candidate_queue_entry(policy_db)
 
 
 @pytest.mark.asyncio
+async def test_platform_preflight_does_not_bypass_missing_robustness(policy_db):
+    await record_research_candidates(
+        "primary",
+        [
+            {
+                "alpha_id": "platform-no-robustness",
+                "expression": "rank(close)",
+                "is_metrics": {"sharpe": 1.8, "fitness": 1.3, "returns": 0.1, "turnover": 0.2},
+                "validation": {"status": "platform_recheck"},
+            }
+        ],
+    )
+    updated = await reconcile_candidate_platform_statuses(
+        "primary",
+        {"platform-no-robustness": {"status": "UNSUBMITTED", "sc_result": "PASS", "sc_value": 0.40}},
+    )
+    assert updated == 1
+    status = await get_submission_policy_status("primary")
+    assert status["candidate_queue_count"] == 0
+    decision = await reserve_submission("primary", "platform-no-robustness")
+    assert decision["allowed"] is False
+    assert decision["validation_status"] == "robustness_pending"
+
+    payloads = await get_candidate_robustness_revalidation_payloads(
+        "primary",
+        ["platform-no-robustness"],
+    )
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert payload["expression"] == "rank(close)"
+    payload["validation"] = {"status": "ready", "robustness_score": 1.0, "completed": 2, "passed": 2}
+    await record_research_candidates(
+        "primary",
+        [payload],
+        settings=payload["settings"],
+        tag=payload["tag"],
+    )
+    promoted = await reserve_submission("primary", "platform-no-robustness")
+    assert promoted["allowed"] is True
+
+
+@pytest.mark.asyncio
 async def test_platform_sc_value_updates_queued_candidate_and_priority(policy_db):
     await record_research_candidates(
         "primary",
@@ -404,6 +447,7 @@ async def test_platform_sc_value_updates_queued_candidate_and_priority(policy_db
                 "alpha_id": "sc-valued",
                 "expression": "rank(close)",
                 "is_metrics": {"sharpe": 1.8, "fitness": 1.3, "returns": 0.1, "turnover": 0.2},
+                "validation": {"status": "ready", "robustness_score": 1.0},
             }
         ],
     )
@@ -568,14 +612,17 @@ async def test_points_feedback_gate_exposes_operator_feedback(policy_db, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_zero_delta_settlement_keeps_uncertainty_visible(policy_db):
+async def test_zero_delta_current_state_keeps_active_points_pending(policy_db):
     await observe_account_status("primary", _current_points(1000))
     await _seed_ready_candidate("historical-zero-delta")
     assert (await reserve_submission("primary", "historical-zero-delta"))["allowed"] is True
     await finalize_submission_attempt("primary", "historical-zero-delta", {"ok": True, "final_status": "ACTIVE"})
-    await observe_account_status("primary", _current_points(1000))
+    status = await observe_account_status("primary", _current_points(1000))
     memory = await load_research_memory("primary")
-    assert memory["points_feedback_coverage"]["settled_attempts"] == 1
+    assert status["pending_score_submissions"] == 1
+    assert status["points_score_unchanged_pending"] is True
+    assert status["submission_warning"] == "leaderboard_alpha_count_current_but_score_unchanged_pending_points"
+    assert memory["points_feedback_coverage"]["settled_attempts"] == 0
     assert memory["points_feedback_coverage"]["usable_attempts"] == 0
     assert memory["family_points_feedback_usable"] == {}
     assert memory["dataset_points_feedback_usable"] == {}

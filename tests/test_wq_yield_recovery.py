@@ -85,6 +85,10 @@ async def test_full_yield_recovery_grows_inventory_with_submission_slots_exhaust
                 "passes_primary_thresholds": good,
                 "mutation_targets": ["candidate_passes_primary_thresholds"] if good else ["improve_fitness"],
             }
+            if good:
+                item["validation"] = {
+                    "overfitting_evidence": {"status": "available", "score": 0.9, "sample_count": 252},
+                }
             results.append(item)
             if good:
                 candidates.append(item)
@@ -124,7 +128,12 @@ async def test_full_yield_recovery_grows_inventory_with_submission_slots_exhaust
     assert result["summary"]["directed_mutation_routes"] > 0
     assert result["inventory_mode"] == "REPLENISHMENT"
     assert result["summary"]["formally_submitted"] == 0
+    assert result["summary"]["primary_simulation_budget"] == 8
+    assert result["summary"]["total_simulation_budget_upper_bound"] >= 8
     assert result["ready_candidates"]
+    ready_validation = result["ready_candidates"][0]["validation"]
+    assert ready_validation["overfitting_evidence"]["score"] == 0.9
+    assert ready_validation["submission_gate"]["ready"] is True
 
     assert await record_research_trials("primary", result, hypothesis="yield recovery") > 0
     assert await record_research_candidates(

@@ -17,6 +17,7 @@ import multiprocessing as mp
 import os
 from abc import ABC, abstractmethod
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
+from typing import cast
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +128,7 @@ class CeleryTaskExecutor(TaskExecutor):
         ser_args = to_json_transport(list(args))
         ser_kwargs = to_json_transport(kwargs)
         async_result = run_cpu_work.apply_async(args=(fn_path, ser_args, ser_kwargs))
-        return _CeleryFutureAdapter(async_result)
+        return cast(Future, _CeleryFutureAdapter(async_result))
 
     def shutdown(self) -> None:
         pass

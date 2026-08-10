@@ -111,7 +111,7 @@ Syntax extensions:
 
 import logging
 import re
-from typing import Callable
+from typing import Callable, cast
 
 import numpy as np
 import pandas as pd
@@ -339,15 +339,15 @@ class ExpressionParser:
 
     @staticmethod
     def _calc_atr(df: "pd.DataFrame", w: int) -> "pd.Series":
-        high = df.get('high', df['close'])
-        low = df.get('low', df['close'])
-        close_prev = df['close'].shift(1)
+        high = cast(pd.Series, df['high'] if 'high' in df.columns else df['close'])
+        low = cast(pd.Series, df['low'] if 'low' in df.columns else df['close'])
+        close_prev = cast(pd.Series, df['close']).shift(1)
         tr = pd.concat([
             high - low,
             (high - close_prev).abs(),
             (low - close_prev).abs(),
         ], axis=1).max(axis=1)
-        return tr.rolling(w, min_periods=1).mean()
+        return cast(pd.Series, cast(pd.Series, tr).rolling(w, min_periods=1).mean())
 
     # Supported time-series functions (column, window -> Series)
     # When the DataFrame has a 'stock_code' column, these automatically
@@ -594,10 +594,10 @@ class ExpressionParser:
                 if 'stock_code' in df.columns:
                     # Apply per-stock: build temporary frame, groupby, apply
                     tmp = pd.DataFrame({'s1': s1, 's2': s2, 'sc': df['stock_code']}, index=df.index)
-                    return tmp.groupby('sc', group_keys=False).apply(
+                    return cast(pd.Series, tmp.groupby('sc', group_keys=False).apply(
                         lambda g: _op(g['s1'], g['s2'], _w)
-                    )
-                return _op(s1, s2, _w)
+                    ))
+                return cast(pd.Series, _op(s1, s2, _w))
             return _ts_dual
 
         if func_name in self._BINARY_OPS:
@@ -707,11 +707,19 @@ class ExpressionParser:
             inner = self._sub_parse(parts[0].strip())
             window = self._validate_window(int(parts[1].strip()), func_name)
             if func_name == 'boll_upper':
-                return lambda df, _i=inner, _w=window: _i(df).rolling(_w, min_periods=1).mean() + 2 * _i(df).rolling(_w, min_periods=1).std()
+                def _boll_upper(df: pd.DataFrame, _i=inner, _w=window) -> pd.Series:
+                    values = cast(pd.Series, _i(df))
+                    return values.rolling(_w, min_periods=1).mean() + 2 * values.rolling(_w, min_periods=1).std()
+                return _boll_upper
             elif func_name == 'boll_lower':
-                return lambda df, _i=inner, _w=window: _i(df).rolling(_w, min_periods=1).mean() - 2 * _i(df).rolling(_w, min_periods=1).std()
+                def _boll_lower(df: pd.DataFrame, _i=inner, _w=window) -> pd.Series:
+                    values = cast(pd.Series, _i(df))
+                    return values.rolling(_w, min_periods=1).mean() - 2 * values.rolling(_w, min_periods=1).std()
+                return _boll_lower
             else:  # boll_mid
-                return lambda df, _i=inner, _w=window: _i(df).rolling(_w, min_periods=1).mean()
+                def _boll_mid(df: pd.DataFrame, _i=inner, _w=window) -> pd.Series:
+                    return cast(pd.Series, cast(pd.Series, _i(df)).rolling(_w, min_periods=1).mean())
+                return _boll_mid
 
         if func_name == 'clip':
             parts = self._split_top_level(args_str)
@@ -838,16 +846,16 @@ class ExpressionParser:
             if self.mode == "wq" and expr_lower not in _WQ_SPECIAL_VARS:
                 raise ValueError(f"WQ 模式下不支持变量 '{expr_lower}'")
             var_fn = self._SPECIAL_VARS[expr_lower]
-            return lambda df, _fn=var_fn: _fn(df)
+            return lambda df, _fn=var_fn: cast(pd.Series, _fn(df))
 
         # Average daily volume: adv{N} (e.g., adv20, adv60) — case-insensitive
         if expr_lower.startswith('adv') and expr_lower[3:].isdigit():
             window = self._validate_window(int(expr_lower[3:]), 'adv')
-            return lambda df, _w=window: (
-                df.groupby('stock_code')['volume'].transform(lambda x: x.rolling(_w, min_periods=1).mean())
-                if 'stock_code' in df.columns
-                else df['volume'].rolling(_w, min_periods=1).mean()
-            )
+            def _adv(df: pd.DataFrame, _w=window) -> pd.Series:
+                if 'stock_code' in df.columns:
+                    return cast(pd.Series, df.groupby('stock_code')['volume'].transform(lambda x: x.rolling(_w, min_periods=1).mean()))
+                return cast(pd.Series, cast(pd.Series, df['volume']).rolling(_w, min_periods=1).mean())
+            return _adv
 
         # Column reference — only allow known columns (case-insensitive)
         col_name = expr_lower.strip()

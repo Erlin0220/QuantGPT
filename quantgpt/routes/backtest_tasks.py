@@ -10,6 +10,7 @@ import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -336,11 +337,11 @@ def _run_backtest_task(task_id: str, req: AutoBacktestRequest, user_id: str):
             if hasattr(strat_ret, "index") and len(strat_ret) > 0:
                 cum = (1 + strat_ret).cumprod()
                 step = max(1, len(cum) // 50)
-                sampled = cum.iloc[::step]
+                sampled = cast(pd.Series, cum.iloc[::step])
                 if sampled.index[-1] != cum.index[-1]:
                     sampled = pd.concat([sampled, cum.iloc[[-1]]])
                 nav_series = [
-                    {"date": d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d), "value": round(float(v), 4)}
+                    {"date": str(d)[:10], "value": round(float(v), 4)}
                     for d, v in sampled.items()
                 ]
         except Exception:
@@ -440,6 +441,9 @@ async def cancel_task(
             task["status"] = "cancelled"
         logger.info(f"[{task_id}] cancel requested by user")
         return {"task_id": task_id, "status": "cancelled"}
+
+    if user is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
 
     result = await db.execute(
         select(TaskModel).where(TaskModel.id == task_id, TaskModel.user_id == user.id)

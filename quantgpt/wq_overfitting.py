@@ -258,8 +258,11 @@ def overfitting_priority_multiplier(evidence: Any) -> float:
     """Small soft ranking adjustment; unavailable evidence stays neutral."""
     if not isinstance(evidence, dict) or evidence.get("status") != "available":
         return 1.0
+    raw_score = evidence.get("score")
+    if raw_score is None:
+        return 1.0
     try:
-        score = max(0.0, min(1.0, float(evidence.get("score"))))
+        score = max(0.0, min(1.0, float(raw_score)))
     except (TypeError, ValueError):
         return 1.0
     return 0.9 + 0.2 * score

@@ -9,6 +9,7 @@ from quantgpt.models import Base, WQResearchStageEvent
 from quantgpt.wq_candidate_funnel import (
     STAGE_CANDIDATE,
     STAGE_COMPILE,
+    STAGE_CORRELATION,
     STAGE_DIAGNOSIS,
     STAGE_IDEA,
     STAGE_MUTATION,
@@ -67,6 +68,59 @@ async def test_success_path_reaches_candidate(funnel_db):
     ]
     assert (STAGE_ROBUSTNESS, "passed") in stages
     assert stages[-1] == (STAGE_CANDIDATE, "passed")
+
+
+@pytest.mark.asyncio
+async def test_submission_gate_local_correlation_failure_stops_before_candidate(funnel_db):
+    result = {
+        "results": [
+            {
+                "alpha_id": "corr-blocked",
+                "expression": "rank(ts_mean(volume, 20))",
+                "is_metrics": {"sharpe": 1.6, "fitness": 1.3, "turnover": 0.2, "checks": []},
+                "local_correlation_proxy": {"status": "available", "max_correlation": 0.82},
+                "validation": {
+                    "status": "ready",
+                    "robustness_score": 1.0,
+                    "submission_gate": {"ready": False, "blockers": ["local_correlation_high"]},
+                },
+            }
+        ],
+        "candidates": [{"alpha_id": "corr-blocked"}],
+    }
+    await record_research_trials("primary", result)
+    events = await _events(funnel_db)
+    stages = [(event.stage, event.outcome) for event in events]
+
+    assert (STAGE_ROBUSTNESS, "passed") in stages
+    assert stages[-1] == (STAGE_CORRELATION, "failed")
+    assert STAGE_CANDIDATE not in [event.stage for event in events]
+
+
+@pytest.mark.asyncio
+async def test_submission_gate_weak_overfit_fails_robustness_stage(funnel_db):
+    result = {
+        "results": [
+            {
+                "alpha_id": "overfit-blocked",
+                "expression": "rank(ts_mean(volume, 20))",
+                "is_metrics": {"sharpe": 1.6, "fitness": 1.3, "turnover": 0.2, "checks": []},
+                "validation": {
+                    "status": "ready",
+                    "robustness_score": 1.0,
+                    "overfitting_evidence": {"status": "available", "score": 0.2},
+                    "submission_gate": {"ready": False, "blockers": ["overfitting_evidence_weak"]},
+                },
+            }
+        ],
+        "candidates": [{"alpha_id": "overfit-blocked"}],
+    }
+    await record_research_trials("primary", result)
+    events = await _events(funnel_db)
+    stages = [(event.stage, event.outcome) for event in events]
+
+    assert stages[-1] == (STAGE_ROBUSTNESS, "failed")
+    assert STAGE_CANDIDATE not in [event.stage for event in events]
 
 
 @pytest.mark.asyncio

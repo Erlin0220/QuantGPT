@@ -26,12 +26,13 @@ from .wq_candidate_calibration import (
     calibration_report,
     configured_confidence_thresholds,
 )
-from .wq_correlation_proxy import correlation_evidence_is_fresh, correlation_priority_multiplier
+from .wq_correlation_proxy import correlation_priority_multiplier
 from .wq_failure_taxonomy import classify_research_failure
 from .wq_learning_maturity import active_feedback_gate
 from .wq_lineage import lineage_id_for, parent_lineage_id_for, recover_research_metadata
 from .wq_overfitting import overfitting_priority_multiplier
 from .wq_research_scheduler import research_cell_key
+from .wq_submission_evidence import configured_submission_evidence_policy, submission_evidence_blockers
 
 _DEFAULT_DAILY_BUDGET = 2
 _MAX_CONFIGURED_BUDGET = 5
@@ -40,8 +41,6 @@ _DEFAULT_INVENTORY_TARGET_LOW = 40
 _DEFAULT_INVENTORY_TARGET_HIGH = 50
 _DEFAULT_FRESHNESS_HOURS = 24.0
 _DEFAULT_RESERVATION_TTL_SECONDS = 15 * 60
-_DEFAULT_SUBMISSION_MAX_LOCAL_CORRELATION = 0.70
-_DEFAULT_SUBMISSION_MIN_OVERFIT_SCORE = 0.50
 _TERMINAL_POSITIVE_STATUSES = {"ACTIVE"}
 _TERMINAL_NEGATIVE_STATUSES = {"SC_FAIL", "OTHER_FAIL"}
 _CONVERSION_PRIOR_ALPHA = 2.0
@@ -103,6 +102,15 @@ def _normalized_datetime(value: datetime | None) -> datetime | None:
     return value.astimezone(timezone.utc)
 
 
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _candidate_is_fresh(candidate: WQResearchCandidate, *, now: datetime | None = None) -> bool:
     validated_at = _normalized_datetime(candidate.last_validated_at)
     if validated_at is None:
@@ -118,56 +126,6 @@ def _configured_reservation_ttl_seconds() -> int:
     except (TypeError, ValueError):
         value = _DEFAULT_RESERVATION_TTL_SECONDS
     return max(120, value)
-
-
-def _configured_submission_evidence_policy() -> dict[str, float]:
-    try:
-        max_local_correlation = float(
-            os.environ.get("WQ_SUBMISSION_MAX_LOCAL_CORRELATION", str(_DEFAULT_SUBMISSION_MAX_LOCAL_CORRELATION))
-        )
-    except (TypeError, ValueError):
-        max_local_correlation = _DEFAULT_SUBMISSION_MAX_LOCAL_CORRELATION
-    try:
-        min_overfit_score = float(
-            os.environ.get("WQ_SUBMISSION_MIN_OVERFIT_SCORE", str(_DEFAULT_SUBMISSION_MIN_OVERFIT_SCORE))
-        )
-    except (TypeError, ValueError):
-        min_overfit_score = _DEFAULT_SUBMISSION_MIN_OVERFIT_SCORE
-    return {
-        "max_local_correlation": max(0.0, min(1.0, max_local_correlation)),
-        "min_overfit_score": max(0.0, min(1.0, min_overfit_score)),
-    }
-
-
-def _submission_evidence_blockers(
-    local_evidence: dict[str, Any] | None,
-    overfitting: dict[str, Any] | None,
-    *,
-    now: datetime | None = None,
-) -> list[str]:
-    blockers: list[str] = []
-    evidence_policy = _configured_submission_evidence_policy()
-    local_evidence = local_evidence if isinstance(local_evidence, dict) else {}
-    try:
-        local_correlation = float(local_evidence.get("max_correlation"))
-    except (TypeError, ValueError):
-        local_correlation = None
-    if (
-        local_correlation is not None
-        and correlation_evidence_is_fresh(local_evidence, now=now)
-        and local_correlation >= evidence_policy["max_local_correlation"]
-    ):
-        blockers.append("local_correlation_high")
-
-    overfitting = overfitting if isinstance(overfitting, dict) else {}
-    if str(overfitting.get("status") or "").lower() == "available":
-        try:
-            overfit_score = float(overfitting.get("score"))
-        except (TypeError, ValueError):
-            overfit_score = None
-        if overfit_score is not None and overfit_score < evidence_policy["min_overfit_score"]:
-            blockers.append("overfitting_evidence_weak")
-    return blockers
 
 
 def _candidate_submission_blockers(
@@ -199,7 +157,7 @@ def _candidate_submission_blockers(
     }
     validation_details = candidate.validation_details if isinstance(candidate.validation_details, dict) else {}
     blockers.extend(
-        _submission_evidence_blockers(
+        submission_evidence_blockers(
             local_evidence,
             validation_details.get("overfitting_evidence"),
             now=now,
@@ -257,10 +215,7 @@ def _priority_score(candidate: dict[str, Any]) -> float:
     sc_check = next((check for check in raw_checks if str(check.get("name") or "").upper() == "SELF_CORRELATION"), None)
     if checks.get("SELF_CORRELATION") == "FAIL":
         return -10000.0
-    try:
-        self_correlation = float((sc_check or {}).get("value"))
-    except (TypeError, ValueError):
-        self_correlation = 0.0
+    self_correlation = _optional_float((sc_check or {}).get("value")) or 0.0
 
     turnover = number("turnover")
     turnover_penalty = 0.0
@@ -529,17 +484,11 @@ async def record_research_candidates(
                 ),
                 None,
             )
-            try:
-                self_correlation = float((sc_check or {}).get("value"))
-            except (TypeError, ValueError):
-                self_correlation = None
+            self_correlation = _optional_float((sc_check or {}).get("value"))
             sc_status = str((sc_check or {}).get("result") or "").upper() or None
             raw_local_correlation = candidate.get("local_correlation_proxy") or validation.get("local_correlation_proxy") or {}
             local_proxy = raw_local_correlation if isinstance(raw_local_correlation, dict) else {}
-            try:
-                local_correlation = float(local_proxy.get("max_correlation"))
-            except (TypeError, ValueError):
-                local_correlation = None
+            local_correlation = _optional_float(local_proxy.get("max_correlation"))
             local_correlation_alpha_id = str(local_proxy.get("matching_alpha_id") or "") or None
             try:
                 local_correlation_samples = int(local_proxy.get("sample_length") or 0)
@@ -551,14 +500,14 @@ async def record_research_candidates(
                     local_correlation_at = datetime.fromisoformat(str(local_proxy["calculated_at"]).replace("Z", "+00:00"))
                 except (TypeError, ValueError):
                     local_correlation_at = None
-            submission_evidence_blockers = _submission_evidence_blockers(
+            evidence_blockers = submission_evidence_blockers(
                 local_proxy,
                 validation.get("overfitting_evidence"),
             )
             validation["submission_gate"] = {
-                "ready": not submission_evidence_blockers,
-                "blockers": list(submission_evidence_blockers),
-                "policy": _configured_submission_evidence_policy(),
+                "ready": not evidence_blockers,
+                "blockers": list(evidence_blockers),
+                "policy": configured_submission_evidence_policy(),
             }
             peer_result = await session.execute(
                 select(WQResearchCandidate.expression).where(
@@ -641,7 +590,7 @@ async def record_research_candidates(
             # candidates retain their old queue semantics and are still rechecked before submit.
             if validation_status == "robustness_fail":
                 target_status = "robustness_fail"
-            elif validation_status in {"validation_pending", "robustness_unavailable"} or submission_evidence_blockers:
+            elif validation_status in {"validation_pending", "robustness_unavailable"} or evidence_blockers:
                 target_status = "validation_pending"
             else:
                 target_status = "queued"
@@ -758,10 +707,7 @@ async def reconcile_candidate_platform_statuses(
                 continue
             platform_status = str((info or {}).get("status") or "").upper()
             sc_result = str((info or {}).get("sc_result") or "").upper()
-            try:
-                sc_value = float((info or {}).get("sc_value"))
-            except (TypeError, ValueError):
-                sc_value = None
+            sc_value = _optional_float((info or {}).get("sc_value"))
             if platform_status == "ACTIVE":
                 target_status = "submitted"
             elif sc_result == "FAIL":
@@ -794,14 +740,36 @@ async def reconcile_candidate_platform_statuses(
                 if target_status is not None:
                     candidate.status = target_status
                 elif platform_status == "UNSUBMITTED":
-                    ready = (
+                    metrics_ready = (
                         float(candidate.sharpe or 0.0) >= 1.25
                         and float(candidate.fitness or 0.0) >= 1.0
                         and 0.01 <= float(candidate.turnover or 0.0) <= 0.7
                         and sc_result != "FAIL"
                     )
+                    validation_details = (
+                        dict(candidate.validation_details)
+                        if isinstance(candidate.validation_details, dict)
+                        else {}
+                    )
+                    robustness_ready = (
+                        str(validation_details.get("status") or candidate.validation_status or "").lower() == "ready"
+                        and candidate.robustness_score is not None
+                    )
+                    ready = metrics_ready and robustness_ready
                     candidate.status = "queued" if ready else "validation_pending"
-                    candidate.validation_status = "ready" if ready else "platform_readiness_failed"
+                    if ready:
+                        candidate.validation_status = "ready"
+                    elif metrics_ready and not robustness_ready:
+                        candidate.validation_status = "robustness_pending"
+                        validation_details.update(
+                            {
+                                "status": "robustness_pending",
+                                "reason": "platform_preflight_requires_cross_setting_robustness_before_submission",
+                            }
+                        )
+                        candidate.validation_details = validation_details
+                    else:
+                        candidate.validation_status = "platform_readiness_failed"
                     if ready:
                         evidence_blockers = [
                             blocker
@@ -831,23 +799,130 @@ async def reconcile_candidate_platform_statuses(
                         }],
                     },
                     "validation": {
+                        **(
+                            dict(candidate.validation_details)
+                            if isinstance(candidate.validation_details, dict)
+                            else {}
+                        ),
                         "status": candidate.validation_status,
                         "robustness_score": candidate.robustness_score,
+                    },
+                    "local_correlation_proxy": {
+                        "status": "available" if candidate.local_correlation is not None else "unavailable",
+                        "max_correlation": candidate.local_correlation,
+                        "matching_alpha_id": candidate.local_correlation_alpha_id,
+                        "sample_length": candidate.local_correlation_samples or 0,
+                        "calculated_at": candidate.local_correlation_at.isoformat() if candidate.local_correlation_at else None,
+                        "official_sc": False,
                     },
                     "novelty_score": candidate.novelty_score,
                 }
                 calibration = calibrate_active_probability(evidence, conversion_feedback)
-                candidate.active_probability = float(calibration["probability"])
+                active_probability = float(calibration["probability"])
+                candidate.active_probability = active_probability
                 candidate.confidence_tier = str(calibration["tier"])
                 candidate.probability_support = int(calibration["support"])
                 candidate.probability_provenance = str(calibration["provenance"])
                 candidate.calibration_details = calibration
                 candidate.priority_score = _priority_score(evidence)
                 if calibration.get("decision_weight_enabled"):
-                    candidate.priority_score *= 0.75 + candidate.active_probability * 0.5
+                    candidate.priority_score *= 0.75 + active_probability * 0.5
                 updated += 1
         await session.commit()
     return updated
+
+
+async def get_candidate_robustness_revalidation_payloads(
+    account: str,
+    alpha_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Load tracked candidates that need cross-setting robustness before formal submission."""
+    requested = {str(alpha_id or "").strip() for alpha_id in alpha_ids if str(alpha_id or "").strip()}
+    if not requested:
+        return []
+    factory = _get_session_factory()
+    async with factory() as session:
+        result = await session.execute(
+            select(WQResearchCandidate).where(
+                WQResearchCandidate.account == account,
+                WQResearchCandidate.alpha_id.in_(sorted(requested)),
+                WQResearchCandidate.status.in_(["queued", "validation_pending"]),
+            )
+        )
+        candidates = list(result.scalars().all())
+
+    payloads: list[dict[str, Any]] = []
+    for candidate in candidates:
+        validation_status = str(candidate.validation_status or "").lower()
+        if candidate.robustness_score is not None and validation_status == "ready":
+            continue
+        if validation_status not in {
+            "platform_recheck",
+            "robustness_pending",
+            "validation_pending",
+            "robustness_unavailable",
+        }:
+            continue
+        validation = dict(candidate.validation_details) if isinstance(candidate.validation_details, dict) else {}
+        local_proxy = {
+            "status": "available" if candidate.local_correlation is not None else "unavailable",
+            "max_correlation": candidate.local_correlation,
+            "matching_alpha_id": candidate.local_correlation_alpha_id,
+            "sample_length": candidate.local_correlation_samples or 0,
+            "calculated_at": candidate.local_correlation_at.isoformat() if candidate.local_correlation_at else None,
+            "official_sc": False,
+        }
+        payloads.append(
+            {
+                "alpha_id": str(candidate.alpha_id),
+                "expression": str(candidate.expression),
+                "is_metrics": {
+                    "sharpe": candidate.sharpe,
+                    "fitness": candidate.fitness,
+                    "returns": candidate.returns,
+                    "turnover": candidate.turnover,
+                    "checks": [
+                        {
+                            "name": "SELF_CORRELATION",
+                            "result": candidate.sc_status,
+                            "value": candidate.self_correlation,
+                        }
+                    ],
+                },
+                "research_meta": {
+                    "family": candidate.family,
+                    "hypothesis": candidate.hypothesis,
+                    "parent_expression": candidate.parent_expression,
+                    "generation": candidate.generation,
+                    "mutation_type": candidate.mutation_type,
+                    "data_fields": list(candidate.data_fields or []),
+                    "dataset_id": candidate.dataset_id,
+                    "dataset_category": candidate.dataset_category,
+                    "provenance_state": candidate.provenance_state,
+                    "provenance_reason": candidate.provenance_reason,
+                    "lineage_id": candidate.lineage_id,
+                    "parent_lineage_id": candidate.parent_lineage_id,
+                    "operator_pattern": candidate.operator_pattern,
+                    "operators": list(candidate.operators or []),
+                    "mutation_reason": candidate.mutation_reason,
+                    "planner_strategy": candidate.planner_strategy,
+                    "allocation_cell": candidate.allocation_cell,
+                    "source_run_id": candidate.source_run_id,
+                },
+                "validation": validation,
+                "local_correlation_proxy": local_proxy,
+                "settings": {
+                    "region": candidate.region,
+                    "universe": candidate.universe,
+                    "delay": candidate.delay,
+                    "decay": candidate.decay,
+                    "neutralization": candidate.neutralization,
+                    "truncation": candidate.truncation,
+                },
+                "tag": candidate.tag,
+            }
+        )
+    return payloads
 
 
 async def reserve_submission(
@@ -1091,9 +1166,9 @@ async def observe_account_status(account: str, status: dict[str, Any]) -> dict[s
             state.last_observed_points = points_value
 
             if points_status == "CURRENT":
-                if pending:
-                    baseline = float(state.last_settled_points or 0.0)
-                    delta = max(0.0, points_value - baseline)
+                baseline = float(state.last_settled_points or 0.0)
+                if pending and points_value > baseline:
+                    delta = points_value - baseline
                     cohort_ids = sorted(str(attempt.alpha_id) for attempt in pending)
                     attributed_share = delta / len(pending)
                     uncertainty_slots = max(0, int(state.untracked_active_gap or 0))
@@ -1144,7 +1219,7 @@ async def observe_account_status(account: str, status: dict[str, Any]) -> dict[s
                     else:
                         state.daily_budget = min(2, _configured_daily_budget())
                     state.last_settled_points = points_value
-                elif points_value != state.last_settled_points:
+                elif not pending and points_value != state.last_settled_points:
                     # Catch up the baseline for score changes not created by this
                     # local ledger (e.g. submissions made before this feature).
                     state.last_settled_points = points_value
@@ -1286,8 +1361,17 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
         leaderboard_lagging = last_points_status == "LEADERBOARD_LAGGING"
         points_sync_unknown = last_points_status == "SYNC_UNKNOWN"
         untracked_active_gap = int(state.untracked_active_gap or 0)
+        points_score_unchanged_pending = (
+            pending_score > 0
+            and last_points_status == "CURRENT"
+            and state.last_observed_points is not None
+            and state.last_settled_points is not None
+            and float(state.last_observed_points) <= float(state.last_settled_points)
+        )
         if points_sync_unknown:
             submission_warning = "points_sync_unknown_alpha_counts_unavailable"
+        elif points_score_unchanged_pending:
+            submission_warning = "leaderboard_alpha_count_current_but_score_unchanged_pending_points"
         elif leaderboard_lagging and untracked_active_gap > 0:
             submission_warning = "leaderboard_lagging_with_untracked_active_alphas"
         else:
@@ -1347,6 +1431,7 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             "untracked_active_gap": untracked_active_gap,
             "leaderboard_lagging": leaderboard_lagging,
             "points_sync_unknown": points_sync_unknown,
+            "points_score_unchanged_pending": points_score_unchanged_pending,
             "submission_warning": submission_warning,
             "submission_frozen": submission_frozen,
             "rule": "submission_budget_and_candidate_inventory_are_independent_control_loops",
@@ -1361,6 +1446,13 @@ def _run_coro_sync(coro):
         future = asyncio.run_coroutine_threadsafe(coro, loop)
         return future.result(timeout=20)
     return asyncio.run(coro)
+
+
+def get_candidate_robustness_revalidation_payloads_sync(
+    account: str,
+    alpha_ids: list[str],
+) -> list[dict[str, Any]]:
+    return _run_coro_sync(get_candidate_robustness_revalidation_payloads(account, alpha_ids))
 
 
 def reserve_submission_sync(account: str, alpha_id: str) -> dict[str, Any]:

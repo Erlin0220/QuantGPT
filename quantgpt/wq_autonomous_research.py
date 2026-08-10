@@ -15,6 +15,7 @@ from .wq_operator_registry import validate_wq_expression
 from .wq_research_agent import run_research_batch
 from .wq_research_memory import classify_wq_family, normalize_wq_expression
 from .wq_research_scheduler import allocate_research_cells
+from .wq_submission_evidence import configured_submission_evidence_policy, submission_evidence_blockers
 
 FAMILY_SEEDS: dict[str, tuple[str, ...]] = {
     "price_volume": (
@@ -1175,8 +1176,12 @@ def run_autonomous_research(
         base_validation_cap, replenishment_cap = 2, 4
     validation_cap = replenishment_cap if inventory_mode == "REPLENISHMENT" else base_validation_cap
     for index, candidate in enumerate(ranked_primary_candidates):
+        raw_existing_validation = candidate.get("validation")
+        existing_validation: dict[str, Any] = (
+            dict(raw_existing_validation) if isinstance(raw_existing_validation, dict) else {}
+        )
         if index < validation_cap and not (check_cancelled and check_cancelled()):
-            validation = validate_candidate_robustness(
+            robustness_validation = validate_candidate_robustness(
                 client,
                 candidate,
                 region=region,
@@ -1188,24 +1193,41 @@ def run_autonomous_research(
                 check_cancelled=check_cancelled,
             )
         else:
-            validation = {
+            robustness_validation = {
                 "status": "validation_pending",
                 "robustness_score": None,
                 "validation_simulations": 0,
                 "reason": f"per-round validation cap:{validation_cap}",
             }
+        validation = dict(existing_validation)
+        validation.update(robustness_validation)
+        raw_local_evidence = candidate.get("local_correlation_proxy") or validation.get("local_correlation_proxy")
+        local_evidence: dict[str, Any] = dict(raw_local_evidence) if isinstance(raw_local_evidence, dict) else {}
+        raw_overfitting = validation.get("overfitting_evidence")
+        overfitting_evidence: dict[str, Any] = dict(raw_overfitting) if isinstance(raw_overfitting, dict) else {}
+        evidence_blockers = submission_evidence_blockers(local_evidence, overfitting_evidence)
+        validation["submission_gate"] = {
+            "ready": not evidence_blockers,
+            "blockers": list(evidence_blockers),
+            "policy": configured_submission_evidence_policy(),
+        }
         candidate["validation"] = validation
         validation_simulations += int(validation.get("validation_simulations") or 0)
         mirrored = result_by_alpha.get(str(candidate.get("alpha_id")))
         if mirrored is not None:
-            mirrored["validation"] = validation
+            mirrored["validation"] = dict(validation)
             if validation.get("status") == "robustness_fail":
                 targets = list(mirrored.get("mutation_targets") or [])
                 if "improve_cross_setting_robustness" not in targets:
                     targets.append("improve_cross_setting_robustness")
                 mirrored["mutation_targets"] = targets
 
-    ready_candidates = [item for item in ranked_primary_candidates if (item.get("validation") or {}).get("status") == "ready"]
+    ready_candidates = [
+        item
+        for item in ranked_primary_candidates
+        if (item.get("validation") or {}).get("status") == "ready"
+        and ((item.get("validation") or {}).get("submission_gate") or {}).get("ready", True)
+    ]
     all_results.sort(key=_rank_result, reverse=True)
     ranked_primary_candidates.sort(key=_rank_result, reverse=True)
     best = all_results[0] if all_results else None
@@ -1238,7 +1260,8 @@ def run_autonomous_research(
         "summary": {
             "generations_requested": generations,
             "generations_completed": len(generation_results),
-            "max_simulations": max_simulations,
+            "primary_simulation_budget": max_simulations,
+            "primary_simulation_budget_scope": "research_generations_only",
             "memory_parent_mutations": len(memory_plan),
             "live_field_expressions": len(live_plan),
             "llm_expressions": len(llm_plan),
@@ -1250,6 +1273,10 @@ def run_autonomous_research(
             "robustness_failed": sum(1 for item in ranked_primary_candidates if (item.get("validation") or {}).get("status") == "robustness_fail"),
             "validation_simulations": validation_simulations,
             "validation_cap": validation_cap,
+            "validation_simulation_budget_upper_bound": validation_cap * 2,
+            "total_simulation_budget_upper_bound": max_simulations + validation_cap * 2,
+            "total_simulations": sum(int((item.get("summary") or {}).get("simulated") or 0) for item in generation_results) + validation_simulations,
+            "simulation_budget_note": "max_simulations is the primary-generation budget; robustness validation is separately bounded and both budgets are explicit",
             "directed_mutation_routes": sum(1 for item in all_results if item.get("directed_mutation_routed")),
             "simulation_failed": len(all_failed),
             "invalid": len(all_invalid),

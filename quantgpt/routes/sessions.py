@@ -5,7 +5,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, select
+from sqlalchemy import delete, desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..auth import get_current_user
@@ -123,14 +123,8 @@ async def delete_session(
     task_ids = [row[0] for row in task_ids_result.fetchall()]
 
     if task_ids:
-        await db.execute(
-            ReportModel.__table__.delete().where(ReportModel.task_id.in_(task_ids))
-        )
-        await db.execute(
-            SavedFactor.__table__.delete().where(SavedFactor.task_id.in_(task_ids))
-        )
-        await db.execute(
-            TaskModel.__table__.delete().where(TaskModel.session_id == session.id)
-        )
+        await db.execute(delete(ReportModel).where(ReportModel.task_id.in_(task_ids)))
+        await db.execute(delete(SavedFactor).where(SavedFactor.task_id.in_(task_ids)))
+        await db.execute(delete(TaskModel).where(TaskModel.session_id == session.id))
     await db.delete(session)
     await db.commit()

@@ -1,8 +1,6 @@
 """Tests for trajectory_analyzer.py."""
 
-import pytest
-
-from quantgpt.trajectory_analyzer import TrajectoryMetrics, analyze_trajectory
+from quantgpt.trajectory_analyzer import analyze_trajectory
 
 
 class TestAnalyzeTrajectory:

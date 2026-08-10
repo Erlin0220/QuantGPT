@@ -50,7 +50,7 @@ class WQBrainBatchRequest(BaseModel):
     neutralizations: list[str] = Field(default=["SUBINDUSTRY"], description="Neutralizations to sweep")
     decay: int = Field(0, ge=0, le=20, description="Alpha decay (shared)")
     truncation: float = Field(0.08, ge=0, le=0.5, description="Weight truncation (shared)")
-    auto_submit: bool = Field(False, description="Auto-submit if all IS checks pass")
+    auto_submit: bool = Field(False, description="Deprecated; formal submission must use the validated Candidate submit-by-id flow")
     account: str = Field("primary", description="WQ account: 'primary' or 'alt'")
     session_id: str | None = Field(None, description="Session ID")
 
@@ -224,6 +224,11 @@ async def wq_brain_batch_submit(
 ):
     if not is_configured():
         raise HTTPException(status_code=503, detail="WQ BRAIN 未配置")
+    if req.auto_submit:
+        raise HTTPException(
+            status_code=422,
+            detail="auto_submit 已停用；请先研究并进入 Candidate Queue，再使用 submit-by-id 正式提交",
+        )
 
     for r in req.regions:
         if r not in VALID_REGIONS:

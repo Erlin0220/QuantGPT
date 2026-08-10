@@ -56,6 +56,22 @@ class TestWQMCPAsyncSurface(unittest.IsolatedAsyncioTestCase):
             with self.subTest(name=name):
                 await self._assert_enqueued(name, call)
 
+    async def test_auto_submit_is_rejected_before_task_enqueue(self):
+        with (
+            patch.dict(
+                os.environ,
+                {"WQ_BRAIN_EMAIL": "test@example.com", "WQ_BRAIN_PASSWORD": "pw"},
+                clear=False,
+            ),
+            patch.object(mcp_server, "start_mcp_task", new=AsyncMock()) as start_task,
+        ):
+            single = json.loads(await mcp_server.wq_brain_submit("rank(close)", "smoke", auto_submit=True))
+            batch = json.loads(await mcp_server.wq_brain_batch_submit("rank(close)", "smoke", auto_submit=True))
+
+        self.assertEqual(single["reason"], "auto_submit_disabled_use_candidate_pipeline")
+        self.assertEqual(batch["reason"], "auto_submit_disabled_use_candidate_pipeline")
+        start_task.assert_not_awaited()
+
     async def test_research_reuses_existing_singleflight_task(self):
         existing = {
             "task_id": "research-active",

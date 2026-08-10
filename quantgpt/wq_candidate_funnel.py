@@ -127,9 +127,16 @@ def funnel_events_for_trial(trial: Any, item: dict[str, Any]) -> list[dict[str, 
         events.append(_event(STAGE_ROBUSTNESS, "passed", details=dict(validation or {})))
 
     checks = list((item.get("is_metrics") or {}).get("checks") or [])
-    has_correlation_evidence = failure_stage == "diversity" or any(
-        str(check.get("name") or "").upper() == "SELF_CORRELATION" for check in checks if isinstance(check, dict)
-    ) or item.get("novelty_score") is not None
+    has_correlation_evidence = (
+        failure_stage == "diversity"
+        or any(
+            str(check.get("name") or "").upper() == "SELF_CORRELATION"
+            for check in checks
+            if isinstance(check, dict)
+        )
+        or isinstance(item.get("local_correlation_proxy"), dict)
+        or item.get("novelty_score") is not None
+    )
     if failure_stage in {"diversity", "submission"}:
         events.append(_event(STAGE_CORRELATION, "failed", reason=failure_reason))
         return events

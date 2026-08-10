@@ -163,6 +163,45 @@ class TestAdaptiveParallelSweep(unittest.TestCase):
         self.assertEqual(result["concurrency"]["initial"], 3)
 
 
+class TestDeprecatedAutoSubmit(unittest.TestCase):
+    def setUp(self):
+        _reset_adaptive_concurrency_hint()
+
+    def test_single_simulation_never_bypasses_candidate_pipeline(self):
+        result = run_single_simulation(
+            _ParallelFakeClient(_SharedState()),
+            "rank(close)",
+            auto_submit=True,
+            submission_guard=lambda _alpha_id: self.fail("submission guard must not be called"),
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["submitted"])
+        self.assertEqual(
+            result["submission_blocked"]["reason"],
+            "auto_submit_disabled_use_candidate_pipeline",
+        )
+
+    def test_batch_simulation_never_bypasses_candidate_pipeline(self):
+        result = run_batch_simulation(
+            _ParallelFakeClient(_SharedState()),
+            "rank(close)",
+            regions=["USA"],
+            delays=[1],
+            universes=["TOP3000"],
+            neutralizations=["SUBINDUSTRY"],
+            auto_submit=True,
+            submission_guard=lambda _alpha_id: self.fail("submission guard must not be called"),
+        )
+
+        entry = next(iter(result["sub_results"].values()))
+        self.assertFalse(entry["submitted"])
+        self.assertEqual(
+            entry["submission_blocked"]["reason"],
+            "auto_submit_disabled_use_candidate_pipeline",
+        )
+
+
 class TestGlobalSimulationGate(unittest.TestCase):
     def setUp(self):
         _reset_adaptive_concurrency_hint()

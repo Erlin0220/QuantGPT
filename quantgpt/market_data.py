@@ -11,6 +11,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -553,7 +554,10 @@ class MarketDataFetcher:
                 # Only use cache if it covers the full requested range
                 # Allow 5-day tolerance for weekends/holidays at boundaries
                 if cache_min <= req_start + pd.Timedelta(days=5) and cache_max >= req_end - pd.Timedelta(days=5):
-                    filtered = cached[(cached["trade_date"] >= req_start) & (cached["trade_date"] <= req_end)]
+                    filtered = cast(
+                        pd.DataFrame,
+                        cached.loc[(cached["trade_date"] >= req_start) & (cached["trade_date"] <= req_end)],
+                    )
                     if len(filtered) > 0:
                         all_data.append(filtered)
                         continue
@@ -581,7 +585,10 @@ class MarketDataFetcher:
                                             .sort_values("trade_date")
                                         )
                                     self._save_cache(code, df)
-                                    filtered = df[(df["trade_date"] >= req_start) & (df["trade_date"] <= req_end)]
+                                    filtered = cast(
+                                        pd.DataFrame,
+                                        df.loc[(df["trade_date"] >= req_start) & (df["trade_date"] <= req_end)],
+                                    )
                                     if len(filtered) > 0:
                                         all_data.append(filtered)
                                     bs_fetched.add(self._normalize_stock_code(code))
@@ -604,7 +611,10 @@ class MarketDataFetcher:
                                         .sort_values("trade_date")
                                     )
                                 self._save_cache(bs_code, df)
-                                filtered = df[(df["trade_date"] >= req_start) & (df["trade_date"] <= req_end)]
+                                filtered = cast(
+                                    pd.DataFrame,
+                                    df.loc[(df["trade_date"] >= req_start) & (df["trade_date"] <= req_end)],
+                                )
                                 if len(filtered) > 0:
                                     all_data.append(filtered)
 
@@ -617,7 +627,7 @@ class MarketDataFetcher:
             return result
         return None
 
-    def calculate_forward_returns(self, df: pd.DataFrame, periods: list[int] = None) -> pd.DataFrame:
+    def calculate_forward_returns(self, df: pd.DataFrame, periods: list[int] | None = None) -> pd.DataFrame:
         """Add fwd_ret_{N}d columns."""
         periods = periods or [5]
         df = df.sort_values(["stock_code", "trade_date"])
@@ -654,12 +664,12 @@ def fetch_benchmark_returns(
             req_e = pd.Timestamp(end_date) if end_date else cache_max
             # Only use cache if it covers the full requested range
             if cache_min <= req_s + pd.Timedelta(days=5) and cache_max >= req_e - pd.Timedelta(days=5):
-                ret = df.set_index("trade_date")["daily_return"].dropna()
+                ret = cast(pd.Series, df.set_index("trade_date")["daily_return"]).dropna()
                 ret.name = info["name"]
                 if start_date:
-                    ret = ret[ret.index >= pd.Timestamp(start_date)]
+                    ret = cast(pd.Series, ret.loc[ret.index >= pd.Timestamp(start_date)])
                 if end_date:
-                    ret = ret[ret.index <= pd.Timestamp(end_date)]
+                    ret = cast(pd.Series, ret.loc[ret.index <= pd.Timestamp(end_date)])
                 if len(ret) > 1:
                     return ret
         except Exception:

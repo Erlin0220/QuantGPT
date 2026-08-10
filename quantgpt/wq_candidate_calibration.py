@@ -60,11 +60,15 @@ def quality_baseline(candidate: dict[str, Any]) -> dict[str, Any]:
     turnover = _safe_float(metrics.get("turnover"))
     robustness = _clamp01(_safe_float(validation.get("robustness_score")))
     novelty = _clamp01(_safe_float(candidate.get("novelty_score")))
-    try:
-        self_correlation = float(sc_check.get("value"))
-        official_correlation = _clamp01(1.0 - max(0.0, self_correlation))
-    except (TypeError, ValueError):
+    raw_self_correlation = sc_check.get("value")
+    if raw_self_correlation is None:
         official_correlation = 0.65
+    else:
+        try:
+            self_correlation = float(raw_self_correlation)
+            official_correlation = _clamp01(1.0 - max(0.0, self_correlation))
+        except (TypeError, ValueError):
+            official_correlation = 0.65
 
     local_proxy = candidate.get("local_correlation_proxy") or {}
     local_multiplier = correlation_priority_multiplier(local_proxy)

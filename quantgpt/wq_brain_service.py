@@ -352,15 +352,11 @@ def run_single_simulation(
     submitted = False
     submission_blocked: dict | None = None
     if auto_submit and alpha_id and grade == "A":
-        decision = submission_guard(alpha_id) if submission_guard else {"allowed": True}
-        allowed = decision if isinstance(decision, bool) else bool(decision.get("allowed"))
-        if allowed:
-            submit_result = client.submit_alpha(alpha_id)
-            submitted = submit_result.get("ok", False)
-            if submission_result_callback:
-                submission_result_callback(alpha_id, submit_result)
-        else:
-            submission_blocked = decision if isinstance(decision, dict) else {"allowed": False, "reason": "submission_guard_blocked"}
+        submission_blocked = {
+            "allowed": False,
+            "reason": "auto_submit_disabled_use_candidate_pipeline",
+            "detail": "simulate/research first, persist a validated Candidate, then use submit-by-id",
+        }
 
     if submitted and alpha_id and user_id:
         _track_alpha(
@@ -458,15 +454,11 @@ def run_batch_simulation(
         submitted = False
         submission_blocked: dict | None = None
         if auto_submit and alpha_id and grade == "A":
-            decision = submission_guard(alpha_id) if submission_guard else {"allowed": True}
-            allowed = decision if isinstance(decision, bool) else bool(decision.get("allowed"))
-            if allowed:
-                submit_result = worker_client.submit_alpha(alpha_id)
-                submitted = submit_result.get("ok", False)
-                if submission_result_callback:
-                    submission_result_callback(alpha_id, submit_result)
-            else:
-                submission_blocked = decision if isinstance(decision, dict) else {"allowed": False, "reason": "submission_guard_blocked"}
+            submission_blocked = {
+                "allowed": False,
+                "reason": "auto_submit_disabled_use_candidate_pipeline",
+                "detail": "simulate/research first, persist a validated Candidate, then use submit-by-id",
+            }
 
         if submitted and alpha_id and user_id:
             _track_alpha(

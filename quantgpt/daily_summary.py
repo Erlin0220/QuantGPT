@@ -15,6 +15,7 @@ import re
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
 import pandas as pd
 from openai import OpenAI
@@ -55,12 +56,13 @@ def _get_today_index_changes(date: str | None = None) -> dict:
             ret = fetch_benchmark_returns(code, start, today)
             if ret is not None and len(ret) > 0:
                 # Use exact date match, not last available
-                ret.index = pd.to_datetime(ret.index).normalize()
+                ret.index = pd.Index([cast(pd.Timestamp, pd.Timestamp(value)).normalize() for value in ret.index])
                 if target in ret.index:
                     metrics[f"{name}_change"] = round(float(ret.loc[target]) * 100, 2)
                 else:
                     # Fallback to last date, but log warning
-                    logger.warning(f"[daily_summary] {name} has no data for {today}, latest is {ret.index[-1].strftime('%Y-%m-%d')}")
+                    latest_date = str(ret.index[-1])[:10]
+                    logger.warning(f"[daily_summary] {name} has no data for {today}, latest is {latest_date}")
                     metrics[f"{name}_change"] = round(float(ret.iloc[-1]) * 100, 2)
             else:
                 metrics[f"{name}_change"] = 0.0

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import os
 import re
-from collections import Counter
+from collections import Counter, defaultdict
+from collections.abc import Mapping
 from typing import Any
 
 from sqlalchemy import select
@@ -163,15 +164,26 @@ async def record_research_trials(
     rows: list[WQResearchTrial] = []
     stage_events: list[WQResearchStageEvent] = []
 
-    candidate_ids = {
-        str(item.get("alpha_id"))
-        for item in (result.get("candidates") or [])
+    result_items_by_alpha = {
+        str(item.get("alpha_id")): item
+        for item in (result.get("results") or [])
         if item.get("alpha_id")
-        and (
-            "validation" not in item
-            or str((item.get("validation") or {}).get("status") or "").lower() == "ready"
-        )
     }
+    candidate_ids: set[str] = set()
+    for candidate in result.get("candidates") or []:
+        alpha_id = str(candidate.get("alpha_id") or "")
+        if not alpha_id:
+            continue
+        evidence_item = candidate if "validation" in candidate else result_items_by_alpha.get(alpha_id, candidate)
+        validation = evidence_item.get("validation") if isinstance(evidence_item.get("validation"), dict) else None
+        if validation is None:
+            candidate_ids.add(alpha_id)
+            continue
+        if (
+            str(validation.get("status") or "").lower() == "ready"
+            and (validation.get("submission_gate") or {}).get("ready", True)
+        ):
+            candidate_ids.add(alpha_id)
     for item in result.get("results") or []:
         status = "candidate" if str(item.get("alpha_id")) in candidate_ids else "rejected"
         row = _trial_from_item(
@@ -362,7 +374,7 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
             )
             .where(WQSubmissionAttempt.account == account)
         )
-        formal_rows = list(formal_result.all())
+        formal_rows = [(attempt, candidate) for attempt, candidate in formal_result.all()]
         from .wq_submission_policy import _load_conversion_feedback
 
         conversion_feedback = await _load_conversion_feedback(session, account)
@@ -484,15 +496,15 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
         "partial_reasons": dict(partial_reason_counts),
     }
     min_points_confidence, min_points_samples = _points_feedback_thresholds()
-    family_points_attribution: Counter[str] = Counter()
-    family_points_feedback: Counter[str] = Counter()
-    dataset_points_attribution: Counter[str] = Counter()
-    dataset_points_feedback: Counter[str] = Counter()
-    operator_points_attribution: Counter[str] = Counter()
-    operator_points_feedback: Counter[str] = Counter()
-    usable_family_feedback: Counter[str] = Counter()
-    usable_dataset_feedback: Counter[str] = Counter()
-    usable_operator_feedback: Counter[str] = Counter()
+    family_points_attribution: defaultdict[str, float] = defaultdict(float)
+    family_points_feedback: defaultdict[str, float] = defaultdict(float)
+    dataset_points_attribution: defaultdict[str, float] = defaultdict(float)
+    dataset_points_feedback: defaultdict[str, float] = defaultdict(float)
+    operator_points_attribution: defaultdict[str, float] = defaultdict(float)
+    operator_points_feedback: defaultdict[str, float] = defaultdict(float)
+    usable_family_feedback: defaultdict[str, float] = defaultdict(float)
+    usable_dataset_feedback: defaultdict[str, float] = defaultdict(float)
+    usable_operator_feedback: defaultdict[str, float] = defaultdict(float)
     usable_family_samples: Counter[str] = Counter()
     usable_dataset_samples: Counter[str] = Counter()
     usable_operator_samples: Counter[str] = Counter()
@@ -534,7 +546,7 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
             usable_family_samples[family] += 1
             usable_operator_samples[operator_pattern] += 1
 
-    def usable_groups(feedback: Counter[str], samples: Counter[str]) -> dict[str, float]:
+    def usable_groups(feedback: Mapping[str, float], samples: Counter[str]) -> dict[str, float]:
         return {
             key: round(float(value), 4)
             for key, value in feedback.items()

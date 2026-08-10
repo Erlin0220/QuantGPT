@@ -9,6 +9,7 @@ returns per group. The strategy return is the top group's daily return.
 
 import logging
 import threading
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -139,9 +140,10 @@ def run_factor_backtest(
 
     # 5. On each rebalance date, assign groups based on factor value
     #    Build a mapping: (trade_date, stock_code) -> group
-    work = market_df[["trade_date", "stock_code", "factor_value", "daily_ret", "close"]].dropna(
-        subset=["factor_value"]
-    ).copy()
+    work = cast(
+        pd.DataFrame,
+        market_df.loc[:, ["trade_date", "stock_code", "factor_value", "daily_ret", "close"]],
+    ).dropna(subset=["factor_value"]).copy()
 
     # Determine grouping strategy: rank-based by default (aligned with WQ BRAIN)
     effective_groups = n_groups
@@ -166,7 +168,7 @@ def run_factor_backtest(
             return vals.map(mapping)
         try:
             ranks = vals.rank(method="first")
-            return pd.cut(ranks, bins=effective_groups, labels=False)
+            return cast(pd.Series, pd.cut(ranks, bins=effective_groups, labels=False))
         except ValueError:
             return pd.Series(np.nan, index=vals.index)
 
@@ -421,8 +423,9 @@ def _calc_ic_series(
                     for i in range(len(all_dates) - holding_period)}
 
     work["_fwd_date"] = work["trade_date"].map(date_fwd_map)
-    future_close = work[["trade_date", "stock_code", "close"]].rename(
-        columns={"trade_date": "_fwd_date", "close": "_fwd_close"})
+    future_close = cast(pd.DataFrame, work.loc[:, ["trade_date", "stock_code", "close"]]).rename(
+        columns={"trade_date": "_fwd_date", "close": "_fwd_close"}
+    )
     work = work.merge(future_close, on=["_fwd_date", "stock_code"], how="left")
     work["fwd_ret"] = np.where(
         work["close"] > 0, work["_fwd_close"] / work["close"] - 1, np.nan)
@@ -471,7 +474,7 @@ def _calc_turnover(
     top_holdings = {}
     for d in rebalance_dates:
         day_data = work[(work["_rebal_date"] == d) & (work["_group"] == top_group)]
-        top_holdings[d] = set(day_data["stock_code"].unique())
+        top_holdings[d] = set(pd.unique(cast(pd.Series, day_data["stock_code"])))
 
     turnovers = []
     sorted_dates = sorted(top_holdings.keys())
@@ -491,7 +494,7 @@ def _calc_turnover(
 
 def _calc_monotonicity(group_means: list[float]) -> float:
     """Spearman rank correlation between group index and mean return."""
-    if len(group_means) < 3:
+    if len(group_means) < 3 or len(set(group_means)) < 2:
         return 0.0
     ranks = list(range(len(group_means)))
     corr, _ = sp_stats.spearmanr(ranks, group_means)
@@ -513,7 +516,7 @@ def _calc_per_group_turnover(
     for d in rebalance_dates:
         for g in range(n_groups):
             day_data = work[(work["_rebal_date"] == d) & (work["_group"] == g)]
-            holdings[(d, g)] = set(day_data["stock_code"].unique())
+            holdings[(d, g)] = set(pd.unique(cast(pd.Series, day_data["stock_code"])))
 
     sorted_dates = sorted(set(d for d, _ in holdings))
     result = {}

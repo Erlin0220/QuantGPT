@@ -315,7 +315,12 @@ async def resolve_feedback(
 
             asyncio.create_task(_safe_send())
 
-    return {"id": str(fb.id), "resolved": True, "resolved_at": fb.resolved_at.isoformat()}
+    resolved_at = fb.resolved_at
+    return {
+        "id": str(fb.id),
+        "resolved": True,
+        "resolved_at": resolved_at.isoformat() if resolved_at is not None else None,
+    }
 
 
 # ---- Factor Deep Research Report ----

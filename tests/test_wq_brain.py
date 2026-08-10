@@ -8,8 +8,6 @@ import pytest
 from quantgpt.wq_brain_client import WQBrainClient, configured_accounts, get_client, is_configured
 from quantgpt.wq_brain_service import run_account_status, run_list_alphas
 
-pytestmark = pytest.mark.asyncio
-
 
 class TestIsConfigured:
     def test_not_configured_when_empty(self):
@@ -305,6 +303,7 @@ class TestAccountStatusService:
 
 
 class TestWQBrainStatusEndpoint:
+    @pytest.mark.asyncio
     async def test_status_returns_config(self, client):
         resp = await client.get("/api/v1/wq-brain/status")
         assert resp.status_code == 200
@@ -315,6 +314,7 @@ class TestWQBrainStatusEndpoint:
 
 
 class TestWQBrainSubmitEndpoint:
+    @pytest.mark.asyncio
     async def test_submit_returns_503_when_not_configured(self, client):
         with patch.dict(os.environ, {"WQ_BRAIN_EMAIL": "", "WQ_BRAIN_PASSWORD": ""}, clear=False):
             resp = await client.post("/api/v1/wq-brain/submit", json={
@@ -323,6 +323,7 @@ class TestWQBrainSubmitEndpoint:
             })
             assert resp.status_code == 503
 
+    @pytest.mark.asyncio
     async def test_submit_creates_task(self, client):
         with (
             patch.dict(os.environ, {"WQ_BRAIN_EMAIL": "a@b.com", "WQ_BRAIN_PASSWORD": "pw"}, clear=False),
@@ -339,6 +340,7 @@ class TestWQBrainSubmitEndpoint:
 
 
 class TestSubmittedAlphasEndpoint:
+    @pytest.mark.asyncio
     async def test_list_returns_empty(self, client):
         resp = await client.get("/api/v1/wq-brain/submitted-alphas")
         assert resp.status_code == 200
@@ -348,6 +350,7 @@ class TestSubmittedAlphasEndpoint:
 
 
 class TestSubmitAlphaEndpoint:
+    @pytest.mark.asyncio
     async def test_submit_alpha_task_not_found(self, client):
         with patch.dict(os.environ, {"WQ_BRAIN_EMAIL": "a@b.com", "WQ_BRAIN_PASSWORD": "pw"}, clear=False):
             resp = await client.post("/api/v1/wq-brain/nonexistent/submit-alpha")

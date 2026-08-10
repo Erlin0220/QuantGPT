@@ -18,6 +18,7 @@ import os
 import tempfile
 import uuid
 from pathlib import Path
+from typing import cast
 
 from celery import Celery
 
@@ -96,8 +97,6 @@ def from_json_transport(obj):
 
 
 def _save_df(df, type_tag: str) -> dict:
-    import pandas as pd
-
     CELERY_DATA_DIR.mkdir(parents=True, exist_ok=True)
     path = CELERY_DATA_DIR / f"{uuid.uuid4().hex}.parquet"
     df.to_parquet(path)
@@ -126,8 +125,8 @@ def run_cpu_work(self, fn_path: str, args: list, kwargs: dict):
     if fn_path not in ALLOWED_TASKS:
         raise ValueError(f"Blocked task function: {fn_path}")
 
-    args = from_json_transport(args)
-    kwargs = from_json_transport(kwargs)
+    args = cast(list, from_json_transport(args))
+    kwargs = cast(dict, from_json_transport(kwargs))
 
     module_path, fn_name = fn_path.rsplit(".", 1)
     mod = importlib.import_module(module_path)

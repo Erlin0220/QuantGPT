@@ -42,7 +42,7 @@ class WQBrainSubmitRequest(BaseModel):
     decay: int = Field(0, ge=0, le=20, description="Alpha decay")
     neutralization: str = Field("SUBINDUSTRY", description="Neutralization method")
     truncation: float = Field(0.08, ge=0, le=0.5, description="Weight truncation")
-    auto_submit: bool = Field(False, description="Auto-submit if checks pass")
+    auto_submit: bool = Field(False, description="Deprecated; formal submission must use the validated Candidate submit-by-id flow")
     account: str = Field("primary", description="WQ account: 'primary' or 'alt'")
     session_id: str | None = Field(None, description="Session ID")
 
@@ -161,6 +161,11 @@ async def wq_brain_submit(
     """提交因子表达式到 WorldQuant BRAIN 平台进行模拟。异步执行，返回 task_id。模拟通常需要 2-5 分钟，用 GET /api/v1/tasks/{task_id} 轮询结果。结果包含 Sharpe、Fitness、Turnover 等 IS 指标。"""
     if not is_configured(req.account):
         raise HTTPException(status_code=503, detail=f"WQ BRAIN 未配置 (account={req.account}) — 请设置对应的环境变量")
+    if req.auto_submit:
+        raise HTTPException(
+            status_code=422,
+            detail="auto_submit 已停用；请先研究并进入 Candidate Queue，再使用 submit-by-id 正式提交",
+        )
 
     client_ip = request.client.host if request.client else "unknown"
     if not check_rate_limit(client_ip):

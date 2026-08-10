@@ -10,7 +10,11 @@ from quantgpt.wq_candidate_calibration import (
     calibration_report,
     confidence_tier,
 )
-from quantgpt.wq_submission_policy import _load_conversion_feedback, get_submission_policy_status, record_research_candidates
+from quantgpt.wq_submission_policy import (
+    _load_conversion_feedback,
+    get_submission_policy_status,
+    record_research_candidates,
+)
 
 
 def _candidate(**overrides):
