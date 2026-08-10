@@ -14,6 +14,7 @@ from __future__ import annotations
 import itertools
 import logging
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -539,6 +540,26 @@ def reconcile_submission_uncertainty(client, account: str = "primary") -> dict[s
     }
 
 
+def _explicit_platform_check_failure(result: dict[str, Any]) -> str | None:
+    """Return a non-SC BRAIN check that explicitly rejected an unsubmitted Alpha."""
+    try:
+        status_code = int(result.get("status_code") or 0)
+    except (TypeError, ValueError):
+        status_code = 0
+    if status_code != 403:
+        return None
+    detail = str(result.get("detail") or "")
+    for match in re.finditer(
+        r'"name"\s*:\s*"([^"]+)"(?:(?!\}\s*,\s*\{).)*?"result"\s*:\s*"FAIL"',
+        detail,
+        flags=re.IGNORECASE,
+    ):
+        check_name = str(match.group(1) or "").upper()
+        if check_name and check_name != "SELF_CORRELATION":
+            return check_name
+    return None
+
+
 def run_submit_by_ids(
     client,
     alpha_ids: list[str],
@@ -594,6 +615,10 @@ def run_submit_by_ids(
         elif "SC FAIL" in result.get("detail", ""):
             sc_fail += 1
             entry["final_status"] = "SC_FAIL"
+        elif platform_failure := _explicit_platform_check_failure(result):
+            entry["final_status"] = "OTHER_FAIL"
+            entry["confirmed_not_submitted"] = True
+            entry["platform_check_failure"] = platform_failure
         elif result.get("confirmed_not_submitted") or str(result.get("platform_status") or "").upper() == "UNSUBMITTED":
             entry["final_status"] = "UNSUBMITTED_CONFIRMED"
             entry["confirmed_not_submitted"] = True

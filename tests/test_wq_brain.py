@@ -178,6 +178,26 @@ class TestSubmitByIdsService:
         assert result["results"]["alpha-unknown"]["final_status"] == "SUBMIT_UNKNOWN"
         assert result["results"]["alpha-unknown"]["submission_uncertain"] is True
 
+    def test_explicit_403_platform_check_failure_is_terminal_other_fail(self):
+        client = MagicMock()
+        client.submit_alpha.return_value = {
+            "ok": False,
+            "status_code": 403,
+            "detail": '{"is":{"checks":[{"name":"LOW_SUB_UNIVERSE_SHARPE","result":"FAIL","limit":0.55,"value":0.5},{"name":"SELF_CORRELATION","result":"PENDING"}]}}',
+        }
+
+        result = run_submit_by_ids(
+            client,
+            ["alpha-platform-fail"],
+            submission_guard=lambda _alpha_id: {"allowed": True},
+        )
+
+        entry = result["results"]["alpha-platform-fail"]
+        assert entry["final_status"] == "OTHER_FAIL"
+        assert entry["confirmed_not_submitted"] is True
+        assert entry["platform_check_failure"] == "LOW_SUB_UNIVERSE_SHARPE"
+        assert result["timeout"] == 0
+
 
 class TestListAlphasService:
     def test_status_filter_is_sent_to_platform_before_pagination(self):
