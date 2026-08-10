@@ -23,7 +23,7 @@ def test_zero_settled_points_have_zero_planner_eligibility():
     assert gate["reason"] == "no_settled_points"
 
 
-def test_scheduler_uses_coverage_first_while_learning_is_cold(monkeypatch):
+def test_scheduler_adapts_from_research_evidence_while_active_learning_is_cold(monkeypatch):
     monkeypatch.setenv("WQ_ACTIVE_DECISION_MIN_SAMPLES", "20")
     maturity = build_learning_maturity(
         trials=60,
@@ -33,17 +33,40 @@ def test_scheduler_uses_coverage_first_while_learning_is_cold(monkeypatch):
     )
     cells = [
         {"cell_key": "a|d1|p1", "family": "a", "dataset": "d1", "operator_pattern": "p1", "trials": 40, "candidates": 5},
-        {"cell_key": "b|d2|p2", "family": "b", "dataset": "d2", "operator_pattern": "p2", "trials": 2, "candidates": 0},
+        {"cell_key": "b|d2|p2", "family": "b", "dataset": "d2", "operator_pattern": "p2", "trials": 12, "candidates": 0, "recent_failure_reasons": {"low_fitness": 12}},
     ]
 
     allocation = allocate_research_cells(cells, budget=6, inventory_mode="REPLENISHMENT", learning_maturity=maturity)
 
+    assert maturity["active_outcome_weighting"]["ready"] is False
+    assert maturity["scheduler_adaptation"]["ready"] is True
+    assert maturity["scheduler_adaptation"]["active_outcome_dependency"] == "independent"
+    assert allocation["policy"] == "adaptive"
+    assert allocation["cooldown_enabled"] is True
+    weak = next(item for item in allocation["cell_summaries"] if item["cell_key"] == "b|d2|p2")
+    assert weak["cooldown"] is True
+    assert allocation["exploitation_slots"] > 0
+
+
+def test_scheduler_keeps_coverage_first_until_local_research_is_mature(monkeypatch):
+    monkeypatch.setenv("WQ_SCHEDULER_ADAPTIVE_MIN_TRIALS", "50")
+    maturity = build_learning_maturity(
+        trials=20,
+        provenance_resolved=20,
+        active_feedback={"global": {"samples": 25, "rate": 0.4}},
+        points_coverage={"settled_attempts": 3, "usable_attempts": 2},
+    )
+    cells = [
+        {"cell_key": "a|d1|p1", "family": "a", "dataset": "d1", "operator_pattern": "p1", "trials": 10, "candidates": 1},
+        {"cell_key": "b|d2|p2", "family": "b", "dataset": "d2", "operator_pattern": "p2", "trials": 10, "candidates": 0},
+    ]
+
+    allocation = allocate_research_cells(cells, budget=4, learning_maturity=maturity)
+
+    assert maturity["scheduler_adaptation"]["ready"] is False
+    assert "insufficient_research_trials" in maturity["scheduler_adaptation"]["reasons"]
     assert allocation["policy"] == "coverage_first"
-    assert allocation["exploration_slots"] == 6
-    assert allocation["exploitation_slots"] == 0
     assert allocation["cooldown_enabled"] is False
-    assert all(item["rationale"] == "cold_start_coverage_first" for item in allocation["selected_cells"])
-    assert {item["cell_key"] for item in allocation["selected_cells"]} == {"a|d1|p1", "b|d2|p2"}
 
 
 def test_scheduler_can_return_to_adaptive_after_all_gates_are_ready(monkeypatch):

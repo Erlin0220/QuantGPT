@@ -90,6 +90,19 @@ def _trial_promise_score(
         score -= 0.25
     if item.get("self_correlation_failed"):
         score -= 0.5
+    failure_text = " ".join(
+        [str(item.get("failure_reason") or "")]
+        + [str(value) for value in (item.get("mutation_targets") or [])]
+        + [str(value) for value in (item.get("failure_reasons") or [])]
+    ).lower()
+    validation = item.get("validation") or {}
+    robustness_failed = (
+        "robustness" in failure_text
+        or "sub_universe" in failure_text
+        or (isinstance(validation, dict) and str(validation.get("status") or "").lower() == "robustness_fail")
+    )
+    if robustness_failed:
+        score -= 0.45
     return score
 
 
@@ -391,6 +404,97 @@ def build_live_field_plan(
             if len(plan) >= limit:
                 return plan, catalog, fields
     return plan, catalog, fields
+
+
+def build_structural_live_plan(
+    client,
+    fields: list[dict[str, Any]],
+    *,
+    seen: set[str],
+    limit: int,
+    hypothesis: str,
+) -> list[dict[str, Any]]:
+    """Generate bounded cross-field structural motifs from live BRAIN fields."""
+    if limit <= 0 or len(fields) < 2:
+        return []
+    try:
+        supported = client.list_operator_names()
+    except Exception:
+        return []
+    if not supported:
+        return []
+
+    valid_fields = [item for item in fields if _live_field_id(item)]
+    by_dataset: dict[str, list[dict[str, Any]]] = {}
+    for item in valid_fields:
+        dataset = item.get("dataset") or {}
+        dataset_id = str(dataset.get("id") or "") if isinstance(dataset, dict) else str(dataset or "")
+        if dataset_id:
+            by_dataset.setdefault(dataset_id, []).append(item)
+
+    pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for dataset_id in sorted(by_dataset):
+        values = by_dataset[dataset_id]
+        for index in range(0, len(values) - 1, 2):
+            pairs.append((values[index], values[index + 1]))
+    if not pairs:
+        pairs = list(zip(valid_fields[::2], valid_fields[1::2]))
+
+    def templates(left: str, right: str) -> list[str]:
+        left_base = f"ts_backfill({left}, 60)"
+        right_base = f"ts_backfill({right}, 60)"
+        return [
+            f"rank(ts_corr({left_base}, {right_base}, 20))",
+            f"group_rank(({left_base} - {right_base}), subindustry)",
+            f"rank(ts_mean(({left_base} - {right_base}), 20))",
+            f"rank(ts_delta({left_base}, 20) - ts_delta({right_base}, 20))",
+        ]
+
+    plan: list[dict[str, Any]] = []
+    for template_index in range(4):
+        for left_item, right_item in pairs:
+            left = _live_field_id(left_item)
+            right = _live_field_id(right_item)
+            if not left or not right or left == right:
+                continue
+            expression = templates(left, right)[template_index]
+            validation = validate_wq_expression(expression, supported)
+            if not validation.ok:
+                continue
+            expression = validation.expression
+            normalized = normalize_wq_expression(expression)
+            if not normalized or normalized in seen:
+                continue
+            if not _expression_uses_only_catalog_fields(expression, supported, {left, right}):
+                continue
+            seen.add(normalized)
+            left_dataset = left_item.get("dataset") or {}
+            right_dataset = right_item.get("dataset") or {}
+            left_dataset_id = str(left_dataset.get("id") or "") if isinstance(left_dataset, dict) else str(left_dataset or "")
+            right_dataset_id = str(right_dataset.get("id") or "") if isinstance(right_dataset, dict) else str(right_dataset or "")
+            dataset_id = left_dataset_id if left_dataset_id and left_dataset_id == right_dataset_id else None
+            category = _dataset_category(left_dataset) if isinstance(left_dataset, dict) else None
+            right_category = _dataset_category(right_dataset) if isinstance(right_dataset, dict) else None
+            dataset_category = category if category and category == right_category else None
+            plan.append(
+                {
+                    "expression": expression,
+                    "family": _classify_live_field(left_item),
+                    "generation": 1,
+                    "hypothesis": hypothesis,
+                    "parent_expression": None,
+                    "mutation_type": "structural_live_seed",
+                    "planner_strategy": "cross_field_structural_diversity",
+                    "data_fields": [left, right],
+                    "dataset_id": dataset_id,
+                    "dataset_category": dataset_category,
+                    "provenance_state": "resolved" if dataset_id else "partial",
+                    "provenance_reason": "same_live_dataset_pair" if dataset_id else "cross_dataset_pair",
+                }
+            )
+            if len(plan) >= limit:
+                return plan
+    return plan
 
 
 def _expression_uses_only_catalog_fields(expression: str, operators: set[str], allowed_fields: set[str]) -> bool:
@@ -947,6 +1051,39 @@ def validate_candidate_robustness(
     }
 
 
+def _merge_candidate_validation(
+    candidate: dict[str, Any],
+    robustness_validation: dict[str, Any],
+    *,
+    mirrored: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Merge robustness and submission evidence, preserving earlier evidence."""
+    raw_existing_validation = candidate.get("validation")
+    validation: dict[str, Any] = (
+        dict(raw_existing_validation) if isinstance(raw_existing_validation, dict) else {}
+    )
+    validation.update(robustness_validation)
+    raw_local_evidence = candidate.get("local_correlation_proxy") or validation.get("local_correlation_proxy")
+    local_evidence: dict[str, Any] = dict(raw_local_evidence) if isinstance(raw_local_evidence, dict) else {}
+    raw_overfitting = validation.get("overfitting_evidence")
+    overfitting_evidence: dict[str, Any] = dict(raw_overfitting) if isinstance(raw_overfitting, dict) else {}
+    evidence_blockers = submission_evidence_blockers(local_evidence, overfitting_evidence)
+    validation["submission_gate"] = {
+        "ready": not evidence_blockers,
+        "blockers": list(evidence_blockers),
+        "policy": configured_submission_evidence_policy(),
+    }
+    candidate["validation"] = validation
+    target = mirrored or candidate
+    target["validation"] = dict(validation)
+    if validation.get("status") == "robustness_fail":
+        targets = list(target.get("mutation_targets") or [])
+        if "improve_cross_setting_robustness" not in targets:
+            targets.append("improve_cross_setting_robustness")
+        target["mutation_targets"] = targets
+    return validation
+
+
 def _rank_result(item: dict[str, Any]) -> tuple[float, float, float]:
     metrics = item.get("is_metrics") or {}
     def num(key: str) -> float:
@@ -1015,12 +1152,12 @@ def run_autonomous_research(
     memory["adaptive_allocation"] = adaptive_allocation
     seen = set(normalized)
 
-    # Exploit promising failures, but reserve most first-generation budget for
-    # genuinely new account-visible BRAIN fields and a small number of LLM ideas.
-    # Static seeds remain a safe fallback when Data Explorer or the LLM is unavailable.
+    # Reserve most first-generation budget for genuinely new hypotheses. In
+    # replenishment mode, repeated failed parents are capped aggressively so the
+    # search does not spend another round in the same low-yield local optimum.
     memory_parent_budget = min(
         first_budget,
-        max(0, math.ceil(first_budget * (0.45 if inventory_mode == "REPLENISHMENT" else 1 / 3))),
+        max(0, math.ceil(first_budget * (0.25 if inventory_mode == "REPLENISHMENT" else 0.30))),
     )
     memory_plan = build_memory_mutation_plan(
         memory,
@@ -1031,7 +1168,7 @@ def run_autonomous_research(
         min_fitness=min_fitness,
     )
     exploration_budget = max(0, first_budget - len(memory_plan))
-    live_budget = min(exploration_budget, max(0, math.ceil(exploration_budget * 0.6)))
+    live_budget = min(exploration_budget, max(0, math.ceil(exploration_budget * 0.35)))
     live_plan, live_catalog, live_fields = build_live_field_plan(
         client,
         memory,
@@ -1042,7 +1179,18 @@ def run_autonomous_research(
         delay=delay,
         hypothesis=goal,
     )
-    llm_budget = min(2, max(0, exploration_budget - len(live_plan)))
+    structural_budget = min(
+        max(0, exploration_budget - len(live_plan)),
+        max(0, math.ceil(exploration_budget * 0.35)),
+    )
+    structural_plan = build_structural_live_plan(
+        client,
+        live_fields,
+        seen=seen,
+        limit=structural_budget,
+        hypothesis=goal,
+    )
+    llm_budget = min(4, max(0, exploration_budget - len(live_plan) - len(structural_plan)))
     llm_plan = build_llm_live_plan(
         client,
         live_fields,
@@ -1055,7 +1203,7 @@ def run_autonomous_research(
     seed_memory["normalized_expressions"] = sorted(seen)
     seed_plan = build_seed_plan(
         seed_memory,
-        limit=max(0, exploration_budget - len(live_plan) - len(llm_plan)),
+        limit=max(0, exploration_budget - len(live_plan) - len(structural_plan) - len(llm_plan)),
         family_count=family_count,
         generation=1,
         hypothesis=goal,
@@ -1063,7 +1211,7 @@ def run_autonomous_research(
     for item in seed_plan:
         seen.add(normalize_wq_expression(item["expression"]))
 
-    planned_count = len(memory_plan) + len(live_plan) + len(llm_plan) + len(seed_plan)
+    planned_count = len(memory_plan) + len(live_plan) + len(structural_plan) + len(llm_plan) + len(seed_plan)
     if planned_count < first_budget:
         memory_plan.extend(
             build_memory_mutation_plan(
@@ -1076,7 +1224,7 @@ def run_autonomous_research(
             )
         )
     first_plan = [
-        item for item in (memory_plan + live_plan + llm_plan + seed_plan)
+        item for item in (memory_plan + live_plan + structural_plan + llm_plan + seed_plan)
         if not _violates_prevention_rules(item, memory.get("prevention_rules"))
     ]
     generation_results: list[dict[str, Any]] = []
@@ -1085,6 +1233,15 @@ def run_autonomous_research(
     all_failed: list[dict[str, Any]] = []
     all_invalid: list[dict[str, Any]] = []
     selected_families = select_research_families(memory, family_count)
+    try:
+        base_validation_cap = max(1, min(8, int(os.environ.get("WQ_RESEARCH_VALIDATION_CAP", "2"))))
+        replenishment_cap = max(base_validation_cap, min(8, int(os.environ.get("WQ_REPLENISHMENT_VALIDATION_CAP", "4"))))
+    except (TypeError, ValueError):
+        base_validation_cap, replenishment_cap = 2, 4
+    validation_cap = replenishment_cap if inventory_mode == "REPLENISHMENT" else base_validation_cap
+    validation_candidates_used = 0
+    validation_simulations = 0
+    robustness_feedback_failures = 0
     remaining = max_simulations
     plan = first_plan
     for item in first_plan:
@@ -1131,6 +1288,42 @@ def run_autonomous_research(
         simulated = int((batch.get("summary") or {}).get("simulated") or 0)
         remaining = max(0, remaining - max(simulated, len(expressions)))
 
+        # Feed cross-setting evidence back before planning the next generation.
+        # This lets a TOP3000 primary pass that collapses on TOP1000 immediately
+        # route to stable-data / exposure-control mutations in the same research run.
+        batch_results_by_alpha = {
+            str(item.get("alpha_id")): item for item in (batch.get("results") or []) if item.get("alpha_id")
+        }
+        for candidate in sorted(batch.get("candidates") or [], key=_rank_result, reverse=True):
+            if validation_candidates_used < validation_cap and not (check_cancelled and check_cancelled()):
+                robustness_validation = validate_candidate_robustness(
+                    client,
+                    candidate,
+                    region=region,
+                    universe=universe,
+                    delay=delay,
+                    decay=decay,
+                    neutralization=neutralization,
+                    truncation=truncation,
+                    check_cancelled=check_cancelled,
+                )
+                validation_candidates_used += 1
+            else:
+                robustness_validation = {
+                    "status": "validation_pending",
+                    "robustness_score": None,
+                    "validation_simulations": 0,
+                    "reason": f"per-round validation cap:{validation_cap}",
+                }
+            validation = _merge_candidate_validation(
+                candidate,
+                robustness_validation,
+                mirrored=batch_results_by_alpha.get(str(candidate.get("alpha_id"))),
+            )
+            validation_simulations += int(validation.get("validation_simulations") or 0)
+            if validation.get("status") == "robustness_fail" and generation_index < generations and remaining > 0:
+                robustness_feedback_failures += 1
+
         if generation_index >= generations or remaining <= 0:
             break
 
@@ -1163,65 +1356,9 @@ def run_autonomous_research(
                 seen.add(normalize_wq_expression(item["expression"]))
         plan = [item for item in next_plan if not _violates_prevention_rules(item, memory.get("prevention_rules"))]
 
-    # A primary threshold pass is not enough to enter the submission-ready queue.
-    # Validate at most the two strongest candidates across alternate universe / neutralization
-    # settings; additional candidates stay validation_pending rather than consuming unbounded BRAIN time.
-    validation_simulations = 0
+    # All primary candidates were validated (or explicitly marked pending) as
+    # they emerged, so no terminal-only robustness pass is needed here.
     ranked_primary_candidates = sorted(all_candidates, key=_rank_result, reverse=True)
-    result_by_alpha = {str(item.get("alpha_id")): item for item in all_results if item.get("alpha_id")}
-    try:
-        base_validation_cap = max(1, min(8, int(os.environ.get("WQ_RESEARCH_VALIDATION_CAP", "2"))))
-        replenishment_cap = max(base_validation_cap, min(8, int(os.environ.get("WQ_REPLENISHMENT_VALIDATION_CAP", "4"))))
-    except (TypeError, ValueError):
-        base_validation_cap, replenishment_cap = 2, 4
-    validation_cap = replenishment_cap if inventory_mode == "REPLENISHMENT" else base_validation_cap
-    for index, candidate in enumerate(ranked_primary_candidates):
-        raw_existing_validation = candidate.get("validation")
-        existing_validation: dict[str, Any] = (
-            dict(raw_existing_validation) if isinstance(raw_existing_validation, dict) else {}
-        )
-        if index < validation_cap and not (check_cancelled and check_cancelled()):
-            robustness_validation = validate_candidate_robustness(
-                client,
-                candidate,
-                region=region,
-                universe=universe,
-                delay=delay,
-                decay=decay,
-                neutralization=neutralization,
-                truncation=truncation,
-                check_cancelled=check_cancelled,
-            )
-        else:
-            robustness_validation = {
-                "status": "validation_pending",
-                "robustness_score": None,
-                "validation_simulations": 0,
-                "reason": f"per-round validation cap:{validation_cap}",
-            }
-        validation = dict(existing_validation)
-        validation.update(robustness_validation)
-        raw_local_evidence = candidate.get("local_correlation_proxy") or validation.get("local_correlation_proxy")
-        local_evidence: dict[str, Any] = dict(raw_local_evidence) if isinstance(raw_local_evidence, dict) else {}
-        raw_overfitting = validation.get("overfitting_evidence")
-        overfitting_evidence: dict[str, Any] = dict(raw_overfitting) if isinstance(raw_overfitting, dict) else {}
-        evidence_blockers = submission_evidence_blockers(local_evidence, overfitting_evidence)
-        validation["submission_gate"] = {
-            "ready": not evidence_blockers,
-            "blockers": list(evidence_blockers),
-            "policy": configured_submission_evidence_policy(),
-        }
-        candidate["validation"] = validation
-        validation_simulations += int(validation.get("validation_simulations") or 0)
-        mirrored = result_by_alpha.get(str(candidate.get("alpha_id")))
-        if mirrored is not None:
-            mirrored["validation"] = dict(validation)
-            if validation.get("status") == "robustness_fail":
-                targets = list(mirrored.get("mutation_targets") or [])
-                if "improve_cross_setting_robustness" not in targets:
-                    targets.append("improve_cross_setting_robustness")
-                mirrored["mutation_targets"] = targets
-
     ready_candidates = [
         item
         for item in ranked_primary_candidates
@@ -1264,6 +1401,7 @@ def run_autonomous_research(
             "primary_simulation_budget_scope": "research_generations_only",
             "memory_parent_mutations": len(memory_plan),
             "live_field_expressions": len(live_plan),
+            "structural_live_expressions": len(structural_plan),
             "llm_expressions": len(llm_plan),
             "seed_expressions": len(seed_plan),
             "simulated": sum(int((item.get("summary") or {}).get("simulated") or 0) for item in generation_results),
@@ -1271,6 +1409,7 @@ def run_autonomous_research(
             "candidates": len(ready_candidates),
             "validation_pending": sum(1 for item in ranked_primary_candidates if (item.get("validation") or {}).get("status") == "validation_pending"),
             "robustness_failed": sum(1 for item in ranked_primary_candidates if (item.get("validation") or {}).get("status") == "robustness_fail"),
+            "same_round_robustness_feedback": robustness_feedback_failures,
             "validation_simulations": validation_simulations,
             "validation_cap": validation_cap,
             "validation_simulation_budget_upper_bound": validation_cap * 2,

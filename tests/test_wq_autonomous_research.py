@@ -253,6 +253,43 @@ def test_live_field_plan_prefers_matrix_fields_and_skips_unknown_memory_fields()
     assert all(item["family"] == "fundamental_quality" for item in plan)
 
 
+def test_structural_live_plan_uses_cross_field_motifs_from_same_dataset():
+    class FakeClient:
+        def list_operator_names(self):
+            return {"rank", "ts_corr", "ts_backfill", "group_rank", "ts_mean", "ts_delta"}
+
+    fields = [
+        {"id": "field_a", "type": "MATRIX", "description": "analyst estimate", "dataset": {"id": "analyst4", "category": {"id": "analyst"}}},
+        {"id": "field_b", "type": "MATRIX", "description": "analyst revision", "dataset": {"id": "analyst4", "category": {"id": "analyst"}}},
+    ]
+
+    plan = autonomous.build_structural_live_plan(
+        FakeClient(),
+        fields,
+        seen=set(),
+        limit=3,
+        hypothesis="cross-field diversity",
+    )
+
+    assert len(plan) == 3
+    assert all(item["mutation_type"] == "structural_live_seed" for item in plan)
+    assert all(item["dataset_id"] == "analyst4" for item in plan)
+    assert all(item["data_fields"] == ["field_a", "field_b"] for item in plan)
+    assert len({item["expression"] for item in plan}) == 3
+    assert any("ts_corr" in item["expression"] for item in plan)
+
+
+def test_robustness_failure_reduces_cross_run_parent_promise():
+    base = {"sharpe": 1.27, "fitness": 1.14, "turnover": 0.2}
+    robust_failure = {
+        **base,
+        "failure_reason": "robustness_instability",
+        "mutation_targets": ["improve_cross_setting_robustness"],
+    }
+
+    assert autonomous._trial_promise_score(robust_failure) < autonomous._trial_promise_score(base)
+
+
 def test_llm_live_plan_rejects_invented_fields_and_keeps_catalog_expression(monkeypatch):
     from quantgpt import iteration
 
@@ -463,6 +500,76 @@ def test_candidate_robustness_failure_is_explicit(monkeypatch):
 
     assert result["status"] == "robustness_fail"
     assert result["robustness_score"] == 0.0
+
+
+def test_autonomous_research_routes_robustness_failure_into_same_round_generation(monkeypatch):
+    monkeypatch.setattr(autonomous, "run_list_alphas", lambda *_args, **_kwargs: {"ok": True, "alphas": []})
+    monkeypatch.setattr(
+        autonomous,
+        "build_live_field_plan",
+        lambda *_args, **_kwargs: ([], {"available": False, "count": 0}, []),
+    )
+    monkeypatch.setattr(autonomous, "build_structural_live_plan", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(autonomous, "build_llm_live_plan", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        autonomous,
+        "validate_candidate_robustness",
+        lambda *_args, **_kwargs: {"status": "robustness_fail", "robustness_score": 0.0, "validation_simulations": 2},
+    )
+
+    calls = []
+
+    def fake_research_batch(_client, expressions, **kwargs):
+        generation = 2 if kwargs["tag"].endswith("g2") else 1
+        calls.append((generation, list(expressions)))
+        results = []
+        candidates = []
+        for index, expression in enumerate(expressions):
+            primary = generation == 1 and index == 0
+            item = {
+                "ok": True,
+                "alpha_id": f"robust-g{generation}-{index}",
+                "expression": expression,
+                "is_metrics": {
+                    "sharpe": 1.3 if primary else 0.8,
+                    "fitness": 1.1 if primary else 0.5,
+                    "returns": 0.08 if primary else 0.02,
+                    "turnover": 0.2,
+                    "checks": [],
+                },
+                "passes_primary_thresholds": primary,
+                "mutation_targets": ["candidate_passes_primary_thresholds"] if primary else ["improve_signal_sharpe"],
+            }
+            results.append(item)
+            if primary:
+                candidates.append(item)
+        return {
+            "ok": True,
+            "tag": kwargs["tag"],
+            "settings": {},
+            "summary": {"simulated": len(expressions)},
+            "results": results,
+            "candidates": candidates,
+            "failed": [],
+            "invalid": [],
+        }
+
+    monkeypatch.setattr(autonomous, "run_research_batch", fake_research_batch)
+
+    result = autonomous.run_autonomous_research(
+        object(),
+        memory={"family_counts": {}, "normalized_expressions": []},
+        max_simulations=8,
+        generations=2,
+        family_count=2,
+        tag="same-round-robustness",
+    )
+
+    assert [generation for generation, _ in calls] == [1, 2]
+    assert result["summary"]["same_round_robustness_feedback"] == 1
+    generation_two = [item for item in result["results"] if (item.get("research_meta") or {}).get("generation") == 2]
+    assert generation_two
+    assert any((item.get("research_meta") or {}).get("mutation_type") == "stable_data_reseed" for item in generation_two)
 
 
 def test_autonomous_research_runs_bounded_second_generation(monkeypatch):

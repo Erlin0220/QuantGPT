@@ -67,7 +67,7 @@ def scheduler_learning_gate(
     trials: int,
     provenance_resolved: int,
     provenance_classified: int | None = None,
-    active_gate: dict[str, Any],
+    active_gate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     thresholds = configured_learning_thresholds()
     trials = max(0, int(trials))
@@ -82,8 +82,9 @@ def scheduler_learning_gate(
         reasons.append("insufficient_research_trials")
     if provenance_rate < float(thresholds["scheduler_provenance_rate"]):
         reasons.append("insufficient_resolved_provenance")
-    if not bool(active_gate.get("ready")):
-        reasons.append("active_outcome_learning_not_mature")
+    # Research allocation learns from the much denser Simulation funnel. ACTIVE
+    # outcomes remain separately gated for ACTIVE-probability calibration and must
+    # not keep a well-observed research scheduler in perpetual coverage-first mode.
     ready = not reasons
     return {
         "status": "ready" if ready else "cold_start",
@@ -97,6 +98,7 @@ def scheduler_learning_gate(
         "minimum_provenance_rate": float(thresholds["scheduler_provenance_rate"]),
         "reasons": reasons,
         "policy": "adaptive" if ready else "coverage_first",
+        "active_outcome_dependency": "independent",
     }
 
 
