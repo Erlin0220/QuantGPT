@@ -836,7 +836,11 @@ def build_skill_plan(
         return []
 
     usable_fields = [_live_field_id(field) for field in fields if _live_field_id(field)][:48]
-    allowed_fields = set(usable_fields)
+    field_items: dict[str, dict[str, Any]] = {
+        _live_field_id(field).lower(): field
+        for field in fields
+        if _live_field_id(field)
+    }
     out: list[dict[str, Any]] = []
     for raw_candidate in candidates:
         if len(out) >= limit:
@@ -851,16 +855,67 @@ def build_skill_plan(
         normalized = normalize_wq_expression(expression)
         if not normalized or normalized in seen:
             continue
+
+        # Skill-first candidates are authored after ChatGPT has read the live Data
+        # Explorer.  The autonomous planner's small coverage sample is therefore
+        # not an authoritative allow-list.  Re-resolve declared fields against
+        # BRAIN so valid skill-authored ideas are not silently dropped merely
+        # because their field was outside the planner's unrelated sample.
+        declared_fields = [
+            str(value).strip()
+            for value in (raw_candidate.get("data_fields") or [])
+            if str(value).strip()
+        ]
+        for field_id in declared_fields:
+            key = field_id.lower()
+            if key in field_items or key in _CORE_WQ_FIELDS or re.fullmatch(r"adv(?:5|10|20|60|120)", key):
+                continue
+            try:
+                matches = client.list_data_fields(search=field_id, limit=20)
+            except Exception:
+                matches = []
+            exact = next(
+                (
+                    item for item in matches
+                    if _live_field_id(item).lower() == key
+                    and str(item.get("type") or "MATRIX").upper() == "MATRIX"
+                ),
+                None,
+            )
+            if exact is not None:
+                field_items[key] = exact
+                usable_fields.append(_live_field_id(exact))
+
+        allowed_fields = set(usable_fields) | set(declared_fields)
         if not _expression_uses_only_catalog_fields(expression, supported, allowed_fields):
+            continue
+        # Do not trust caller-declared field names by themselves: every non-core
+        # field used by the expression must have been observed in either the
+        # planner catalog or the exact BRAIN lookup above.
+        expression_tokens = {
+            token.lower()
+            for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expression)
+        }
+        unresolved = {
+            token
+            for token in expression_tokens
+            if token not in supported
+            and token not in _CORE_WQ_FIELDS
+            and not re.fullmatch(r"adv(?:5|10|20|60|120)", token)
+            and token not in field_items
+        }
+        if unresolved:
             continue
         seen.add(normalized)
 
         used = [
-            field
-            for field in usable_fields
-            if re.search(rf"(?<![a-z0-9_]){re.escape(field.lower())}(?![a-z0-9_])", normalized)
+            field_id
+            for key, item in field_items.items()
+            if key in expression_tokens
+            for field_id in [_live_field_id(item)]
+            if field_id
         ]
-        used_items = [item for item in fields if _live_field_id(item) in used]
+        used_items = [field_items[field.lower()] for field in used if field.lower() in field_items]
         dataset_ids = {
             str((item.get("dataset") or {}).get("id") or "")
             for item in used_items

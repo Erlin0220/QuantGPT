@@ -481,6 +481,47 @@ def test_skill_plan_preserves_devspace_provenance_and_live_dataset():
     assert plan[0]["hypothesis"].startswith("positive analyst revisions")
 
 
+def test_skill_plan_resolves_declared_field_outside_planner_sample_against_live_catalog():
+    class FakeClient:
+        def list_operator_names(self):
+            return {"rank", "ts_delta", "ts_backfill"}
+
+        def list_data_fields(self, *, search=None, limit=20, **_kwargs):
+            if search == "implied_volatility_mean_skew_30":
+                return [{
+                    "id": "implied_volatility_mean_skew_30",
+                    "type": "MATRIX",
+                    "dataset": {"id": "option8", "category": {"id": "option"}},
+                }]
+            return []
+
+    planner_sample = [{
+        "id": "historical_volatility_10",
+        "type": "MATRIX",
+        "dataset": {"id": "option8", "category": {"id": "option"}},
+    }]
+    plan = autonomous.build_skill_plan(
+        FakeClient(),
+        [{
+            "expression": "rank(ts_delta(ts_backfill(implied_volatility_mean_skew_30, 60), 20))",
+            "hypothesis": "changes in downside option skew should forecast relative returns",
+            "family": "options_volatility",
+            "data_fields": ["implied_volatility_mean_skew_30"],
+            "skill_chain": ["wq-alpha-hypothesis", "wq-alpha-review"],
+            "review_decision": "RUN",
+            "review_notes": "field verified in Data Explorer before simulation",
+        }],
+        planner_sample,
+        seen=set(),
+        limit=1,
+        hypothesis="fallback goal",
+    )
+
+    assert len(plan) == 1
+    assert plan[0]["dataset_id"] == "option8"
+    assert plan[0]["data_fields"] == ["implied_volatility_mean_skew_30"]
+
+
 def test_chatgpt_plan_rejects_invented_fields_and_keeps_catalog_expression():
     class FakeClient:
         def list_operator_names(self):
