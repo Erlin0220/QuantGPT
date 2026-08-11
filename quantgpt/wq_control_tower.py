@@ -54,6 +54,8 @@ def build_research_control_tower(
             "completeness": memory.get("metadata_completeness") or {},
             "provenance": memory.get("provenance") or {},
         },
+        "credit_assignment": memory.get("credit_assignment") or {},
+        "round_audits": list(memory.get("research_round_audits") or [])[:8],
         "learning_maturity": memory.get("learning_maturity") or {},
         "research_memory": memory.get("research_memory_guidance") or {},
         "scheduler": {

@@ -14,6 +14,11 @@ def _memory():
         "failure_reason_counts": {"low_sharpe": 18, "sub_universe": 3},
         "candidate_funnel": {"dominant_bottleneck_stage": "simulation"},
         "metadata_completeness": {"family": {"present": 98, "missing": 2, "rate": 0.98}},
+        "credit_assignment": {"formal_submission": {"coverage": 0.75, "unattributed": 2}},
+        "research_round_audits": [
+            {"source_run_id": "round-1", "skill_compliance": {"rate": 1.0}},
+            {"source_run_id": "round-2", "skill_compliance": {"rate": 0.5}},
+        ],
         "research_cells": [
             {
                 "cell_key": "fundamental_quality|fundamental6|rank>ts_rank",
@@ -96,6 +101,8 @@ def test_control_tower_exposes_learning_loop_and_safeguards():
     assert snapshot["funnel"]["trial_to_candidate"]["rate"] == 0.04
     assert snapshot["failures"]["dominant_bottleneck_stage"] == "simulation"
     assert snapshot["metadata"]["completeness"]["family"]["rate"] == 0.98
+    assert snapshot["credit_assignment"]["formal_submission"]["coverage"] == 0.75
+    assert snapshot["round_audits"][0]["source_run_id"] == "round-1"
     assert snapshot["inventory"]["floor"] == 30
     assert snapshot["inventory"]["target_low"] == 40
     assert snapshot["inventory"]["target_high"] == 50
