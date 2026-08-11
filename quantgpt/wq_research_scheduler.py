@@ -44,7 +44,7 @@ def _iso(value: Any) -> str | None:
 
 
 def _latest_trial_by_alpha(trials: Iterable[Any]) -> dict[str, Any]:
-    """Resolve submission credit to the actual research trial that produced an alpha_id."""
+    """Resolve submission credit to the latest research trial for an alpha_id."""
     latest: dict[str, Any] = {}
     for trial in trials:
         alpha_id = str(_get(trial, "alpha_id") or "").strip()
@@ -61,6 +61,29 @@ def _latest_trial_by_alpha(trials: Iterable[Any]) -> dict[str, Any]:
     return latest
 
 
+def _trial_by_lineage(trials: Iterable[Any]) -> dict[str, Any]:
+    """Index exact originating trials by stable lineage identity."""
+    return {
+        str(_get(trial, "lineage_id") or "").strip(): trial
+        for trial in trials
+        if str(_get(trial, "lineage_id") or "").strip()
+    }
+
+
+def _originating_trial(
+    *,
+    alpha_id: str,
+    candidate: Any,
+    latest_by_alpha: dict[str, Any],
+    by_lineage: dict[str, Any],
+) -> Any | None:
+    """Prefer the Candidate's persisted lineage over lossy alpha-id recovery."""
+    lineage_id = str(_get(candidate, "lineage_id") or "").strip() if candidate is not None else ""
+    if lineage_id and lineage_id in by_lineage:
+        return by_lineage[lineage_id]
+    return latest_by_alpha.get(alpha_id)
+
+
 def summarize_research_credit_assignment(
     trials: Iterable[Any],
     candidates: Iterable[Any] = (),
@@ -69,6 +92,7 @@ def summarize_research_credit_assignment(
     """Report whether candidate/submission outcomes can be traced to a real research trial."""
     trial_rows = list(trials)
     latest_trial = _latest_trial_by_alpha(trial_rows)
+    trial_by_lineage = _trial_by_lineage(trial_rows)
     candidate_rows = list(candidates)
     candidate_by_alpha = {
         str(_get(candidate, "alpha_id") or ""): candidate
@@ -79,7 +103,12 @@ def summarize_research_credit_assignment(
     candidate_unattributed = 0
     candidate_metadata_mismatch = 0
     for alpha_id, candidate in candidate_by_alpha.items():
-        trial = latest_trial.get(alpha_id)
+        trial = _originating_trial(
+            alpha_id=alpha_id,
+            candidate=candidate,
+            latest_by_alpha=latest_trial,
+            by_lineage=trial_by_lineage,
+        )
         if trial is None:
             candidate_unattributed += 1
             continue
@@ -102,7 +131,16 @@ def summarize_research_credit_assignment(
             active_total += 1
         if is_terminal:
             terminal_total += 1
-        attributed = bool(alpha_id and latest_trial.get(alpha_id) is not None)
+        attributed = bool(
+            alpha_id
+            and _originating_trial(
+                alpha_id=alpha_id,
+                candidate=candidate,
+                latest_by_alpha=latest_trial,
+                by_lineage=trial_by_lineage,
+            )
+            is not None
+        )
         if is_formal:
             if attributed:
                 formal_attributed += 1
@@ -182,6 +220,7 @@ def summarize_research_cells(
         return cells[key]
 
     latest_trial = _latest_trial_by_alpha(trial_rows)
+    trial_by_lineage = _trial_by_lineage(trial_rows)
 
     for trial in trial_rows:
         cell = ensure(trial)
@@ -204,7 +243,12 @@ def summarize_research_cells(
         alpha_id = str(_get(candidate, "alpha_id") or "")
         if alpha_id:
             candidate_by_alpha[alpha_id] = candidate
-        origin_trial = latest_trial.get(alpha_id)
+        origin_trial = _originating_trial(
+            alpha_id=alpha_id,
+            candidate=candidate,
+            latest_by_alpha=latest_trial,
+            by_lineage=trial_by_lineage,
+        )
         if origin_trial is None:
             continue
         cell = ensure(origin_trial)
@@ -223,7 +267,12 @@ def summarize_research_cells(
     terminal_failures = {"SC_FAIL", "OTHER_FAIL"}
     for attempt, candidate in attempts:
         alpha_id = str(_get(attempt, "alpha_id") or "")
-        origin_trial = latest_trial.get(alpha_id)
+        origin_trial = _originating_trial(
+            alpha_id=alpha_id,
+            candidate=candidate,
+            latest_by_alpha=latest_trial,
+            by_lineage=trial_by_lineage,
+        )
         if origin_trial is None:
             continue
         cell = ensure(origin_trial)

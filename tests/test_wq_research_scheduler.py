@@ -91,6 +91,43 @@ def test_submission_credit_stays_on_originating_trial_cell_when_candidate_metada
     assert credit["formal_submission"]["coverage"] == 1.0
 
 
+def test_lineage_identity_recovers_credit_when_alpha_id_no_longer_matches_trial():
+    now = datetime.now(timezone.utc)
+    trials = [{
+        "alpha_id": "original-alpha",
+        "lineage_id": "lineage-1",
+        "family": "fundamental_quality",
+        "dataset_id": "fundamental6",
+        "provenance_state": "resolved",
+        "operator_pattern": "group_rank>ts_zscore>divide>ts_backfill",
+        "status": "candidate",
+        "created_at": now,
+    }]
+    candidate = {
+        "alpha_id": "platform-alpha",
+        "lineage_id": "lineage-1",
+        "family": "other",
+        "dataset_id": "fundamental6",
+        "provenance_state": "resolved",
+        "operator_pattern": "rank(*)",
+        "validation_status": "ready",
+        "sharpe": 1.5,
+        "fitness": 1.2,
+        "turnover": 0.2,
+    }
+    attempts = [({"alpha_id": "platform-alpha", "status": "ACTIVE"}, candidate)]
+
+    rows = summarize_research_cells(trials, [candidate], attempts)
+    assert len(rows) == 1
+    assert rows[0]["cell_key"] == "fundamental_quality|fundamental6|group_rank>ts_zscore>divide>ts_backfill"
+    assert rows[0]["active"] == 1
+
+    credit = summarize_research_credit_assignment(trials, [candidate], attempts)
+    assert credit["candidate"]["coverage"] == 1.0
+    assert credit["candidate"]["metadata_cell_mismatch"] == 1
+    assert credit["active"]["coverage"] == 1.0
+
+
 def test_unattributed_platform_candidate_does_not_create_phantom_scheduler_cell():
     candidate = {
         "alpha_id": "recovered-only",

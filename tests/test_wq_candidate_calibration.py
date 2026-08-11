@@ -200,6 +200,52 @@ async def test_group_active_feedback_credits_originating_trial_not_current_candi
 
 
 @pytest.mark.asyncio
+async def test_group_active_feedback_prefers_candidate_lineage_when_alpha_id_changed(calibration_db):
+    factory = calibration_db
+    async with factory() as session:
+        session.add(WQResearchTrial(
+            account="primary",
+            alpha_id="origin-alpha",
+            expression="group_rank(ts_zscore(cashflow_op/cap, 60), subindustry)",
+            expression_normalized="group_rank(ts_zscore(cashflow_op/cap,60),subindustry)",
+            family="fundamental_quality",
+            status="candidate",
+            dataset_id="fundamental6",
+            provenance_state="resolved",
+            operator_pattern="group_rank>ts_zscore>divide",
+            lineage_id="lineage-fundamental-1",
+        ))
+        session.add(WQResearchCandidate(
+            account="primary",
+            alpha_id="platform-alpha",
+            expression="group_rank(ts_zscore(cashflow_op/cap, 60), subindustry)",
+            family="other",
+            dataset_id="analyst4",
+            provenance_state="resolved",
+            operator_pattern="rank(*)",
+            lineage_id="lineage-fundamental-1",
+            validation_status="ready",
+            sharpe=1.5,
+            fitness=1.2,
+            priority_score=1.0,
+        ))
+        session.add(WQSubmissionAttempt(
+            account="primary",
+            alpha_id="platform-alpha",
+            submission_day="2026-08-11",
+            status="ACTIVE",
+        ))
+        await session.commit()
+        feedback = await _load_conversion_feedback(session, "primary")
+
+    assert "fundamental_quality" in feedback["family"]
+    assert "other" not in feedback["family"]
+    assert "fundamental6" in feedback["dataset"]
+    assert "analyst4" not in feedback["dataset"]
+    assert feedback["credit_assignment"]["coverage"] == 1.0
+
+
+@pytest.mark.asyncio
 async def test_cold_start_probability_is_null_and_status_exposes_support(calibration_db):
     await record_research_candidates("primary", [_candidate()], settings={"region": "USA", "universe": "TOP3000"})
     status = await get_submission_policy_status("primary")

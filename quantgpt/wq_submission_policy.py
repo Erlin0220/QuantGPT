@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from .db import _get_session_factory
 from .models import WQResearchCandidate, WQResearchTrial, WQSubmissionAttempt, WQSubmissionState
@@ -289,20 +289,34 @@ async def _load_conversion_feedback(session, account: str) -> dict[str, Any]:
     )
     grouped_rows = list(grouped_result.all())
     terminal_alpha_ids = sorted({str(attempt.alpha_id) for attempt, _candidate in grouped_rows if attempt.alpha_id})
+    candidate_lineage_ids = sorted({
+        str(candidate.lineage_id)
+        for _attempt, candidate in grouped_rows
+        if str(candidate.lineage_id or "").strip()
+    })
     latest_trial_by_alpha: dict[str, WQResearchTrial] = {}
-    if terminal_alpha_ids:
+    trial_by_lineage: dict[str, WQResearchTrial] = {}
+    if terminal_alpha_ids or candidate_lineage_ids:
+        predicates = []
+        if terminal_alpha_ids:
+            predicates.append(WQResearchTrial.alpha_id.in_(terminal_alpha_ids))
+        if candidate_lineage_ids:
+            predicates.append(WQResearchTrial.lineage_id.in_(candidate_lineage_ids))
         trial_result = await session.execute(
             select(WQResearchTrial)
             .where(
                 WQResearchTrial.account == account,
-                WQResearchTrial.alpha_id.in_(terminal_alpha_ids),
+                or_(*predicates),
             )
             .order_by(WQResearchTrial.created_at.desc())
         )
         for trial in trial_result.scalars().all():
             alpha_id = str(trial.alpha_id or "")
+            lineage_id = str(trial.lineage_id or "")
             if alpha_id and alpha_id not in latest_trial_by_alpha:
                 latest_trial_by_alpha[alpha_id] = trial
+            if lineage_id and lineage_id not in trial_by_lineage:
+                trial_by_lineage[lineage_id] = trial
 
     family_counts: dict[str, list[int]] = {}
     dataset_counts: dict[str, list[int]] = {}
@@ -312,7 +326,10 @@ async def _load_conversion_feedback(session, account: str) -> dict[str, Any]:
     unattributed_terminal = 0
     for attempt, candidate in grouped_rows:
         is_positive = int(str(attempt.status or "").upper() in _TERMINAL_POSITIVE_STATUSES)
-        origin_trial = latest_trial_by_alpha.get(str(attempt.alpha_id or ""))
+        candidate_lineage_id = str(candidate.lineage_id or "").strip()
+        origin_trial = trial_by_lineage.get(candidate_lineage_id) if candidate_lineage_id else None
+        if origin_trial is None:
+            origin_trial = latest_trial_by_alpha.get(str(attempt.alpha_id or ""))
         if origin_trial is not None:
             attributed_terminal += 1
             cell_key = research_cell_key(origin_trial)
