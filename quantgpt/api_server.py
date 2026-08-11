@@ -61,6 +61,19 @@ async def lifespan(app: FastAPI):
         # Knowledge priors must not prevent the API/MCP service from starting.
         logger.exception("WorldQuant official knowledge seed failed")
 
+    try:
+        from .wq_research_methodology_seed import seed_research_methodology_knowledge
+
+        seeded = await seed_research_methodology_knowledge()
+        logger.info(
+            "Research methodology knowledge seeded: %s sources, %s cards",
+            seeded["sources"],
+            seeded["cards"],
+        )
+    except Exception:
+        # Methodology priors are advisory and must never block service startup.
+        logger.exception("Research methodology knowledge seed failed")
+
     from .db import _get_session_factory as _sf
 
     active_statuses = [
