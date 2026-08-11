@@ -199,6 +199,20 @@ def test_exploitation_slots_are_not_round_robin_equal_when_posterior_differs():
     assert slots["good|d|p"] > slots.get("weak|d|p", 0)
 
 
+def test_allocator_uses_attributed_active_as_tie_breaker_without_changing_posterior():
+    active_cell = _cell("active|d|p", trials=10, candidates=2)
+    active_cell["formal_submissions"] = 1
+    active_cell["active"] = 1
+    peer_cell = _cell("peer|d|p", trials=10, candidates=2)
+
+    allocation = allocate_research_cells([active_cell, peer_cell], budget=1, exploration_share=0.0)
+    assert allocation["selected_cells"][0]["cell_key"] == "active|d|p"
+    summaries = {row["cell_key"]: row for row in allocation["cell_summaries"]}
+    assert summaries["active|d|p"]["posterior_yield"] == summaries["peer|d|p"]["posterior_yield"]
+    assert summaries["active|d|p"]["downstream_evidence"] == "active_observed"
+    assert summaries["peer|d|p"]["downstream_evidence"] == "candidate_only"
+
+
 def test_allocator_is_deterministic_for_same_input():
     cells = [_cell("a|d|p", trials=3, candidates=1), _cell("b|d|p", trials=3, candidates=0)]
     first = allocate_research_cells(cells, budget=7)

@@ -382,6 +382,18 @@ def allocate_research_cells(
         alpha, beta, posterior = _posterior(cell)
         cooling, penalty, cooldown_reason = (False, 1.0, None) if cold_start else _cooldown(cell)
         scored = dict(cell)
+        active = int(cell.get("active") or 0)
+        formal_submissions = int(cell.get("formal_submissions") or 0)
+        terminal_failures = int(cell.get("terminal_failures") or 0)
+        downstream_evidence = (
+            "active_observed"
+            if active > 0
+            else "formal_outcome_observed"
+            if formal_submissions > 0 or terminal_failures > 0
+            else "candidate_only"
+            if int(cell.get("candidates") or 0) > 0
+            else "trial_only"
+        )
         scored.update({
             "posterior_alpha": round(alpha, 4),
             "posterior_beta": round(beta, 4),
@@ -390,6 +402,9 @@ def allocate_research_cells(
             "cooldown_penalty": penalty,
             "cooldown_reason": cooldown_reason,
             "allocation_score": round(posterior * penalty, 6),
+            "downstream_evidence": downstream_evidence,
+            "active_evidence": active,
+            "formal_outcome_evidence": formal_submissions + terminal_failures,
         })
         enriched.append(scored)
 
@@ -415,15 +430,40 @@ def allocate_research_cells(
 
     exploration_slots = min(budget, max(1, ceil(budget * share)))
     exploitation_slots = budget - exploration_slots
-    exploit_order = sorted(enriched, key=lambda item: (-item["allocation_score"], int(item.get("trials") or 0), item["cell_key"]))
+    def exploitation_rank(item: dict[str, Any]) -> tuple[Any, ...]:
+        # Keep the Candidate posterior as the quantitative model. Attributed
+        # downstream outcomes are an evidence-hierarchy tie-breaker, not a
+        # fabricated ACTIVE probability or hand-weighted score.
+        return (
+            -item["allocation_score"],
+            -int(item.get("active_evidence") or 0),
+            -int(item.get("formal_outcome_evidence") or 0),
+            int(item.get("trials") or 0),
+            item["cell_key"],
+        )
+
+    exploit_order = sorted(enriched, key=exploitation_rank)
     explore_order = sorted(enriched, key=lambda item: (int(item.get("trials") or 0), item.get("last_sampled_at") or "", item["cell_key"]))
     allocations: Counter[str] = Counter()
     for _ in range(exploitation_slots):
-        chosen = max(
-            exploit_order,
+        best_adjusted = max(
+            item["allocation_score"] / (1.0 + allocations[item["cell_key"]] * 0.45)
+            for item in exploit_order
+        )
+        tied = [
+            item
+            for item in exploit_order
+            if abs(
+                item["allocation_score"] / (1.0 + allocations[item["cell_key"]] * 0.45)
+                - best_adjusted
+            ) < 1e-12
+        ]
+        chosen = min(
+            tied,
             key=lambda item: (
-                item["allocation_score"] / (1.0 + allocations[item["cell_key"]] * 0.45),
-                -int(item.get("trials") or 0),
+                -int(item.get("active_evidence") or 0),
+                -int(item.get("formal_outcome_evidence") or 0),
+                int(item.get("trials") or 0),
                 item["cell_key"],
             ),
         )
