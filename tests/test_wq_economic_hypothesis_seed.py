@@ -13,6 +13,7 @@ def test_economic_hypothesis_seed_is_multi_source_and_mechanism_first():
     assert "author:aqr-ilmanen-expected-returns-framework-2011" in source_keys
 
     known = set(source_keys)
+    assert all(item["source_type"] in {"textbook", "arxiv", "ssrn", "worldquant", "paper", "other"} for item in seed.ECONOMIC_HYPOTHESIS_SOURCES)
     assert len(seed.ECONOMIC_HYPOTHESIS_CARDS) >= 5
     concepts = {card["concept"] for card in seed.ECONOMIC_HYPOTHESIS_CARDS}
     assert "economic_mechanism_before_expression" in concepts

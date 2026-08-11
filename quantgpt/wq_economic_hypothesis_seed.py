@@ -38,7 +38,7 @@ ECONOMIC_HYPOTHESIS_SOURCES: list[dict[str, Any]] = [
         },
     },
     {
-        "source_type": "book_chapter",
+        "source_type": "textbook",
         "source_key": "chapter:finding-alphas-data-alpha-design-2019",
         "title": "Data and Alpha Design",
         "authors": ["Weijia Li"],
@@ -53,6 +53,7 @@ ECONOMIC_HYPOTHESIS_SOURCES: list[dict[str, Any]] = [
         ),
         "metadata": {
             "publisher": "Wiley",
+            "kind": "book_chapter",
             "book": "Finding Alphas, Second Edition",
             "chapter": 6,
             "retrieved_date": "2026-08-11",
@@ -60,7 +61,7 @@ ECONOMIC_HYPOTHESIS_SOURCES: list[dict[str, Any]] = [
         },
     },
     {
-        "source_type": "book_chapter",
+        "source_type": "textbook",
         "source_key": "chapter:finding-alphas-triple-axis-plan-2019",
         "title": "The Triple-Axis Plan",
         "authors": ["Nitish Maini"],
@@ -75,6 +76,7 @@ ECONOMIC_HYPOTHESIS_SOURCES: list[dict[str, Any]] = [
         ),
         "metadata": {
             "publisher": "Wiley",
+            "kind": "book_chapter",
             "book": "Finding Alphas, Second Edition",
             "chapter": 11,
             "retrieved_date": "2026-08-11",
@@ -103,7 +105,7 @@ ECONOMIC_HYPOTHESIS_SOURCES: list[dict[str, Any]] = [
         },
     },
     {
-        "source_type": "author_material",
+        "source_type": "other",
         "source_key": "author:aqr-ilmanen-expected-returns-framework-2011",
         "title": "Expected Returns: An Investors Guide to Harvesting Market Rewards",
         "authors": ["Antti Ilmanen"],
