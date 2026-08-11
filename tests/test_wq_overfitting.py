@@ -31,30 +31,34 @@ def test_missing_overfitting_evidence_is_neutral_and_does_not_starve_inventory()
     assert overfitting_priority_multiplier(None) == 1.0
 
 
-def test_available_dsr_softly_changes_active_quality_baseline():
+def test_available_dsr_is_preserved_as_named_evidence_not_folded_into_magic_score():
     base = {
         "expression": "rank(close)",
         "is_metrics": {"sharpe": 1.8, "fitness": 1.3, "returns": 0.1, "turnover": 0.2},
         "validation": {"status": "ready", "robustness_score": 0.8},
         "novelty_score": 0.8,
     }
-    neutral = quality_baseline(base)["score"]
+    neutral = quality_baseline(base)
     strong = quality_baseline({
         **base,
         "validation": {
             **base["validation"],
             "overfitting_evidence": {"status": "available", "score": 1.0},
         },
-    })["score"]
+    })
     weak = quality_baseline({
         **base,
         "validation": {
             **base["validation"],
             "overfitting_evidence": {"status": "available", "score": 0.0},
         },
-    })["score"]
+    })
 
-    assert strong > neutral > weak
+    assert neutral["score"] is None
+    assert strong["score"] is None
+    assert weak["score"] is None
+    assert strong["components"]["overfitting_evidence"]["score"] == 1.0
+    assert weak["components"]["overfitting_evidence"]["score"] == 0.0
 
 
 def test_pbo_eligibility_requires_comparable_history_and_bounds_variants():

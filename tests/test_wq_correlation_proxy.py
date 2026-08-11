@@ -45,7 +45,7 @@ def test_missing_short_or_stale_evidence_is_non_blocking():
     assert correlation_priority_multiplier(stale) == 1.0
 
 
-def test_high_local_correlation_only_lowers_priority_and_sc_pending_is_not_a_local_fail():
+def test_high_local_correlation_stays_named_evidence_not_magic_priority_penalty():
     base = {
         "expression": "rank(close)",
         "is_metrics": {"sharpe": 1.6, "fitness": 1.3, "returns": 0.12, "turnover": 0.2, "checks": [{"name": "SELF_CORRELATION", "result": "PENDING"}]},
@@ -54,7 +54,8 @@ def test_high_local_correlation_only_lowers_priority_and_sc_pending_is_not_a_loc
     }
     high = dict(base, local_correlation_proxy={"status": "available", "max_correlation": 0.9, "calculated_at": datetime.now(timezone.utc).isoformat(), "official_sc": False})
     assert _priority_score(base) > 0
-    assert 0 < _priority_score(high) < _priority_score(base)
+    assert _priority_score(high) == _priority_score(base)
+    assert correlation_priority_multiplier(high["local_correlation_proxy"]) < 1.0
 
 
 def test_research_agent_enriches_candidate_from_active_portfolio(monkeypatch):

@@ -35,7 +35,7 @@ def test_cell_summary_tracks_research_candidate_and_formal_outcomes():
         {"family": "price_volume", "dataset_id": "pv1", "operator_pattern": "rank(*)", "status": "candidate", "failure_reason": None, "created_at": datetime.now(timezone.utc)},
         {"family": "price_volume", "dataset_id": "pv1", "operator_pattern": "rank(*)", "status": "rejected", "failure_reason": "low_fitness", "created_at": datetime.now(timezone.utc)},
     ]
-    candidate = {"alpha_id": "a1", "family": "price_volume", "dataset_id": "pv1", "operator_pattern": "rank(*)", "validation_status": "ready", "robustness_score": 0.8, "sharpe": 1.5, "fitness": 1.2}
+    candidate = {"alpha_id": "a1", "family": "price_volume", "dataset_id": "pv1", "operator_pattern": "rank(*)", "validation_status": "ready", "robustness_score": None, "sharpe": 1.5, "fitness": 1.2, "turnover": 0.2}
     attempts = [({"alpha_id": "a1", "status": "ACTIVE"}, candidate)]
     rows = summarize_research_cells(trials, [candidate], attempts)
     assert len(rows) == 1

@@ -43,13 +43,15 @@ def _candidate(**overrides):
     return candidate
 
 
-def test_sparse_evidence_uses_global_prior_and_is_deterministic():
+def test_sparse_evidence_keeps_probability_unavailable_and_is_deterministic():
     feedback = {"global": {"rate": 0.5, "samples": 0}, "family": {}, "dataset": {}, "cell": {}}
     first = calibrate_active_probability(_candidate(), feedback)
     second = calibrate_active_probability(_candidate(), feedback)
     assert first == second
+    assert first["probability"] is None
+    assert first["tier"] is None
     assert first["support"] == 0
-    assert first["provenance"] == "global_prior"
+    assert first["provenance"] == "cold_start_unavailable"
     assert first["outcome_weight"] == 0.0
 
 
@@ -66,19 +68,22 @@ def test_cell_feedback_wins_when_specific_support_is_sufficient():
     assert result["empirical_rate"] == 0.8
 
 
-def test_active_reference_is_a_small_probability_tiebreaker():
+def test_active_reference_does_not_create_probability_during_cold_start():
     feedback = {"global": {"rate": 0.5, "samples": 0}, "family": {}, "dataset": {}, "cell": {}}
     low = calibrate_active_probability(_candidate(active_prior_score=0.1), feedback)
     high = calibrate_active_probability(_candidate(active_prior_score=0.9), feedback)
 
-    assert high["probability"] > low["probability"]
-    assert high["baseline"]["components"]["active_reference"] == 0.9
-    assert low["baseline"]["components"]["active_reference"] == 0.1
+    assert low["probability"] is None
+    assert high["probability"] is None
+    assert "active_reference" not in low["baseline"]["components"]
+    assert "active_reference" not in high["baseline"]["components"]
 
 
-def test_missing_active_reference_is_neutral_for_legacy_candidates():
+def test_raw_candidate_evidence_is_preserved_without_magic_score():
     result = calibrate_active_probability(_candidate(), {"global": {"rate": 0.5, "samples": 0}})
-    assert result["baseline"]["components"]["active_reference"] == 0.5
+    assert result["baseline"]["score"] is None
+    assert result["baseline"]["components"]["fitness"] == 1.3
+    assert result["baseline"]["method"] == "evidence_hierarchy_no_probability"
 
 
 def test_sparse_cell_falls_back_to_family_dataset_groups():
@@ -151,12 +156,12 @@ async def test_only_terminal_outcomes_train_feedback(calibration_db):
 
 
 @pytest.mark.asyncio
-async def test_probability_persists_and_status_exposes_support(calibration_db):
+async def test_cold_start_probability_is_null_and_status_exposes_support(calibration_db):
     await record_research_candidates("primary", [_candidate()], settings={"region": "USA", "universe": "TOP3000"})
     status = await get_submission_policy_status("primary")
     top = status["candidate_queue_top"][0]
-    assert 0.0 <= top["active_probability"] <= 1.0
-    assert top["confidence_tier"] in {"S", "A", "B"}
+    assert top["active_probability"] is None
+    assert top["confidence_tier"] is None
     assert top["probability_support"] == 0
-    assert top["probability_provenance"] == "global_prior"
-    assert top["calibration_details"]["baseline"]["components"]["freshness"] > 0
+    assert top["probability_provenance"] == "cold_start_unavailable"
+    assert top["calibration_details"]["baseline"]["score"] is None

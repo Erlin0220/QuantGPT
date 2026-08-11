@@ -429,18 +429,30 @@ def test_robustness_failure_reduces_cross_run_parent_promise():
     assert autonomous._trial_promise_score(robust_failure) < autonomous._trial_promise_score(base)
 
 
-def test_skill_candidate_contract_requires_hypothesis_review_chain_and_run_decision():
+def test_skill_candidate_contract_requires_review_robustness_and_evidence_chain():
     valid = {
         "expression": "rank(ts_mean(returns, 20))",
         "hypothesis": "recent return persistence should rank future returns",
-        "skill_chain": ["wq-alpha-hypothesis", "wq-alpha-review"],
+        "skill_chain": [
+            "wq-alpha-hypothesis",
+            "wq-alpha-review",
+            "wq-robustness-validation",
+            "wq-candidate-evidence",
+        ],
         "review_decision": "RUN",
+        "robustness_plan": {
+            "mode": "skill_defined",
+            "checks": [{"universe": "TOP1000", "purpose": "test universe sensitivity"}],
+        },
+        "candidate_evidence_policy": {"mode": "calibrated_evidence_hierarchy"},
     }
 
     assert autonomous.validate_skill_candidate_contract(valid) is None
     assert "missing hypothesis" in autonomous.validate_skill_candidate_contract({**valid, "hypothesis": ""})
-    assert "wq-alpha-review" in autonomous.validate_skill_candidate_contract({**valid, "skill_chain": ["wq-alpha-hypothesis"]})
+    assert "wq-alpha-review" in autonomous.validate_skill_candidate_contract({**valid, "skill_chain": ["wq-alpha-hypothesis", "wq-robustness-validation", "wq-candidate-evidence"]})
     assert "review_decision" in autonomous.validate_skill_candidate_contract({**valid, "review_decision": "REVISE"})
+    assert "robustness_plan" in autonomous.validate_skill_candidate_contract({**valid, "robustness_plan": {}})
+    assert "candidate_evidence_policy" in autonomous.validate_skill_candidate_contract({**valid, "candidate_evidence_policy": {}})
 
 
 def test_skill_plan_preserves_devspace_provenance_and_live_dataset():
@@ -462,9 +474,11 @@ def test_skill_plan_preserves_devspace_provenance_and_live_dataset():
             "expression": "rank(ts_mean(ts_backfill(real_field, 60), 20))",
             "hypothesis": "positive analyst revisions should predict relative outperformance",
             "family": "analyst_revision",
-            "skill_chain": ["wq-alpha-hypothesis", "wq-alpha-review"],
+            "skill_chain": ["wq-alpha-hypothesis", "wq-alpha-review", "wq-robustness-validation", "wq-candidate-evidence"],
             "review_decision": "RUN",
             "review_notes": "live field and operator checks passed",
+            "robustness_plan": {"mode": "skill_defined", "checks": [{"universe": "TOP1000", "purpose": "coverage sensitivity"}]},
+            "candidate_evidence_policy": {"mode": "calibrated_evidence_hierarchy"},
         }],
         fields,
         seen=set(),
@@ -476,7 +490,9 @@ def test_skill_plan_preserves_devspace_provenance_and_live_dataset():
     assert plan[0]["planner_strategy"] == "devspace_skill"
     assert plan[0]["generation_source"] == "devspace_skill"
     assert plan[0]["skill_provenance_verified"] is True
-    assert plan[0]["skill_chain"] == ["wq-alpha-hypothesis", "wq-alpha-review"]
+    assert plan[0]["skill_chain"] == ["wq-alpha-hypothesis", "wq-alpha-review", "wq-robustness-validation", "wq-candidate-evidence"]
+    assert plan[0]["robustness_plan"]["mode"] == "skill_defined"
+    assert plan[0]["candidate_evidence_policy"]["mode"] == "calibrated_evidence_hierarchy"
     assert plan[0]["dataset_id"] == "analyst4"
     assert plan[0]["hypothesis"].startswith("positive analyst revisions")
 
@@ -507,9 +523,11 @@ def test_skill_plan_resolves_declared_field_outside_planner_sample_against_live_
             "hypothesis": "changes in downside option skew should forecast relative returns",
             "family": "options_volatility",
             "data_fields": ["implied_volatility_mean_skew_30"],
-            "skill_chain": ["wq-alpha-hypothesis", "wq-alpha-review"],
+            "skill_chain": ["wq-alpha-hypothesis", "wq-alpha-review", "wq-robustness-validation", "wq-candidate-evidence"],
             "review_decision": "RUN",
             "review_notes": "field verified in Data Explorer before simulation",
+            "robustness_plan": {"mode": "skill_defined", "checks": [{"universe": "TOP1000", "purpose": "coverage sensitivity"}]},
+            "candidate_evidence_policy": {"mode": "calibrated_evidence_hierarchy"},
         }],
         planner_sample,
         seen=set(),
@@ -889,9 +907,11 @@ def test_strict_skill_mode_does_not_run_native_decay_rescue(monkeypatch):
             "hypothesis": "relative price level is used only as a smoke-test Skill candidate",
             "family": "price_volume",
             "data_fields": ["close"],
-            "skill_chain": ["wq-alpha-hypothesis", "wq-alpha-review"],
+            "skill_chain": ["wq-alpha-hypothesis", "wq-alpha-review", "wq-robustness-validation", "wq-candidate-evidence"],
             "review_decision": "RUN",
             "review_notes": "smoke test",
+            "robustness_plan": {"mode": "skill_defined", "checks": [{"universe": "TOP1000", "purpose": "smoke-test universe sensitivity"}]},
+            "candidate_evidence_policy": {"mode": "calibrated_evidence_hierarchy"},
         }],
         allow_deterministic_fallback=False,
         max_simulations=4,
@@ -1027,22 +1047,28 @@ def test_next_generation_diversifies_parents_before_second_child():
     assert {item["parent_expression"] for item in plan} == {item["expression"] for item in ranked}
 
 
-def test_candidate_robustness_requires_cross_setting_support(monkeypatch):
-    monkeypatch.setattr(
-        autonomous,
-        "run_batch_simulation",
-        lambda *_args, **_kwargs: {
-            "ok": True,
-            "sub_results": {
-                "a": {"status": "completed", "sharpe": 1.2, "fitness": 0.9, "returns": 0.05, "turnover": 0.2},
-                "b": {"status": "completed", "sharpe": 1.1, "fitness": 0.8, "returns": 0.03, "turnover": 0.25},
-            },
-        },
-    )
+def test_candidate_robustness_executes_skill_defined_targeted_checks(monkeypatch):
+    calls = []
 
+    def fake_single(_client, _expression, **kwargs):
+        calls.append(kwargs)
+        return {
+            "ok": True,
+            "alpha_id": f"stress-{len(calls)}",
+            "is_metrics": {"sharpe": 1.2, "fitness": 0.9, "returns": 0.05, "turnover": 0.2},
+        }
+
+    monkeypatch.setattr(autonomous, "run_single_simulation", fake_single)
+    plan = {
+        "mode": "skill_defined",
+        "checks": [
+            {"universe": "TOP1000", "purpose": "test universe sensitivity"},
+            {"neutralization": "INDUSTRY", "purpose": "test peer-group sensitivity"},
+        ],
+    }
     result = autonomous.validate_candidate_robustness(
         object(),
-        {"expression": "rank(close)"},
+        {"expression": "rank(close)", "research_meta": {"robustness_plan": plan}},
         region="USA",
         universe="TOP3000",
         delay=1,
@@ -1051,27 +1077,34 @@ def test_candidate_robustness_requires_cross_setting_support(monkeypatch):
         truncation=0.08,
     )
 
-    assert result["status"] == "ready"
-    assert result["robustness_score"] == 1.0
+    assert result["status"] == "evidence_collected"
+    assert result["robustness_score"] is None
     assert result["validation_simulations"] == 2
+    assert calls[0]["universe"] == "TOP1000"
+    assert calls[1]["neutralization"] == "INDUSTRY"
 
 
-def test_candidate_robustness_failure_is_explicit(monkeypatch):
+def test_candidate_robustness_does_not_turn_weak_stress_metrics_into_magic_fail(monkeypatch):
     monkeypatch.setattr(
         autonomous,
-        "run_batch_simulation",
+        "run_single_simulation",
         lambda *_args, **_kwargs: {
             "ok": True,
-            "sub_results": {
-                "a": {"status": "completed", "sharpe": 0.4, "fitness": 0.3, "returns": -0.02, "turnover": 0.2},
-                "b": {"status": "completed", "sharpe": 0.6, "fitness": 0.4, "returns": 0.01, "turnover": 0.2},
-            },
+            "alpha_id": "stress-weak",
+            "is_metrics": {"sharpe": 0.4, "fitness": 0.3, "returns": -0.02, "turnover": 0.2},
         },
     )
-
     result = autonomous.validate_candidate_robustness(
         object(),
-        {"expression": "rank(close)"},
+        {
+            "expression": "rank(close)",
+            "research_meta": {
+                "robustness_plan": {
+                    "mode": "skill_defined",
+                    "checks": [{"universe": "TOP1000", "purpose": "test universe sensitivity"}],
+                }
+            },
+        },
         region="USA",
         universe="TOP3000",
         delay=1,
@@ -1080,8 +1113,9 @@ def test_candidate_robustness_failure_is_explicit(monkeypatch):
         truncation=0.08,
     )
 
-    assert result["status"] == "robustness_fail"
-    assert result["robustness_score"] == 0.0
+    assert result["status"] == "evidence_collected"
+    assert result["robustness_score"] is None
+    assert result["details"][0]["sharpe"] == 0.4
 
 
 def test_platform_alpha_history_scans_beyond_first_page(monkeypatch):

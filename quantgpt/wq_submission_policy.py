@@ -26,11 +26,9 @@ from .wq_candidate_calibration import (
     calibration_report,
     configured_confidence_thresholds,
 )
-from .wq_correlation_proxy import correlation_priority_multiplier
 from .wq_failure_taxonomy import classify_research_failure
 from .wq_learning_maturity import active_feedback_gate
 from .wq_lineage import lineage_id_for, parent_lineage_id_for, recover_research_metadata
-from .wq_overfitting import overfitting_priority_multiplier
 from .wq_research_scheduler import research_cell_key
 from .wq_submission_evidence import configured_submission_evidence_policy, submission_evidence_blockers
 
@@ -141,7 +139,7 @@ def _candidate_submission_blockers(
     blockers: list[str] = []
     if str(candidate.status or "").lower() != "queued":
         blockers.append("candidate_not_queued")
-    if str(candidate.validation_status or "").lower() != "ready":
+    if str(candidate.validation_status or "").lower() not in {"ready", "evidence_collected"}:
         blockers.append("validation_not_ready")
     if float(candidate.sharpe or 0.0) < 1.25:
         blockers.append("sharpe_below_threshold")
@@ -236,55 +234,23 @@ def _novelty_score(expression: str, peers: list[str]) -> float:
 
 
 def _priority_score(candidate: dict[str, Any]) -> float:
+    """Compatibility/display score only; candidate ordering uses evidence hierarchy.
+
+    Keep the stored field for API/backward compatibility without pretending an
+    opaque weighted metric blend is a calibrated preference or probability.
+    """
     metrics = candidate.get("is_metrics") or {}
-
-    def number(key: str) -> float:
-        try:
-            return float(metrics.get(key) or 0.0)
-        except (TypeError, ValueError):
-            return 0.0
-
-    raw_checks = list(metrics.get("checks") or [])
-    checks = {
-        str(check.get("name") or "").upper(): str(check.get("result") or "").upper()
+    raw_checks = list(metrics.get("checks") or []) if isinstance(metrics, dict) else []
+    if any(
+        str(check.get("name") or "").upper() == "SELF_CORRELATION"
+        and str(check.get("result") or "").upper() == "FAIL"
         for check in raw_checks
-    }
-    sc_check = next((check for check in raw_checks if str(check.get("name") or "").upper() == "SELF_CORRELATION"), None)
-    if checks.get("SELF_CORRELATION") == "FAIL":
+    ):
         return -10000.0
-    self_correlation = _optional_float((sc_check or {}).get("value")) or 0.0
-
-    turnover = number("turnover")
-    turnover_penalty = 0.0
-    if turnover > 0.5:
-        turnover_penalty += (turnover - 0.5) * 60.0
-    elif 0 < turnover < 0.03:
-        turnover_penalty += (0.03 - turnover) * 60.0
-
-    expression = str(candidate.get("expression") or "")
-    complexity_penalty = max(0, expression.count("(") - 8) * 1.5
-    raw_validation = candidate.get("validation") or {}
-    validation = raw_validation if isinstance(raw_validation, dict) else {}
     try:
-        robustness = float(validation.get("robustness_score") or 0.0)
+        return float(metrics.get("fitness") or 0.0)
     except (TypeError, ValueError):
-        robustness = 0.0
-    try:
-        novelty = float(candidate.get("novelty_score") or 0.0)
-    except (TypeError, ValueError):
-        novelty = 0.0
-    score = (
-        number("fitness") * 100.0
-        + number("sharpe") * 20.0
-        + number("returns") * 50.0
-        + robustness * 20.0
-        + novelty * 10.0
-        - max(0.0, self_correlation) * 20.0
-        - turnover_penalty
-        - complexity_penalty
-    )
-    overfitting_multiplier = overfitting_priority_multiplier(validation.get("overfitting_evidence"))
-    return score * correlation_priority_multiplier(candidate.get("local_correlation_proxy")) * overfitting_multiplier
+        return 0.0
 
 
 def _smoothed_rate(successes: int, samples: int, *, prior_rate: float, prior_strength: float) -> float:
@@ -557,10 +523,9 @@ async def record_research_candidates(
             candidate["novelty_score"] = novelty_score
             candidate["research_meta"] = meta
             calibration = calibrate_active_probability(candidate, conversion_feedback)
-            active_probability = float(calibration["probability"])
+            raw_probability = calibration.get("probability")
+            active_probability = float(raw_probability) if raw_probability is not None else None
             priority_score = _priority_score(candidate)
-            if calibration.get("decision_weight_enabled"):
-                priority_score *= 0.75 + active_probability * 0.5
             structure_signature = str(meta.get("structure_signature") or _structure_signature(expression))
             lineage_id = str(meta.get("lineage_id") or "") or lineage_id_for(expression, settings=settings, metadata=meta)
             parent_lineage_id = str(meta.get("parent_lineage_id") or "") or parent_lineage_id_for(
@@ -581,13 +546,13 @@ async def record_research_candidates(
                 "turnover": metrics.get("turnover"),
                 "priority_score": priority_score,
                 "active_probability": active_probability,
-                "confidence_tier": calibration["tier"],
+                "confidence_tier": calibration.get("tier"),
                 "probability_support": int(calibration["support"]),
                 "probability_provenance": str(calibration["provenance"]),
                 "calibration_details": calibration,
                 "last_validated_at": (
                     datetime.now(timezone.utc)
-                    if validation_status == "ready"
+                    if validation_status in {"ready", "evidence_collected"}
                     else (existing.last_validated_at if existing is not None else None)
                 ),
                 "family": meta.get("family"),
@@ -796,19 +761,19 @@ async def reconcile_candidate_platform_statuses(
                         else {}
                     )
                     robustness_ready = (
-                        str(validation_details.get("status") or candidate.validation_status or "").lower() == "ready"
-                        and candidate.robustness_score is not None
+                        str(validation_details.get("status") or candidate.validation_status or "").lower()
+                        in {"ready", "evidence_collected"}
                     )
                     ready = metrics_ready and robustness_ready
                     candidate.status = "queued" if ready else "validation_pending"
-                    if ready:
+                    if ready and str(candidate.validation_status or "").lower() != "evidence_collected":
                         candidate.validation_status = "ready"
                     elif metrics_ready and not robustness_ready:
                         candidate.validation_status = "robustness_pending"
                         validation_details.update(
                             {
                                 "status": "robustness_pending",
-                                "reason": "platform_preflight_requires_cross_setting_robustness_before_submission",
+                                "reason": "platform_preflight_requires_skill_defined_cross_setting_evidence_before_submission",
                             }
                         )
                         candidate.validation_details = validation_details
@@ -862,15 +827,13 @@ async def reconcile_candidate_platform_statuses(
                     "novelty_score": candidate.novelty_score,
                 }
                 calibration = calibrate_active_probability(evidence, conversion_feedback)
-                active_probability = float(calibration["probability"])
-                candidate.active_probability = active_probability
-                candidate.confidence_tier = str(calibration["tier"])
+                raw_probability = calibration.get("probability")
+                candidate.active_probability = float(raw_probability) if raw_probability is not None else None
+                candidate.confidence_tier = str(calibration["tier"]) if calibration.get("tier") else None
                 candidate.probability_support = int(calibration["support"])
                 candidate.probability_provenance = str(calibration["provenance"])
                 candidate.calibration_details = calibration
                 candidate.priority_score = _priority_score(evidence)
-                if calibration.get("decision_weight_enabled"):
-                    candidate.priority_score *= 0.75 + active_probability * 0.5
                 updated += 1
         await session.commit()
     return updated
@@ -898,7 +861,7 @@ async def get_candidate_robustness_revalidation_payloads(
     payloads: list[dict[str, Any]] = []
     for candidate in candidates:
         validation_status = str(candidate.validation_status or "").lower()
-        if candidate.robustness_score is not None and validation_status == "ready":
+        if validation_status in {"ready", "evidence_collected"}:
             continue
         if validation_status not in {
             "platform_recheck",
@@ -1413,9 +1376,17 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
         pending_score = int(pending_result.scalar() or 0)
         conversion_feedback = await _load_conversion_feedback(session, account)
         active_gate = active_feedback_gate(conversion_feedback)
-        candidate_order = [WQResearchCandidate.priority_score.desc(), WQResearchCandidate.created_at.asc()]
+        # Candidate Evidence Skill: official eligibility is enforced separately;
+        # preference uses calibrated ACTIVE probability only when mature, then a
+        # transparent lexicographic BRAIN-metric hierarchy. No opaque weighted sum.
+        candidate_order = [
+            WQResearchCandidate.fitness.desc(),
+            WQResearchCandidate.sharpe.desc(),
+            WQResearchCandidate.returns.desc(),
+            WQResearchCandidate.created_at.asc(),
+        ]
         if active_gate["ready"]:
-            candidate_order.insert(0, WQResearchCandidate.active_probability.desc())
+            candidate_order.insert(0, WQResearchCandidate.active_probability.desc().nullslast())
 
         queue_result = await session.execute(
             select(WQResearchCandidate)
@@ -1444,7 +1415,10 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             key=lambda candidate: (
                 not _candidate_research_ready(candidate),
                 not _candidate_fallback_submission_ready(candidate),
-                -(float(candidate.priority_score or 0.0)),
+                -(float(candidate.active_probability) if active_gate["ready"] and candidate.active_probability is not None else -1.0),
+                -(float(candidate.fitness or 0.0)),
+                -(float(candidate.sharpe or 0.0)),
+                -(float(candidate.returns or 0.0)),
             ),
         )
 
@@ -1507,7 +1481,7 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             if tier not in confidence_counts:
                 tier = "B"
             confidence_counts[tier] += 1
-            if str(candidate.validation_status or "").lower() == "ready":
+            if str(candidate.validation_status or "").lower() in {"ready", "evidence_collected"}:
                 ready_confidence_counts[tier] += 1
                 if _candidate_research_ready(candidate):
                     research_readiness_eligible_count += 1

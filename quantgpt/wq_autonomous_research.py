@@ -797,7 +797,12 @@ def _expression_uses_only_catalog_fields(expression: str, operators: set[str], a
     return all(token in operators or token in allowed for token in tokens)
 
 
-REQUIRED_WQ_SKILL_CHAIN = ("wq-alpha-hypothesis", "wq-alpha-review")
+REQUIRED_WQ_SKILL_CHAIN = (
+    "wq-alpha-hypothesis",
+    "wq-alpha-review",
+    "wq-robustness-validation",
+    "wq-candidate-evidence",
+)
 
 
 def validate_skill_candidate_contract(candidate: dict[str, Any]) -> str | None:
@@ -815,6 +820,15 @@ def validate_skill_candidate_contract(candidate: dict[str, Any]) -> str | None:
         return f"missing required skill(s): {', '.join(missing)}"
     if review_decision != "RUN":
         return "review_decision must be RUN"
+    robustness_plan = candidate.get("robustness_plan")
+    if not isinstance(robustness_plan, dict) or str(robustness_plan.get("mode") or "") != "skill_defined":
+        return "missing skill-defined robustness_plan"
+    checks = robustness_plan.get("checks") or []
+    if not isinstance(checks, list) or not 1 <= len(checks) <= 4:
+        return "robustness_plan.checks must contain 1-4 targeted checks"
+    evidence_policy = candidate.get("candidate_evidence_policy")
+    if not isinstance(evidence_policy, dict) or str(evidence_policy.get("mode") or "") != "calibrated_evidence_hierarchy":
+        return "missing candidate_evidence_policy"
     return None
 
 
@@ -949,6 +963,8 @@ def build_skill_plan(
                 "skill_review_notes": raw_candidate.get("review_notes"),
                 "skill_provenance_verified": True,
                 "knowledge_card_ids": list(raw_candidate.get("knowledge_card_ids") or []),
+                "robustness_plan": dict(raw_candidate.get("robustness_plan") or {}),
+                "candidate_evidence_policy": dict(raw_candidate.get("candidate_evidence_policy") or {}),
             }
         )
     return out
@@ -1685,54 +1701,83 @@ def validate_candidate_robustness(
     truncation: float,
     check_cancelled: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
-    """Run a small alternate-setting funnel before a primary-pass Alpha becomes READY."""
+    """Execute a Skill-authored targeted robustness plan and preserve raw evidence.
+
+    The Skill owns which perturbations are informative. This function deliberately
+    avoids inventing a universal local pass ratio; BRAIN metrics/checks and later
+    evidence review decide how much confidence to place in the candidate.
+    """
     expression = str(candidate.get("expression") or "").strip()
     if not expression:
-        return {"status": "robustness_unavailable", "robustness_score": 0.0, "reason": "missing_expression"}
-    alternate_universe = "TOP1000" if str(universe).upper() == "TOP3000" else "TOP3000"
-    alternate_neutralization = "INDUSTRY" if str(neutralization).upper() != "INDUSTRY" else "SUBINDUSTRY"
-    try:
-        sweep = run_batch_simulation(
-            client,
-            expression,
-            regions=[region],
-            delays=[delay],
-            universes=[alternate_universe],
-            neutralizations=[neutralization, alternate_neutralization],
-            decay=decay,
-            truncation=truncation,
-            auto_submit=False,
-            check_cancelled=check_cancelled,
-        )
-    except Exception as exc:
+        return {"status": "robustness_unavailable", "robustness_score": None, "reason": "missing_expression"}
+
+    meta = candidate.get("research_meta") or {}
+    raw_plan = candidate.get("robustness_plan") or (meta.get("robustness_plan") if isinstance(meta, dict) else None)
+    plan = dict(raw_plan) if isinstance(raw_plan, dict) else {}
+    checks = plan.get("checks") or []
+    if str(plan.get("mode") or "") != "skill_defined" or not isinstance(checks, list) or not checks:
         return {
-            "status": "robustness_unavailable",
-            "robustness_score": 0.0,
-            "reason": str(exc)[:300],
+            "status": "validation_pending",
+            "robustness_score": None,
+            "reason": "skill_robustness_plan_missing",
             "validation_simulations": 0,
+            "policy": "skill_defined_required",
         }
 
-    sub_results = list((sweep.get("sub_results") or {}).values()) if isinstance(sweep, dict) else []
-    completed = [item for item in sub_results if item.get("status") == "completed"]
-    passes = []
-    for item in completed:
-        sharpe = _safe_metric(item.get("sharpe"), -999.0)
-        fitness = _safe_metric(item.get("fitness"), -999.0)
-        turnover = _safe_metric(item.get("turnover"), 0.0)
-        returns = _safe_metric(item.get("returns"), -999.0)
-        if sharpe >= 1.0 and fitness >= 0.7 and 0.01 <= turnover <= 0.7 and returns > 0:
-            passes.append(item)
-    score = len(passes) / max(1, len(completed))
-    ready = len(completed) >= 2 and score >= 0.5
+    details: list[dict[str, Any]] = []
+    for raw_check in checks[:4]:
+        if check_cancelled and check_cancelled():
+            break
+        check = dict(raw_check) if isinstance(raw_check, dict) else {}
+        settings = {
+            "region": str(check.get("region") or region),
+            "universe": str(check.get("universe") or universe),
+            "delay": int(check.get("delay") if check.get("delay") is not None else delay),
+            "decay": int(check.get("decay") if check.get("decay") is not None else decay),
+            "neutralization": str(check.get("neutralization") or neutralization),
+            "truncation": float(check.get("truncation") if check.get("truncation") is not None else truncation),
+        }
+        try:
+            result = run_single_simulation(
+                client,
+                expression,
+                region=settings["region"],
+                universe=settings["universe"],
+                delay=settings["delay"],
+                decay=settings["decay"],
+                neutralization=settings["neutralization"],
+                truncation=settings["truncation"],
+                auto_submit=False,
+                check_cancelled=check_cancelled,
+            )
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)[:300]}
+        is_metrics = result.get("is_metrics") or {}
+        details.append(
+            {
+                "status": "completed" if result.get("ok") else ("cancelled" if result.get("cancelled") else "failed"),
+                "purpose": str(check.get("purpose") or "targeted robustness check"),
+                "settings": settings,
+                "alpha_id": result.get("alpha_id"),
+                "sharpe": _safe_metric(is_metrics.get("sharpe"), None),
+                "fitness": _safe_metric(is_metrics.get("fitness"), None),
+                "returns": _safe_metric(is_metrics.get("returns"), None),
+                "turnover": _safe_metric(is_metrics.get("turnover"), None),
+                "checks": list(is_metrics.get("checks") or []),
+                "error": result.get("error"),
+            }
+        )
+
+    completed = [item for item in details if item.get("status") == "completed"]
     return {
-        "status": "ready" if ready else "robustness_fail",
-        "robustness_score": round(score, 4),
-        "validation_simulations": len(sub_results),
+        "status": "evidence_collected" if completed else "robustness_unavailable",
+        "robustness_score": None,
+        "validation_simulations": len(details),
         "completed": len(completed),
-        "passed": len(passes),
-        "alternate_universe": alternate_universe,
-        "neutralizations": [neutralization, alternate_neutralization],
-        "details": sub_results,
+        "details": details,
+        "robustness_plan": plan,
+        "knowledge_card_ids": list(plan.get("knowledge_card_ids") or []),
+        "interpretation_policy": "skill_review_required_no_magic_pass_ratio",
     }
 
 
@@ -1748,6 +1793,9 @@ def _merge_candidate_validation(
         dict(raw_existing_validation) if isinstance(raw_existing_validation, dict) else {}
     )
     validation.update(robustness_validation)
+    meta = candidate.get("research_meta") or {}
+    if isinstance(meta, dict) and isinstance(meta.get("candidate_evidence_policy"), dict):
+        validation["candidate_evidence_policy"] = dict(meta["candidate_evidence_policy"])
     raw_local_evidence = candidate.get("local_correlation_proxy") or validation.get("local_correlation_proxy")
     local_evidence: dict[str, Any] = dict(raw_local_evidence) if isinstance(raw_local_evidence, dict) else {}
     raw_overfitting = validation.get("overfitting_evidence")
@@ -2458,7 +2506,7 @@ def run_autonomous_research(
     ready_candidates = [
         item
         for item in ranked_primary_candidates
-        if (item.get("validation") or {}).get("status") == "ready"
+        if str((item.get("validation") or {}).get("status") or "").lower() in {"ready", "evidence_collected"}
         and ((item.get("validation") or {}).get("submission_gate") or {}).get("ready", True)
     ]
     all_results.sort(key=_rank_result, reverse=True)

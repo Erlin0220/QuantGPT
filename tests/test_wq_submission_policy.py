@@ -532,7 +532,7 @@ async def test_explicit_local_robustness_fail_can_fill_daily_active_target_as_fa
 
 
 @pytest.mark.asyncio
-async def test_platform_sc_value_updates_queued_candidate_and_priority(policy_db):
+async def test_platform_sc_value_updates_queued_candidate_without_magic_priority_penalty(policy_db):
     await record_research_candidates(
         "primary",
         [
@@ -558,7 +558,7 @@ async def test_platform_sc_value_updates_queued_candidate_and_priority(policy_db
     item = after["candidate_queue_top"][0]
     assert item["sc_status"] == "PASS"
     assert item["self_correlation"] == 0.58
-    assert item["priority_score"] < before_priority
+    assert item["priority_score"] == before_priority
 
 
 @pytest.mark.asyncio

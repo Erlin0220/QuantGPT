@@ -74,6 +74,19 @@ async def lifespan(app: FastAPI):
         # Methodology priors are advisory and must never block service startup.
         logger.exception("Research methodology knowledge seed failed")
 
+    try:
+        from .wq_validation_evidence_seed import seed_validation_evidence_knowledge
+
+        seeded = await seed_validation_evidence_knowledge()
+        logger.info(
+            "Validation/evidence methodology seeded: %s sources, %s cards",
+            seeded["sources"],
+            seeded["cards"],
+        )
+    except Exception:
+        # Validation/evidence priors are advisory and must never block startup.
+        logger.exception("Validation/evidence methodology seed failed")
+
     from .db import _get_session_factory as _sf
 
     active_statuses = [

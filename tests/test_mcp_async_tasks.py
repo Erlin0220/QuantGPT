@@ -55,8 +55,10 @@ class TestWQMCPAsyncSurface(unittest.IsolatedAsyncioTestCase):
                     skill_candidates=[{
                         "expression": "rank(close/open)",
                         "hypothesis": "relative close/open strength should predict next-day cross-sectional returns",
-                        "skill_chain": ["wq-alpha-hypothesis", "wq-alpha-review"],
+                        "skill_chain": ["wq-alpha-hypothesis", "wq-alpha-review", "wq-robustness-validation", "wq-candidate-evidence"],
                         "review_decision": "RUN",
+                        "robustness_plan": {"mode": "skill_defined", "checks": [{"universe": "TOP1000", "purpose": "smoke-test universe sensitivity"}]},
+                        "candidate_evidence_policy": {"mode": "calibrated_evidence_hierarchy"},
                     }]
                 ),
             ),
@@ -79,7 +81,7 @@ class TestWQMCPAsyncSurface(unittest.IsolatedAsyncioTestCase):
             payload = json.loads(await mcp_server.wq_brain_autonomous_research())
 
         self.assertEqual(payload["status"], "skill_generation_required")
-        self.assertEqual(payload["required_skill_chain"], ["wq-alpha-hypothesis", "wq-alpha-review"])
+        self.assertEqual(payload["required_skill_chain"], ["wq-alpha-hypothesis", "wq-alpha-review", "wq-robustness-validation", "wq-candidate-evidence"])
         start_task.assert_not_awaited()
 
     async def test_auto_submit_is_rejected_before_task_enqueue(self):

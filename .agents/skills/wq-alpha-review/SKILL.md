@@ -44,9 +44,9 @@ Decision:
 - **REVISE:** syntax/live-field/look-ahead/hypothesis mismatch; fix before simulation.
 - **DEFER:** valid but redundant with better candidates in the same research cell.
 
-For every `RUN` candidate, return/preserve the Skill contract required by QuantGPT: `expression`, `hypothesis`, `family`, `data_fields`, `skill_chain` containing `wq-alpha-hypothesis` and `wq-alpha-review` (plus `wq-alpha-repair` / `wq-alpha-diversify` when applicable), `review_decision: "RUN"`, concise `review_notes`, and `knowledge_card_ids` when known. This metadata must travel with the expression into `wq_brain_autonomous_research`.
+For every provisional `RUN` candidate, invoke `wq-robustness-validation` to define a small hypothesis-targeted `robustness_plan`, then invoke `wq-candidate-evidence` to attach a transparent `candidate_evidence_policy`. Only then package the final Skill contract required by QuantGPT: `expression`, `hypothesis`, `family`, `data_fields`, `skill_chain` containing `wq-alpha-hypothesis`, `wq-alpha-review`, `wq-robustness-validation`, and `wq-candidate-evidence` (plus `wq-experiment-allocation` / `wq-alpha-repair` / `wq-alpha-diversify` when applicable), `review_decision: "RUN"`, concise `review_notes`, `robustness_plan`, `candidate_evidence_policy`, and `knowledge_card_ids` when known. This metadata must travel with the expression into `wq_brain_autonomous_research`.
 
-Do not reject solely because a local proxy predicts mediocre robustness. BRAIN remains the empirical judge.
+Do not reject solely because a local proxy predicts mediocre robustness. The robustness Skill chooses informative evidence collection; BRAIN remains the empirical judge.
 
 ## B — Boundary
 
@@ -60,3 +60,5 @@ Do not reject solely because a local proxy predicts mediocre robustness. BRAIN r
 - `wq-alpha-hypothesis`
 - `wq-alpha-repair`
 - `wq-alpha-diversify`
+- `wq-robustness-validation`
+- `wq-candidate-evidence`

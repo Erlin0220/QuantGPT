@@ -181,7 +181,7 @@ async def record_research_trials(
             candidate_ids.add(alpha_id)
             continue
         if (
-            str(validation.get("status") or "").lower() == "ready"
+            str(validation.get("status") or "").lower() in {"ready", "evidence_collected"}
             and (validation.get("submission_gate") or {}).get("ready", True)
         ):
             candidate_ids.add(alpha_id)
@@ -407,7 +407,7 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
         for candidate in candidate_rows
         if str(candidate.confidence_tier or "B").upper() in {"S", "A"}
         and str(candidate.status or "").lower() == "queued"
-        and str(candidate.validation_status or "").lower() == "ready"
+        and str(candidate.validation_status or "").lower() in {"ready", "evidence_collected"}
     )
 
     def conversion(numerator: int, denominator: int) -> dict[str, Any]:

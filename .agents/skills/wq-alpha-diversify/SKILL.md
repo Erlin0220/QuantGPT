@@ -36,7 +36,7 @@ Invoke when Self-Correlation failures rise, the candidate queue is dominated by 
    3. different structural transform/horizon;
    4. if evidence points to shared factor exposure, a justified neutralized sibling;
    5. only then fine parameter changes.
-7. Review each diversified candidate with `wq-alpha-review`. For `RUN` candidates emit structured `skill_candidates` with `skill_chain: ["wq-alpha-hypothesis", "wq-alpha-diversify", "wq-alpha-review"]`, the new hypothesis/family/data fields, and review notes; return them through `wq_brain_autonomous_research` with deterministic fallback disabled.
+7. Review each diversified candidate with `wq-alpha-review`, then complete `wq-robustness-validation` and `wq-candidate-evidence`. For `RUN` candidates emit structured `skill_candidates` with `skill_chain: ["wq-alpha-hypothesis", "wq-alpha-diversify", "wq-alpha-review", "wq-robustness-validation", "wq-candidate-evidence"]`, the new hypothesis/family/data fields, review notes, `robustness_plan`, and `candidate_evidence_policy`; return them through `wq_brain_autonomous_research` with deterministic fallback disabled.
 8. Use BRAIN simulation and current SC feedback to evaluate whether diversification is real. Persist family/dataset/structure lineage.
 9. Avoid creating a pool that is numerically diverse but economically identical.
 

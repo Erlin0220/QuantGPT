@@ -1826,14 +1826,15 @@ async def wq_brain_autonomous_research(
     """Skill-first 研究 WQ Alpha；生成式推理由当前 ChatGPT + DevSpace 项目 Skill 负责。
 
     默认必须先用 DevSpace 打开 QuantGPT 项目，执行 ``wq-alpha-hypothesis`` 生成候选，再执行
-    ``wq-alpha-review``；只有 review_decision=RUN 的结构化 ``skill_candidates`` 才会进入 BRAIN
+    ``wq-alpha-review`` → ``wq-robustness-validation`` → ``wq-candidate-evidence``；只有
+    review_decision=RUN 且携带 skill-defined robustness/evidence policy 的结构化 ``skill_candidates`` 才会进入 BRAIN
     Simulation。真实 Simulation 失败后的下一代应回到 ``wq-alpha-repair`` / ``wq-alpha-diversify``
     再生成，而不是由服务端隐藏模板继续变异。``allow_deterministic_fallback=True`` 仅用于显式兼容/
     故障降级，此时才允许 legacy chatgpt_expressions 与确定性 ACTIVE/near-miss/knowledge/live-field 路径。
     QuantGPT 服务端不调用任何 LLM。
-    ``max_simulations`` 是主研究 generations 的 Simulation 预算；
-    Robustness Validation 使用独立、显式上报的有界预算。Primary Pass 还会经过有限的跨
-    Universe/Neutralization Robustness Funnel，只有 READY Candidate 才进入正式候选库存。工具永远不会正式提交
+    ``max_simulations`` 是主研究 generations 的 Simulation 预算；Robustness Validation 使用独立、显式上报的有界预算，
+    并严格执行 Skill 提供的 targeted robustness plan，不再使用固定跨 Universe/Neutralization 网格或 magic pass ratio。
+    Primary Pass 携带可审计 robustness evidence 后才进入正式候选库存。工具永远不会正式提交
     Alpha，正式提交仍由 Submission Gate 控制。
 
     Returns:
@@ -1854,7 +1855,7 @@ async def wq_brain_autonomous_research(
                 "error": "skill_candidates_required",
                 "project_path": r"C:\project\QuantGPT",
                 "required_skill_chain": list(REQUIRED_WQ_SKILL_CHAIN),
-                "next_step": "用 DevSpace 打开项目，执行 wq-alpha-hypothesis → wq-alpha-review，并把 RUN 候选作为 skill_candidates 传回。",
+                "next_step": "用 DevSpace 打开项目，执行 wq-alpha-hypothesis → wq-alpha-review → wq-robustness-validation → wq-candidate-evidence，并把完整 RUN 候选作为 skill_candidates 传回。",
             }, ensure_ascii=False)
         contract_errors = [
             {"index": index, "error": error}
