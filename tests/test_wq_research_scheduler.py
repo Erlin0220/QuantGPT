@@ -4,6 +4,7 @@ from quantgpt.wq_research_scheduler import (
     allocate_research_cells,
     research_cell_key,
     summarize_research_cells,
+    summarize_research_credit_assignment,
 )
 
 
@@ -32,8 +33,8 @@ def test_research_cell_key_has_stable_fallbacks():
 
 def test_cell_summary_tracks_research_candidate_and_formal_outcomes():
     trials = [
-        {"family": "price_volume", "dataset_id": "pv1", "operator_pattern": "rank(*)", "status": "candidate", "failure_reason": None, "created_at": datetime.now(timezone.utc)},
-        {"family": "price_volume", "dataset_id": "pv1", "operator_pattern": "rank(*)", "status": "rejected", "failure_reason": "low_fitness", "created_at": datetime.now(timezone.utc)},
+        {"alpha_id": "a1", "family": "price_volume", "dataset_id": "pv1", "operator_pattern": "rank(*)", "status": "candidate", "failure_reason": None, "created_at": datetime.now(timezone.utc)},
+        {"alpha_id": "a2", "family": "price_volume", "dataset_id": "pv1", "operator_pattern": "rank(*)", "status": "rejected", "failure_reason": "low_fitness", "created_at": datetime.now(timezone.utc)},
     ]
     candidate = {"alpha_id": "a1", "family": "price_volume", "dataset_id": "pv1", "operator_pattern": "rank(*)", "validation_status": "ready", "robustness_score": None, "sharpe": 1.5, "fitness": 1.2, "turnover": 0.2}
     attempts = [({"alpha_id": "a1", "status": "ACTIVE"}, candidate)]
@@ -46,6 +47,67 @@ def test_cell_summary_tracks_research_candidate_and_formal_outcomes():
     assert row["formal_submissions"] == 1
     assert row["active"] == 1
     assert row["recent_failure_reasons"] == {"low_fitness": 1}
+
+
+def test_submission_credit_stays_on_originating_trial_cell_when_candidate_metadata_changes():
+    now = datetime.now(timezone.utc)
+    trials = [{
+        "alpha_id": "a1",
+        "family": "analyst_revision",
+        "dataset_id": "analyst4",
+        "provenance_state": "resolved",
+        "operator_pattern": "rank(ts_delta(*,#))",
+        "status": "candidate",
+        "created_at": now,
+    }]
+    recovered_candidate = {
+        "alpha_id": "a1",
+        "family": "other",
+        "dataset_id": "analyst4",
+        "provenance_state": "resolved",
+        "operator_pattern": "group_rank(rank(*))",
+        "validation_status": "ready",
+        "sharpe": 1.5,
+        "fitness": 1.2,
+        "turnover": 0.2,
+    }
+    rows = summarize_research_cells(
+        trials,
+        [recovered_candidate],
+        [({"alpha_id": "a1", "status": "ACTIVE"}, recovered_candidate)],
+    )
+    assert len(rows) == 1
+    assert rows[0]["cell_key"] == "analyst_revision|analyst4|rank(ts_delta(*,#))"
+    assert rows[0]["trials"] == 1
+    assert rows[0]["formal_submissions"] == 1
+    assert rows[0]["active"] == 1
+
+    credit = summarize_research_credit_assignment(
+        trials,
+        [recovered_candidate],
+        [({"alpha_id": "a1", "status": "ACTIVE"}, recovered_candidate)],
+    )
+    assert credit["candidate"]["metadata_cell_mismatch"] == 1
+    assert credit["formal_submission"]["coverage"] == 1.0
+
+
+def test_unattributed_platform_candidate_does_not_create_phantom_scheduler_cell():
+    candidate = {
+        "alpha_id": "recovered-only",
+        "family": "other",
+        "dataset_id": "analyst4",
+        "provenance_state": "resolved",
+        "operator_pattern": "rank(*)",
+        "validation_status": "ready",
+        "sharpe": 1.5,
+        "fitness": 1.2,
+        "turnover": 0.2,
+    }
+    rows = summarize_research_cells([], [candidate], [({"alpha_id": "recovered-only", "status": "ACTIVE"}, candidate)])
+    assert rows == []
+    credit = summarize_research_credit_assignment([], [candidate], [({"alpha_id": "recovered-only", "status": "ACTIVE"}, candidate)])
+    assert credit["formal_submission"]["unattributed"] == 1
+    assert credit["active"]["unattributed"] == 1
 
 
 def test_sparse_cells_shrink_to_global_prior_instead_of_raw_rate():

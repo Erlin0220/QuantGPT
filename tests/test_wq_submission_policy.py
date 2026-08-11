@@ -190,6 +190,24 @@ async def test_points_settlement_records_confidence_weighted_research_feedback(p
     import quantgpt.db as db
 
     await observe_account_status("primary", _current_points(1000))
+    await record_research_trials(
+        "primary",
+        {
+            "results": [
+                {
+                    "alpha_id": "points-a",
+                    "expression": "rank(ts_mean(field_a, 20))",
+                    "research_meta": {"family": "family_a", "dataset_id": "dataset_a", "data_fields": ["field_a"]},
+                },
+                {
+                    "alpha_id": "points-b",
+                    "expression": "rank(ts_mean(field_b, 20))",
+                    "research_meta": {"family": "family_b", "dataset_id": "dataset_b", "data_fields": ["field_b"]},
+                },
+            ],
+            "candidates": [{"alpha_id": "points-a"}, {"alpha_id": "points-b"}],
+        },
+    )
     await record_research_candidates(
         "primary",
         [
@@ -683,6 +701,17 @@ async def test_points_feedback_gate_exposes_operator_feedback(policy_db, monkeyp
     monkeypatch.setenv("WQ_POINTS_FEEDBACK_MIN_CONFIDENCE", "0.5")
     monkeypatch.setenv("WQ_POINTS_FEEDBACK_MIN_SAMPLES", "1")
     await observe_account_status("primary", _current_points(1000))
+    await record_research_trials(
+        "primary",
+        {
+            "results": [{
+                "alpha_id": "feedback-a",
+                "expression": "rank(ts_mean(field_feedback, 20))",
+                "research_meta": {"family": "feedback_family", "dataset_id": "feedback_dataset"},
+            }],
+            "candidates": [{"alpha_id": "feedback-a"}],
+        },
+    )
     await record_research_candidates(
         "primary",
         [{

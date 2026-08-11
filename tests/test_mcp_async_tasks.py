@@ -69,6 +69,23 @@ class TestWQMCPAsyncSurface(unittest.IsolatedAsyncioTestCase):
             with self.subTest(name=name):
                 await self._assert_enqueued(name, call)
 
+    def test_research_source_run_stamp_reaches_nested_persistence_payloads(self):
+        result = {
+            "results": [{"alpha_id": "a1", "research_meta": {"family": "price_volume"}}],
+            "candidates": [{"alpha_id": "a1"}],
+            "generations": [{"results": [{"alpha_id": "a2"}], "failed": [{"expression": "rank(x)"}]}],
+            "best": {"alpha_id": "a1"},
+        }
+
+        stamped = mcp_server._stamp_wq_research_source_run(result, "round-123")
+
+        self.assertEqual(stamped["source_run_id"], "round-123")
+        self.assertEqual(stamped["results"][0]["research_meta"]["source_run_id"], "round-123")
+        self.assertEqual(stamped["candidates"][0]["research_meta"]["source_run_id"], "round-123")
+        self.assertEqual(stamped["generations"][0]["results"][0]["research_meta"]["source_run_id"], "round-123")
+        self.assertEqual(stamped["generations"][0]["failed"][0]["research_meta"]["source_run_id"], "round-123")
+        self.assertEqual(stamped["best"]["research_meta"]["source_run_id"], "round-123")
+
     async def test_autonomous_research_requires_devspace_skill_candidates_by_default(self):
         with (
             patch.dict(

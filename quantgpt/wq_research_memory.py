@@ -11,7 +11,7 @@ from typing import Any
 from sqlalchemy import select
 
 from .db import _get_session_factory
-from .models import WQResearchCandidate, WQResearchStageEvent, WQResearchTrial, WQSubmissionAttempt
+from .models import Task, WQResearchCandidate, WQResearchStageEvent, WQResearchTrial, WQSubmissionAttempt
 from .wq_candidate_funnel import funnel_events_for_trial, summarize_funnel
 from .wq_failure_taxonomy import classify_research_failure
 from .wq_learning_maturity import build_learning_maturity
@@ -25,7 +25,8 @@ from .wq_lineage import (
 )
 from .wq_mutation_policy import compile_prevention_rules, summarize_mutation_outcomes
 from .wq_operator_registry import canonicalize_wq_expression
-from .wq_research_scheduler import summarize_research_cells
+from .wq_research_audit import build_research_round_audit
+from .wq_research_scheduler import summarize_research_cells, summarize_research_credit_assignment
 
 _DEFAULT_POINTS_FEEDBACK_MIN_CONFIDENCE = 0.5
 _DEFAULT_POINTS_FEEDBACK_MIN_SAMPLES = 2
@@ -378,11 +379,57 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
             .where(WQSubmissionAttempt.account == account)
         )
         formal_rows = [(attempt, candidate) for attempt, candidate in formal_result.all()]
+        task_result = await session.execute(
+            select(Task)
+            .where(Task.task_type == "wq_research")
+            .order_by(Task.created_at.desc())
+            .limit(12)
+        )
+        recent_research_tasks = list(task_result.scalars().all())
         from .wq_submission_policy import _load_conversion_feedback
 
         conversion_feedback = await _load_conversion_feedback(session, account)
 
     research_cells = summarize_research_cells(rows, candidate_rows, formal_rows)
+    credit_assignment = summarize_research_credit_assignment(rows, candidate_rows, formal_rows)
+
+    latest_trial_by_alpha: dict[str, WQResearchTrial] = {}
+    for row in rows:
+        alpha_id = str(row.alpha_id or "")
+        if alpha_id and alpha_id not in latest_trial_by_alpha:
+            latest_trial_by_alpha[alpha_id] = row
+
+    research_round_audits: list[dict[str, Any]] = []
+    for task in recent_research_tasks:
+        source_run_id = str(task.id)
+        params = task.params if isinstance(task.params, dict) else {}
+        tag = str(params.get("tag") or "")
+        task_trials = [row for row in rows if str(row.source_run_id or "") == source_run_id]
+        task_candidates = [candidate for candidate in candidate_rows if str(candidate.source_run_id or "") == source_run_id]
+        attribution_mode = "source_run_id"
+        if not task_trials and not task_candidates and tag:
+            task_trials = [row for row in rows if str(row.tag or "") == tag]
+            task_candidates = [candidate for candidate in candidate_rows if str(candidate.tag or "") == tag]
+            if task_trials or task_candidates:
+                attribution_mode = "legacy_tag_fallback"
+        linked_alpha_ids = {str(candidate.alpha_id) for candidate in task_candidates if candidate.alpha_id}
+        if not linked_alpha_ids:
+            linked_alpha_ids = {str(row.alpha_id) for row in task_trials if row.alpha_id}
+        task_attempts = [
+            attempt
+            for attempt, _candidate in formal_rows
+            if str(attempt.alpha_id or "") in linked_alpha_ids
+        ]
+        research_round_audits.append(
+            build_research_round_audit(
+                task,
+                trials=task_trials,
+                candidates=task_candidates,
+                attempts=task_attempts,
+                attribution_mode=attribution_mode,
+            )
+        )
+
     overfitting_rows = []
     local_correlation_available = 0
     local_correlation_high_risk = 0
@@ -526,12 +573,16 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
         details = attempt.attribution_details if isinstance(attempt.attribution_details, dict) else {}
         cohort_ids = details.get("cohort_alpha_ids") or [attempt.alpha_id]
         settlement_cohorts.add("|".join(sorted(str(value) for value in cohort_ids if value)))
-        if candidate is None:
+        origin_trial = latest_trial_by_alpha.get(str(attempt.alpha_id or ""))
+        if origin_trial is None:
+            # Points may still be globally settled, but family/dataset/operator credit
+            # must not be learned from a recovered/current Candidate whose research
+            # origin is unknown.
             continue
-        family = str(candidate.family or "unknown")
-        dataset_id = str(candidate.dataset_id or "")
-        dataset_resolved = str(candidate.provenance_state or "").lower() == "resolved" and bool(dataset_id)
-        operator_pattern = str(candidate.operator_pattern or "unknown")
+        family = str(origin_trial.family or "unknown")
+        dataset_id = str(origin_trial.dataset_id or "")
+        dataset_resolved = str(origin_trial.provenance_state or "").lower() == "resolved" and bool(dataset_id)
+        operator_pattern = str(origin_trial.operator_pattern or "unknown")
         family_points_attribution[family] += share
         family_points_feedback[family] += weighted
         if dataset_resolved:
@@ -709,6 +760,8 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
         "provenance": provenance_summary,
         "field_registry": field_registry,
         "research_cells": research_cells,
+        "credit_assignment": credit_assignment,
+        "research_round_audits": research_round_audits,
         "learning_funnel": learning_funnel,
         "learning_maturity": learning_maturity,
         "research_memory_guidance": research_memory_guidance,

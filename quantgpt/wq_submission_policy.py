@@ -287,22 +287,46 @@ async def _load_conversion_feedback(session, account: str) -> dict[str, Any]:
             WQSubmissionAttempt.status.in_(terminal_statuses),
         )
     )
+    grouped_rows = list(grouped_result.all())
+    terminal_alpha_ids = sorted({str(attempt.alpha_id) for attempt, _candidate in grouped_rows if attempt.alpha_id})
+    latest_trial_by_alpha: dict[str, WQResearchTrial] = {}
+    if terminal_alpha_ids:
+        trial_result = await session.execute(
+            select(WQResearchTrial)
+            .where(
+                WQResearchTrial.account == account,
+                WQResearchTrial.alpha_id.in_(terminal_alpha_ids),
+            )
+            .order_by(WQResearchTrial.created_at.desc())
+        )
+        for trial in trial_result.scalars().all():
+            alpha_id = str(trial.alpha_id or "")
+            if alpha_id and alpha_id not in latest_trial_by_alpha:
+                latest_trial_by_alpha[alpha_id] = trial
+
     family_counts: dict[str, list[int]] = {}
     dataset_counts: dict[str, list[int]] = {}
     cell_counts: dict[str, list[int]] = {}
     resolved_predictions: list[tuple[float, bool]] = []
-    for attempt, candidate in grouped_result.all():
+    attributed_terminal = 0
+    unattributed_terminal = 0
+    for attempt, candidate in grouped_rows:
         is_positive = int(str(attempt.status or "").upper() in _TERMINAL_POSITIVE_STATUSES)
-        cell_key = research_cell_key(candidate)
-        family_key = str(candidate.family or "unknown")
-        values = family_counts.setdefault(family_key, [0, 0])
-        values[0] += is_positive
-        values[1] += 1
-        if str(candidate.provenance_state or "").lower() == "resolved" and candidate.dataset_id:
-            for mapping, key in ((dataset_counts, str(candidate.dataset_id)), (cell_counts, cell_key)):
-                grouped = mapping.setdefault(key, [0, 0])
-                grouped[0] += is_positive
-                grouped[1] += 1
+        origin_trial = latest_trial_by_alpha.get(str(attempt.alpha_id or ""))
+        if origin_trial is not None:
+            attributed_terminal += 1
+            cell_key = research_cell_key(origin_trial)
+            family_key = str(origin_trial.family or "unknown")
+            values = family_counts.setdefault(family_key, [0, 0])
+            values[0] += is_positive
+            values[1] += 1
+            if str(origin_trial.provenance_state or "").lower() == "resolved" and origin_trial.dataset_id:
+                for mapping, key in ((dataset_counts, str(origin_trial.dataset_id)), (cell_counts, cell_key)):
+                    grouped = mapping.setdefault(key, [0, 0])
+                    grouped[0] += is_positive
+                    grouped[1] += 1
+        else:
+            unattributed_terminal += 1
         if candidate.active_probability is not None:
             resolved_predictions.append((float(candidate.active_probability), bool(is_positive)))
 
@@ -326,6 +350,13 @@ async def _load_conversion_feedback(session, account: str) -> dict[str, Any]:
         "dataset": summarize(dataset_counts),
         "cell": summarize(cell_counts),
         "calibration": calibration_report(resolved_predictions),
+        "credit_assignment": {
+            "policy": "group_outcomes_credit_only_to_originating_trial",
+            "terminal_total": len(grouped_rows),
+            "attributed": attributed_terminal,
+            "unattributed": unattributed_terminal,
+            "coverage": round(attributed_terminal / max(1, len(grouped_rows)), 4),
+        },
         "smoothing": {"global_prior": "beta(2,2)", "group_prior_strength": _CONVERSION_GROUP_PRIOR_STRENGTH},
     }
 

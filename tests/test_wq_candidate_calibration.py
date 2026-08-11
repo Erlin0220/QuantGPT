@@ -4,7 +4,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from quantgpt.models import Base, WQResearchCandidate, WQSubmissionAttempt
+from quantgpt.models import Base, WQResearchCandidate, WQResearchTrial, WQSubmissionAttempt
 from quantgpt.wq_candidate_calibration import (
     calibrate_active_probability,
     calibration_report,
@@ -153,6 +153,50 @@ async def test_only_terminal_outcomes_train_feedback(calibration_db):
     assert feedback["global"]["samples"] == 2
     assert feedback["global"]["active"] == 1
     assert feedback["global"]["failed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_group_active_feedback_credits_originating_trial_not_current_candidate_metadata(calibration_db):
+    factory = calibration_db
+    async with factory() as session:
+        session.add(WQResearchTrial(
+            account="primary",
+            alpha_id="origin-a",
+            expression="rank(close)",
+            expression_normalized="rank(close)",
+            family="price_volume",
+            status="candidate",
+            dataset_id="pv1",
+            provenance_state="resolved",
+            operator_pattern="rank(*)",
+        ))
+        session.add(WQResearchCandidate(
+            account="primary",
+            alpha_id="origin-a",
+            expression="rank(close)",
+            family="other",
+            dataset_id="analyst4",
+            provenance_state="resolved",
+            operator_pattern="group_rank(rank(*))",
+            validation_status="ready",
+            sharpe=1.5,
+            fitness=1.2,
+            priority_score=1.0,
+        ))
+        session.add(WQSubmissionAttempt(
+            account="primary",
+            alpha_id="origin-a",
+            submission_day="2026-08-11",
+            status="ACTIVE",
+        ))
+        await session.commit()
+        feedback = await _load_conversion_feedback(session, "primary")
+
+    assert "price_volume" in feedback["family"]
+    assert "other" not in feedback["family"]
+    assert "pv1" in feedback["dataset"]
+    assert "analyst4" not in feedback["dataset"]
+    assert feedback["credit_assignment"]["coverage"] == 1.0
 
 
 @pytest.mark.asyncio

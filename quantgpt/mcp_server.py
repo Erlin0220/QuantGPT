@@ -1222,6 +1222,35 @@ def _run_wq_batch_mcp_task(task_id: str, params: dict) -> dict:
         client.close()
 
 
+def _stamp_wq_research_source_run(result: dict, task_id: str) -> dict:
+    """Attach the MCP task id to persisted research lineage for exact round attribution."""
+    if not isinstance(result, dict):
+        return result
+    result["source_run_id"] = task_id
+    seen_ids: set[int] = set()
+
+    def stamp_item(item: object) -> None:
+        if not isinstance(item, dict) or id(item) in seen_ids:
+            return
+        seen_ids.add(id(item))
+        meta = dict(item.get("research_meta") or {})
+        meta["source_run_id"] = task_id
+        item["research_meta"] = meta
+
+    for key in ("results", "candidates", "ready_candidates", "failed", "invalid"):
+        for item in result.get(key) or []:
+            stamp_item(item)
+    for generation in result.get("generations") or []:
+        if not isinstance(generation, dict):
+            continue
+        for key in ("results", "candidates", "failed", "invalid"):
+            for item in generation.get(key) or []:
+                stamp_item(item)
+    best = result.get("best")
+    stamp_item(best)
+    return result
+
+
 def _run_wq_research_mcp_task(task_id: str, params: dict) -> dict:
     from .wq_brain_client import get_client
 
@@ -1266,6 +1295,7 @@ def _run_wq_research_mcp_task(task_id: str, params: dict) -> dict:
             on_progress=on_progress,
             check_cancelled=lambda: is_mcp_task_cancelled(task_id),
         )
+        _stamp_wq_research_source_run(result, task_id)
         try:
             from .wq_research_memory import record_research_trials_sync
 
@@ -1354,6 +1384,7 @@ def _run_wq_autonomous_research_mcp_task(task_id: str, params: dict) -> dict:
             on_progress=on_progress,
             check_cancelled=lambda: is_mcp_task_cancelled(task_id),
         )
+        _stamp_wq_research_source_run(result, task_id)
         try:
             result["research_trials_saved"] = record_research_trials_sync(
                 "primary",

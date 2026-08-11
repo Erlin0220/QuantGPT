@@ -43,12 +43,119 @@ def _iso(value: Any) -> str | None:
     return str(value)
 
 
+def _latest_trial_by_alpha(trials: Iterable[Any]) -> dict[str, Any]:
+    """Resolve submission credit to the actual research trial that produced an alpha_id."""
+    latest: dict[str, Any] = {}
+    for trial in trials:
+        alpha_id = str(_get(trial, "alpha_id") or "").strip()
+        if not alpha_id:
+            continue
+        current = latest.get(alpha_id)
+        if current is None:
+            latest[alpha_id] = trial
+            continue
+        current_created = _iso(_get(current, "created_at")) or ""
+        trial_created = _iso(_get(trial, "created_at")) or ""
+        if trial_created >= current_created:
+            latest[alpha_id] = trial
+    return latest
+
+
+def summarize_research_credit_assignment(
+    trials: Iterable[Any],
+    candidates: Iterable[Any] = (),
+    attempts: Iterable[tuple[Any, Any]] = (),
+) -> dict[str, Any]:
+    """Report whether candidate/submission outcomes can be traced to a real research trial."""
+    trial_rows = list(trials)
+    latest_trial = _latest_trial_by_alpha(trial_rows)
+    candidate_rows = list(candidates)
+    candidate_by_alpha = {
+        str(_get(candidate, "alpha_id") or ""): candidate
+        for candidate in candidate_rows
+        if str(_get(candidate, "alpha_id") or "")
+    }
+    candidate_attributed = 0
+    candidate_unattributed = 0
+    candidate_metadata_mismatch = 0
+    for alpha_id, candidate in candidate_by_alpha.items():
+        trial = latest_trial.get(alpha_id)
+        if trial is None:
+            candidate_unattributed += 1
+            continue
+        candidate_attributed += 1
+        if research_cell_key(candidate) != research_cell_key(trial):
+            candidate_metadata_mismatch += 1
+
+    formal_total = formal_attributed = formal_unattributed = 0
+    active_total = active_attributed = active_unattributed = 0
+    terminal_total = terminal_attributed = terminal_unattributed = 0
+    for attempt, candidate in attempts:
+        status = str(_get(attempt, "status") or "").upper()
+        alpha_id = str(_get(attempt, "alpha_id") or "")
+        is_formal = status in {"RESERVED", "RESERVATION_EXPIRED", "SUBMIT_UNKNOWN", "SC_PENDING", "ACTIVE", "SC_FAIL", "OTHER_FAIL"}
+        is_active = status == "ACTIVE"
+        is_terminal = status in {"ACTIVE", "SC_FAIL", "OTHER_FAIL"}
+        if is_formal:
+            formal_total += 1
+        if is_active:
+            active_total += 1
+        if is_terminal:
+            terminal_total += 1
+        attributed = bool(alpha_id and latest_trial.get(alpha_id) is not None)
+        if is_formal:
+            if attributed:
+                formal_attributed += 1
+            else:
+                formal_unattributed += 1
+        if is_active:
+            if attributed:
+                active_attributed += 1
+            else:
+                active_unattributed += 1
+        if is_terminal:
+            if attributed:
+                terminal_attributed += 1
+            else:
+                terminal_unattributed += 1
+
+    return {
+        "policy": "submission_outcomes_credit_only_to_originating_trial",
+        "candidate": {
+            "total": len(candidate_by_alpha),
+            "attributed": candidate_attributed,
+            "unattributed": candidate_unattributed,
+            "metadata_cell_mismatch": candidate_metadata_mismatch,
+            "coverage": round(candidate_attributed / max(1, len(candidate_by_alpha)), 4),
+        },
+        "formal_submission": {
+            "total": formal_total,
+            "attributed": formal_attributed,
+            "unattributed": formal_unattributed,
+            "coverage": round(formal_attributed / max(1, formal_total), 4),
+        },
+        "terminal_outcome": {
+            "total": terminal_total,
+            "attributed": terminal_attributed,
+            "unattributed": terminal_unattributed,
+            "coverage": round(terminal_attributed / max(1, terminal_total), 4),
+        },
+        "active": {
+            "total": active_total,
+            "attributed": active_attributed,
+            "unattributed": active_unattributed,
+            "coverage": round(active_attributed / max(1, active_total), 4),
+        },
+    }
+
+
 def summarize_research_cells(
     trials: Iterable[Any],
     candidates: Iterable[Any] = (),
     attempts: Iterable[tuple[Any, Any]] = (),
 ) -> list[dict[str, Any]]:
-    """Aggregate only provenance-resolved evidence into scheduler-ready cells."""
+    """Aggregate provenance-resolved evidence, crediting outcomes to their originating trial cell."""
+    trial_rows = list(trials)
     cells: dict[str, dict[str, Any]] = {}
 
     def ensure(item: Any) -> dict[str, Any] | None:
@@ -74,7 +181,9 @@ def summarize_research_cells(
             }
         return cells[key]
 
-    for trial in trials:
+    latest_trial = _latest_trial_by_alpha(trial_rows)
+
+    for trial in trial_rows:
         cell = ensure(trial)
         if cell is None:
             continue
@@ -95,7 +204,10 @@ def summarize_research_cells(
         alpha_id = str(_get(candidate, "alpha_id") or "")
         if alpha_id:
             candidate_by_alpha[alpha_id] = candidate
-        cell = ensure(candidate)
+        origin_trial = latest_trial.get(alpha_id)
+        if origin_trial is None:
+            continue
+        cell = ensure(origin_trial)
         if cell is None:
             continue
         ready = str(_get(candidate, "validation_status") or "").lower() in {"ready", "evidence_collected"}
@@ -110,10 +222,11 @@ def summarize_research_cells(
 
     terminal_failures = {"SC_FAIL", "OTHER_FAIL"}
     for attempt, candidate in attempts:
-        candidate = candidate or candidate_by_alpha.get(str(_get(attempt, "alpha_id") or ""))
-        if candidate is None:
+        alpha_id = str(_get(attempt, "alpha_id") or "")
+        origin_trial = latest_trial.get(alpha_id)
+        if origin_trial is None:
             continue
-        cell = ensure(candidate)
+        cell = ensure(origin_trial)
         if cell is None:
             continue
         status = str(_get(attempt, "status") or "").upper()
