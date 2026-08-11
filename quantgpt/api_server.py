@@ -62,6 +62,19 @@ async def lifespan(app: FastAPI):
         logger.exception("WorldQuant official knowledge seed failed")
 
     try:
+        from .wq_economic_hypothesis_seed import seed_economic_hypothesis_knowledge
+
+        seeded = await seed_economic_hypothesis_knowledge()
+        logger.info(
+            "Economic hypothesis knowledge seeded: %s sources, %s cards",
+            seeded["sources"],
+            seeded["cards"],
+        )
+    except Exception:
+        # Economic-hypothesis priors are advisory and must never block startup.
+        logger.exception("Economic hypothesis knowledge seed failed")
+
+    try:
         from .wq_research_methodology_seed import seed_research_methodology_knowledge
 
         seeded = await seed_research_methodology_knowledge()

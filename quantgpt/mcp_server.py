@@ -1856,7 +1856,8 @@ async def wq_brain_autonomous_research(
 ) -> str:
     """Skill-first 研究 WQ Alpha；生成式推理由当前 ChatGPT + DevSpace 项目 Skill 负责。
 
-    默认必须先用 DevSpace 打开 QuantGPT 项目，执行 ``wq-alpha-hypothesis`` 生成候选，再执行
+    默认必须先用 DevSpace 打开 QuantGPT 项目。新 Alpha 先执行 ``wq-economic-hypothesis`` 形成机制优先、可证伪的
+    economic cases，再由 ``wq-alpha-hypothesis`` 转成 live-supported FASTEXPR，随后执行
     ``wq-alpha-review`` → ``wq-robustness-validation`` → ``wq-candidate-evidence``；只有
     review_decision=RUN 且携带 skill-defined robustness/evidence policy 的结构化 ``skill_candidates`` 才会进入 BRAIN
     Simulation。真实 Simulation 失败后的下一代应回到 ``wq-alpha-repair`` / ``wq-alpha-diversify``
@@ -1886,7 +1887,7 @@ async def wq_brain_autonomous_research(
                 "error": "skill_candidates_required",
                 "project_path": r"C:\project\QuantGPT",
                 "required_skill_chain": list(REQUIRED_WQ_SKILL_CHAIN),
-                "next_step": "用 DevSpace 打开项目，执行 wq-alpha-hypothesis → wq-alpha-review → wq-robustness-validation → wq-candidate-evidence，并把完整 RUN 候选作为 skill_candidates 传回。",
+                "next_step": "用 DevSpace 打开项目；新 Alpha 执行 wq-economic-hypothesis → wq-alpha-hypothesis → wq-alpha-review → wq-robustness-validation → wq-candidate-evidence，并把完整 RUN 候选作为 skill_candidates 传回。",
             }, ensure_ascii=False)
         contract_errors = [
             {"index": index, "error": error}

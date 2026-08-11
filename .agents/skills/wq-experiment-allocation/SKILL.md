@@ -9,7 +9,7 @@ description: Allocate scarce WorldQuant BRAIN Simulation budget across new hypot
 
 This skill is distilled from authoritative sequential-experimentation sources stored in QuantGPT Knowledge Sources:
 
-- `textbook:garnett-bayesian-optimization-2023` — Roman Garnett, *Bayesian Optimization*: expensive black-box objectives, uncertainty-aware sequential decision making, utility functions, acquisition policies, batch/extension settings.
+- `textbook:garnett-bayesian-optimization-2023` — Roman Garnett, *Bayesian Optimization*: expensive black-box objectives; Chapters 5–9 separate decision theory, utility definition, acquisition-policy choice and practical computation; Chapter 11 covers extensions/related settings such as richer evaluation settings. The key transfer is **utility first, policy second**.
 - `textbook:lattimore-szepesvari-bandit-algorithms-2020` — Tor Lattimore & Csaba Szepesvari, *Bandit Algorithms*: exploration/exploitation, contextual/linear bandits, pure exploration, Bayesian methods and Thompson sampling.
 - `textbook:slivkins-introduction-multi-armed-bandits-2019` — Aleksandrs Slivkins, *Introduction to Multi-Armed Bandits*: adaptive exploration, contextual bandits, structured actions and bandits with knapsacks/budget constraints.
 - `textbook:powell-ryzhov-optimal-learning-2012` — Warren B. Powell & Ilya O. Ryzhov, *Optimal Learning*: expensive information collection, learning policies and knowledge-gradient/value-of-information thinking.
@@ -52,19 +52,21 @@ Invoke after `wq-failure-diagnosis` has produced a Failure Signature when the tr
    - `DIVERSIFY` — route to `wq-alpha-diversify` when correlation/family saturation dominates;
    - `NUMERIC_REFINE` — only for a fixed hypothesis/structure with a bounded low-dimensional parameter space;
    - `DEFER` — do not spend a Simulation now.
-4. Evaluate each item on source-grounded dimensions rather than a made-up universal formula:
+4. Define the decision utility **before** choosing an acquisition-like ranking or allocation policy. For QuantGPT the utility is not raw Fitness alone; evaluate each item on source-grounded dimensions rather than a made-up universal formula:
    - empirical promise from context-matched lineage outcomes;
    - uncertainty/sample scarcity, preserving exploration where evidence is weak;
    - value of information: will the result discriminate between plausible failure explanations or change the next decision?;
    - Simulation cost/budget pressure;
    - redundancy with already planned experiments;
    - downstream Candidate/ACTIVE evidence when statistically mature.
+   Only after those decision consequences are explicit should an uncertainty-aware policy choose the next run.
 5. Prefer experiments that either have credible Candidate upside **or** materially reduce uncertainty. Repeated variants that are both low-promise and low-information should lose budget to another route.
 6. For uncertain diagnoses, use a deliberately small screening batch that changes one causal dimension per child. Do not change field + sign + window + neutralization + decay together; computer-experiment methodology requires attributable results.
 7. Use Bayesian-optimization concepts only when the semantic Alpha is fixed and the search is genuinely bounded/low-dimensional. Do not apply GP/EI/UCB/Optuna-style numeric search across arbitrary FASTEXPR structures or economic hypotheses.
-8. Preserve exploration. Do not permanently blacklist a family or repair class from a handful of failures. Use confidence/sample maturity and recent evidence; BRAIN behavior and account-visible datasets can change.
-9. Stopping is evidence-based, not a magic retry count. If further repair is dominated by another experiment in both promise and expected information value, return `STOP_REPAIR` and route budget to `DIVERSIFY` or `NEW_HYPOTHESIS`. If evidence is insufficient, prefer a small discriminating experiment rather than a large repair batch.
-10. Return a compact allocation decision with: `decision`, `reason`, `evidence`, `knowledge_card_ids`, `uncertainty_note`, and `next_skill`. When choosing `REPAIR`, also name the single failure cause the child is intended to test.
+8. For a batch, prefer complementary experiments whose outcomes answer different questions. Do not use a batch merely to evaluate several near-identical points in parallel; redundant evaluations have lower joint information value.
+9. Preserve exploration. Do not permanently blacklist a family or repair class from a handful of failures. Use confidence/sample maturity and recent evidence; BRAIN behavior and account-visible datasets can change.
+10. Stopping is evidence-based, not a magic retry count. If further repair is dominated by another experiment in both promise and expected information value, return `STOP_REPAIR` and route budget to `DIVERSIFY` or `NEW_HYPOTHESIS`. If evidence is insufficient, prefer a small discriminating experiment rather than a large repair batch.
+11. Return a compact allocation decision with: `decision`, `reason`, `evidence`, `knowledge_card_ids`, `uncertainty_note`, and `next_skill`. When choosing `REPAIR`, also name the single failure cause the child is intended to test. When choosing `NEW_HYPOTHESIS`, route through `wq-economic-hypothesis` before `wq-alpha-hypothesis` so budget is not replenished with another operator-first batch.
 
 ## B — Boundary
 

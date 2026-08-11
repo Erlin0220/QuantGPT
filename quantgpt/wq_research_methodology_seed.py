@@ -291,6 +291,40 @@ RESEARCH_METHODOLOGY_CARDS: list[dict[str, Any]] = [
         "confidence": 0.90,
         "status": "active",
     },
+    {
+        "concept": "utility_defined_before_acquisition_policy",
+        "family": "research_allocation",
+        "hypothesis": (
+            "For an expensive sequential experiment, define what makes the next observation useful before choosing a "
+            "policy that ranks experiments. In QuantGPT, useful can mean Candidate upside, discrimination between failure "
+            "causes, uncertainty reduction, or preserving scarce Simulation budget; raw Fitness alone is not the utility."
+        ),
+        "mechanism": [
+            "State the downstream decision that the next Simulation could change.",
+            "Define the relevant utility components before using an acquisition-like ranking.",
+            "Account for uncertainty and experiment cost as part of the sequential decision.",
+            "For batches, prefer complementary experiments whose joint outcomes answer different questions over redundant near-identical evaluations.",
+        ],
+        "scope": {"workflow": "define decision utility -> compare experiment choices -> select sequential/batch evaluation"},
+        "evidence": [
+            {"source_key": "textbook:garnett-bayesian-optimization-2023", "support": "positive", "claim": "Bayesian Optimization separates decision theory, utility functions, common policies and policy computation for expensive objectives.", "location": "Chapters 5-9 and 11"},
+            {"source_key": "textbook:powell-ryzhov-optimal-learning-2012", "support": "positive", "claim": "Optimal Learning evaluates expensive information collection by how it improves later decisions, including knowledge-gradient/value-of-information thinking.", "location": "book overview and knowledge-gradient treatment"},
+        ],
+        "operators": [],
+        "expression_templates": [],
+        "failure_modes": [
+            "Choosing a policy before defining utility can optimize the wrong objective.",
+            "Using raw Fitness as the only utility ignores information value and Candidate/ACTIVE consequences.",
+            "Parallel near-duplicates can waste a batch because their outcomes are jointly redundant.",
+        ],
+        "mutation_strategies": [
+            "Write the decision consequence of each proposed experiment before ranking it.",
+            "Prefer tests that separate plausible failure causes when immediate Candidate upside is uncertain.",
+            "Diversify batch questions when several Simulations can run concurrently.",
+        ],
+        "confidence": 0.92,
+        "status": "active",
+    },
 ]
 
 

@@ -99,6 +99,7 @@ class TestWQMCPAsyncSurface(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload["status"], "skill_generation_required")
         self.assertEqual(payload["required_skill_chain"], ["wq-alpha-hypothesis", "wq-alpha-review", "wq-robustness-validation", "wq-candidate-evidence"])
+        self.assertIn("wq-economic-hypothesis", payload["next_step"])
         start_task.assert_not_awaited()
 
     async def test_auto_submit_is_rejected_before_task_enqueue(self):
