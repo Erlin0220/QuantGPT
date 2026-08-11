@@ -28,18 +28,19 @@ Invoke after a real WQ simulation/check produces actionable failure evidence: lo
 ## E — Execution
 
 1. Read the exact BRAIN metrics/checks and `diagnose_wq_result` output. Also query `kb_explain_alpha` when the Alpha has Knowledge Card lineage.
-2. Search `kb_search_alpha_knowledge` for the parent family and failure mode; prefer cards that have empirical trial history. Also load the research-allocation methodology cards and invoke `wq-experiment-allocation` before spending another Simulation on this lineage.
-3. If `wq-experiment-allocation` returns `STOP_REPAIR`, do not manufacture siblings just because the workflow reached this skill. Route to the recommended `wq-alpha-diversify` or `wq-alpha-hypothesis` path. Otherwise classify the failure:
+2. Invoke `wq-failure-diagnosis` first. Preserve its structured Failure Signature (`observed_symptoms`, plausible causes, counter-evidence, unknowns and discriminating tests) rather than converting a metric miss directly into a repair action.
+3. Search `kb_search_alpha_knowledge` for the parent family and diagnosed cause; prefer cards that have empirical trial history. Then load the research-allocation methodology cards and invoke `wq-experiment-allocation` before spending another Simulation on this lineage.
+4. If `wq-experiment-allocation` returns `STOP_REPAIR`, do not manufacture siblings just because the workflow reached this skill. Route to the recommended `wq-alpha-diversify` or `wq-alpha-hypothesis` path. Otherwise use the Failure Signature to select the repair class:
    - **Turnover high:** first test simulation Decay or light smoothing; then conditional `trade_when` if the hypothesis has a defensible regime condition.
    - **Sharpe/Fitness near threshold:** preserve the main field/mechanism; change one lookback, normalization, estimate variant, or neutralization at a time.
    - **Sub-universe weakness / concentration:** prefer broader coverage, group-relative transforms, simpler expressions, or a better-supported field before adding complexity.
    - **Common factor exposure / shared drawdown:** preserve the idiosyncratic hypothesis and test a justified neutralization change; compare Sharpe/drawdown against any turnover increase. Do not use neutralization as a generic cure.
    - **Self-correlation:** change data family, information source, or economic mechanism. Do not inject random noise. If common-factor exposure is specifically implicated, a neutralized sibling may be tested before abandoning the family.
    - **Coverage/sparsity:** use live field metadata and conservative `ts_backfill`/group handling when justified.
-4. Generate only the smallest screening/refinement set justified by the allocation decision, usually 1–2 directed siblings for a well-diagnosed failure. Record parent, mutation type, tested failure cause and reason. Preserve the parent hypothesis. After each child passes `wq-alpha-review`, complete `wq-robustness-validation` and `wq-candidate-evidence`, then emit `skill_chain: ["wq-alpha-hypothesis", "wq-experiment-allocation", "wq-alpha-repair", "wq-alpha-review", "wq-robustness-validation", "wq-candidate-evidence"]`; only `review_decision: "RUN"` children with both structured policies may return to BRAIN.
-5. Re-simulate through `wq_brain_autonomous_research` as structured `skill_candidates` with deterministic fallback disabled. Compare the child against the parent on the metric that motivated the mutation and reject repairs that only improve unrelated metrics.
-6. Persist the outcome so Research Memory can estimate context-specific repair yield and value of information for later allocation decisions.
-7. Do not use a fixed retry count as the stopping rule. Re-run `wq-experiment-allocation` after new evidence; if another repair is dominated by diversification/new-hypothesis experiments in both empirical promise and expected information value, stop the lineage.
+5. Generate only the smallest screening/refinement set justified by the allocation decision, usually 1–2 directed siblings for a well-diagnosed failure. Record parent, mutation type, tested failure cause and reason, and preserve the `failure_signature`. Preserve the parent hypothesis. After each child passes `wq-alpha-review`, complete `wq-robustness-validation` and `wq-candidate-evidence`, then emit `skill_chain: ["wq-alpha-hypothesis", "wq-failure-diagnosis", "wq-experiment-allocation", "wq-alpha-repair", "wq-alpha-review", "wq-robustness-validation", "wq-candidate-evidence"]`; only `review_decision: "RUN"` children with the structured diagnosis and policies may return to BRAIN.
+6. Re-simulate through `wq_brain_autonomous_research` as structured `skill_candidates` with deterministic fallback disabled. Compare the child against the parent on the metric that motivated the mutation and reject repairs that only improve unrelated metrics.
+7. Persist the outcome so Research Memory can estimate context-specific repair yield and value of information for later allocation decisions.
+8. Do not use a fixed retry count as the stopping rule. Re-run `wq-failure-diagnosis` and `wq-experiment-allocation` after new evidence; if another repair is dominated by diversification/new-hypothesis experiments in both empirical promise and expected information value, stop the lineage.
 
 ## B — Boundary
 
@@ -52,5 +53,7 @@ Invoke after a real WQ simulation/check produces actionable failure evidence: lo
 ## Related skills
 
 - `wq-alpha-hypothesis`
+- `wq-failure-diagnosis`
+- `wq-experiment-allocation`
 - `wq-alpha-review`
 - `wq-alpha-diversify`

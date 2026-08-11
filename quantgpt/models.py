@@ -275,6 +275,8 @@ class WQResearchCandidate(Base):
     allocation_cell: Mapped[str | None] = mapped_column(String(200), nullable=True)
     source_run_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     knowledge_card_ids: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    failure_signature: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    diversity_case: Mapped[Any | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="queued")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)
@@ -325,6 +327,8 @@ class WQResearchTrial(Base):
     allocation_cell: Mapped[str | None] = mapped_column(String(200), nullable=True)
     source_run_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     knowledge_card_ids: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    failure_signature: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    diversity_case: Mapped[Any | None] = mapped_column(JSON, nullable=True)
     tag: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
 

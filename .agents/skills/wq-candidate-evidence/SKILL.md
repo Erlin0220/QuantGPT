@@ -50,7 +50,8 @@ Invoke:
    4. `sharpe`
    5. `returns`
    6. `robustness_and_multiple_testing_evidence`
-   7. `local_correlation_and_novelty`
+   7. `diversity_case_and_realized_correlation`
+   8. `local_correlation_and_novelty`
 3. `official_eligibility` is not a preference score. An explicit official blocker remains a blocker.
 4. `calibrated_active_outcome_rate` may be used as probability only when QuantGPT's learning gate is ready. Require every probability to expose:
    - `support`;
@@ -60,7 +61,8 @@ Invoke:
 6. During cold start, compare eligible candidates lexicographically by the transparent BRAIN evidence hierarchy (Fitness → Sharpe → returns), with robustness/multiple-testing/local-correlation evidence used as named advisory tie-break/context rather than hidden weights.
 7. When ACTIVE outcome evidence is mature, prefer the calibrated empirical probability first, then the transparent raw-metric hierarchy. Do not blend it with an arbitrary local metric formula and still call the result calibrated.
 8. DSR/PBO/PSR evidence must preserve its assumptions and sample support. `unavailable` stays neutral.
-9. Return/preserve a structured `candidate_evidence_policy`:
+9. If a `diversity_case` exists, distinguish `designed_diverse` from `empirically_supported`; only official SC/PnL evidence can upgrade a design rationale into realized diversification evidence.
+10. Return/preserve a structured `candidate_evidence_policy`:
 
 ```text
 {
@@ -74,6 +76,7 @@ Invoke:
     "sharpe",
     "returns",
     "robustness_and_multiple_testing_evidence",
+    "diversity_case_and_realized_correlation",
     "local_correlation_and_novelty"
   ],
   "knowledge_card_ids": ["..."],
@@ -81,7 +84,7 @@ Invoke:
 }
 ```
 
-10. Add `wq-candidate-evidence` to `skill_chain`; the policy must travel with the candidate into QuantGPT and remain visible in validation/audit metadata.
+11. Add `wq-candidate-evidence` to `skill_chain`; the policy must travel with the candidate into QuantGPT and remain visible in validation/audit metadata.
 
 ## B — Boundary
 

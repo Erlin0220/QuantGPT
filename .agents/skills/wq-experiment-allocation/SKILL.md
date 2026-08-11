@@ -34,7 +34,7 @@ When repeated `low_fitness` trials come from the same family/structure, do not a
 
 ## A2 — Future trigger
 
-Invoke when:
+Invoke after `wq-failure-diagnosis` has produced a Failure Signature when the trigger is a real BRAIN failure. Also invoke when:
 
 - deciding `REPAIR` vs `DIVERSIFY` vs `NEW_HYPOTHESIS` vs `DEFER`;
 - selecting which failed Alphas deserve repair budget;
@@ -45,7 +45,7 @@ Invoke when:
 ## E — Execution
 
 1. Query `kb_search_alpha_knowledge` for `simulation allocation sequential experiment repair value of information` and preserve the relevant methodology card IDs.
-2. Read Research Memory/lineage for the competing experiment choices. At minimum capture: family, dataset, operator pattern, failure reason/signature, parent Sharpe/Fitness/turnover, prior mutation type, child outcomes, Candidate outcomes, ACTIVE outcomes when mature, and sample counts.
+2. Read the structured `failure_signature` from `wq-failure-diagnosis` when this is a failure-driven decision, then read Research Memory/lineage for the competing experiment choices. At minimum capture: family, dataset, operator pattern, observed symptoms, plausible causes, discriminating tests, parent Sharpe/Fitness/turnover, prior mutation type, child outcomes, Candidate outcomes, ACTIVE outcomes when mature, and sample counts.
 3. Build a small experiment slate. Each item is one of:
    - `NEW_HYPOTHESIS` — route to `wq-alpha-hypothesis`;
    - `REPAIR` — route to `wq-alpha-repair` with one diagnosis-specific causal change;
@@ -70,6 +70,7 @@ Invoke when:
 
 - Never claim textbook methodology is an official WorldQuant submission rule.
 - Never use a local surrogate to hard-block all BRAIN exploration; ranking/allocation is advisory and BRAIN remains the empirical judge.
+- Never replace `wq-failure-diagnosis` with a direct metric-to-repair mapping; allocation consumes the diagnosis, it does not invent one.
 - Never invent fixed probability thresholds or retry counts that are not calibrated from QuantGPT evidence.
 - Do not optimize arbitrary symbolic Alpha expressions as if they formed a smooth numeric space.
 - Do not reward repeated near-identical experiments merely because they are cheap to generate.

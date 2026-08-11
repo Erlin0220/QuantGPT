@@ -5,7 +5,7 @@ import pytest_asyncio
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from quantgpt.models import Base, WQResearchTrial
+from quantgpt.models import Base, WQResearchCandidate, WQResearchTrial
 from quantgpt.wq_failure_taxonomy import classify_research_failure
 from quantgpt.wq_research_memory import load_research_memory, record_research_trials
 from quantgpt.wq_submission_policy import finalize_submission_attempt, record_research_candidates, reserve_submission
@@ -214,6 +214,54 @@ async def test_terminal_submission_failure_updates_latest_research_trial(researc
         assert row.failure_evidence["final_status"] == "SC_FAIL"
 
 
+@pytest.mark.asyncio
+async def test_research_memory_preserves_skill_failure_signature_and_diversity_case(research_db):
+    signature = {
+        "observed_symptoms": ["official_self_correlation"],
+        "plausible_causes": [{"cause": "correlation_saturation", "confidence": "high"}],
+    }
+    diversity_case = {
+        "reference": "price_volume|pv1|rank",
+        "changed_dimensions": ["information_source", "economic_mechanism"],
+        "why_independent": "uses analyst revisions instead of price-volume reversion",
+        "empirical_evidence": "pending",
+    }
+    result = {
+        "results": [{
+            "alpha_id": "diverse-child",
+            "expression": "rank(close)",
+            "is_metrics": {"sharpe": 1.5, "fitness": 1.2, "turnover": 0.2, "checks": []},
+            "research_meta": {
+                "family": "analyst_revision",
+                "failure_signature": signature,
+                "diversity_case": diversity_case,
+            },
+        }],
+        "candidates": [{"alpha_id": "diverse-child"}],
+    }
+    await record_research_trials("primary", result)
+    await record_research_candidates("primary", [{
+        "alpha_id": "diverse-child",
+        "expression": "rank(close)",
+        "is_metrics": {"sharpe": 1.5, "fitness": 1.2, "returns": 0.08, "turnover": 0.2},
+        "validation": {"status": "evidence_collected"},
+        "research_meta": {
+            "family": "analyst_revision",
+            "failure_signature": signature,
+            "diversity_case": diversity_case,
+        },
+    }])
+    memory = await load_research_memory("primary")
+    item = memory["recent_trials"][0]
+    assert item["failure_signature"] == signature
+    assert item["diversity_case"] == diversity_case
+    factory = research_db
+    async with factory() as session:
+        candidate = (await session.execute(sa.select(WQResearchCandidate))).scalar_one()
+        assert candidate.failure_signature == signature
+        assert candidate.diversity_case == diversity_case
+
+
 def test_dev_migration_adds_failure_columns_to_existing_table():
     from quantgpt.db import _migrate_add_columns
 
@@ -229,4 +277,4 @@ def test_dev_migration_adds_failure_columns_to_existing_table():
         _migrate_add_columns(connection)
         columns = {column["name"] for column in sa.inspect(connection).get_columns("wq_research_trials")}
 
-    assert {"failure_stage", "failure_reason", "failure_reasons", "failure_evidence"} <= columns
+    assert {"failure_stage", "failure_reason", "failure_reasons", "failure_evidence", "failure_signature", "diversity_case"} <= columns

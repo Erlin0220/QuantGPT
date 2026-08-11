@@ -87,6 +87,15 @@ async def lifespan(app: FastAPI):
         # Validation/evidence priors are advisory and must never block startup.
         logger.exception("Validation/evidence methodology seed failed")
 
+    try:
+        from .wq_failure_diversity_seed import seed_failure_diversity_knowledge
+
+        seeded = await seed_failure_diversity_knowledge()
+        logger.info("Failure/diversity knowledge seeded: %s cards", seeded["cards"])
+    except Exception:
+        # Diagnosis/diversity priors are advisory and must never block startup.
+        logger.exception("Failure/diversity knowledge seed failed")
+
     from .db import _get_session_factory as _sf
 
     active_statuses = [

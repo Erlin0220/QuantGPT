@@ -455,6 +455,60 @@ def test_skill_candidate_contract_requires_review_robustness_and_evidence_chain(
     assert "candidate_evidence_policy" in autonomous.validate_skill_candidate_contract({**valid, "candidate_evidence_policy": {}})
 
 
+def test_repair_candidate_requires_failure_diagnosis_signature_and_allocation():
+    base = {
+        "expression": "rank(ts_mean(returns, 20))",
+        "hypothesis": "repair a known momentum signal implementation",
+        "skill_chain": [
+            "wq-alpha-hypothesis",
+            "wq-failure-diagnosis",
+            "wq-experiment-allocation",
+            "wq-alpha-repair",
+            "wq-alpha-review",
+            "wq-robustness-validation",
+            "wq-candidate-evidence",
+        ],
+        "review_decision": "RUN",
+        "robustness_plan": {"mode": "skill_defined", "checks": [{"universe": "TOP1000", "purpose": "diagnostic stress"}]},
+        "candidate_evidence_policy": {"mode": "calibrated_evidence_hierarchy"},
+        "failure_signature": {
+            "observed_symptoms": ["low_fitness", "turnover_high"],
+            "plausible_causes": [{"cause": "execution_drag", "confidence": "medium"}],
+        },
+    }
+    assert autonomous.validate_skill_candidate_contract(base) is None
+    missing_diag = {**base, "skill_chain": [name for name in base["skill_chain"] if name != "wq-failure-diagnosis"]}
+    assert "wq-failure-diagnosis" in autonomous.validate_skill_candidate_contract(missing_diag)
+    assert "failure_signature" in autonomous.validate_skill_candidate_contract({**base, "failure_signature": {}})
+
+
+def test_diversified_candidate_requires_structured_diversity_case():
+    base = {
+        "expression": "rank(ts_mean(returns, 20))",
+        "hypothesis": "test a genuinely independent information source",
+        "skill_chain": [
+            "wq-alpha-hypothesis",
+            "wq-alpha-diversify",
+            "wq-alpha-review",
+            "wq-robustness-validation",
+            "wq-candidate-evidence",
+        ],
+        "review_decision": "RUN",
+        "robustness_plan": {"mode": "skill_defined", "checks": [{"universe": "TOP1000", "purpose": "coverage stress"}]},
+        "candidate_evidence_policy": {"mode": "calibrated_evidence_hierarchy"},
+        "diversity_case": {
+            "reference": "saturated price-volume cell",
+            "changed_dimensions": ["information_source", "economic_mechanism"],
+            "why_independent": "uses analyst revisions instead of price-volume reversion",
+            "empirical_evidence": "pending",
+        },
+    }
+    assert autonomous.validate_skill_candidate_contract(base) is None
+    assert "diversity_case" in autonomous.validate_skill_candidate_contract({**base, "diversity_case": {}})
+    bad_dimension = {**base, "diversity_case": {**base["diversity_case"], "changed_dimensions": ["window_only"]}}
+    assert "changed_dimensions" in autonomous.validate_skill_candidate_contract(bad_dimension)
+
+
 def test_skill_plan_preserves_devspace_provenance_and_live_dataset():
     class FakeClient:
         def list_operator_names(self):

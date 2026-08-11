@@ -143,6 +143,8 @@ def _trial_from_item(
         allocation_cell=str(meta.get("allocation_cell") or "") or None,
         source_run_id=str(meta.get("source_run_id") or item.get("run_id") or item.get("task_id") or "") or None,
         knowledge_card_ids=list(meta.get("knowledge_card_ids") or []),
+        failure_signature=dict(meta.get("failure_signature") or item.get("failure_signature") or {}),
+        diversity_case=dict(meta.get("diversity_case") or item.get("diversity_case") or {}),
         tag=tag,
     )
 
@@ -682,6 +684,8 @@ async def load_research_memory(account: str = "primary", limit: int = 2000) -> d
             "allocation_cell": row.allocation_cell,
             "source_run_id": row.source_run_id,
             "knowledge_card_ids": list(row.knowledge_card_ids or []),
+            "failure_signature": dict(row.failure_signature or {}),
+            "diversity_case": dict(row.diversity_case or {}),
         }
         for row in rows[:200]
         if row.expression

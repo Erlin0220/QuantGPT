@@ -829,6 +829,27 @@ def validate_skill_candidate_contract(candidate: dict[str, Any]) -> str | None:
     evidence_policy = candidate.get("candidate_evidence_policy")
     if not isinstance(evidence_policy, dict) or str(evidence_policy.get("mode") or "") != "calibrated_evidence_hierarchy":
         return "missing candidate_evidence_policy"
+
+    if "wq-alpha-repair" in skill_chain:
+        for required in ("wq-failure-diagnosis", "wq-experiment-allocation"):
+            if required not in skill_chain:
+                return f"repair candidate missing required skill: {required}"
+        signature = candidate.get("failure_signature")
+        if not isinstance(signature, dict):
+            return "repair candidate missing failure_signature"
+        if not isinstance(signature.get("observed_symptoms"), list) or not isinstance(signature.get("plausible_causes"), list):
+            return "failure_signature must preserve observed_symptoms and plausible_causes"
+
+    if "wq-alpha-diversify" in skill_chain:
+        diversity_case = candidate.get("diversity_case")
+        if not isinstance(diversity_case, dict):
+            return "diversified candidate missing diversity_case"
+        changed = [str(value) for value in (diversity_case.get("changed_dimensions") or []) if str(value)]
+        allowed = {"information_source", "economic_mechanism", "horizon_delay", "structure", "factor_exposure"}
+        if not changed or not set(changed).issubset(allowed):
+            return "diversity_case.changed_dimensions must name supported diversity dimensions"
+        if not str(diversity_case.get("why_independent") or "").strip():
+            return "diversity_case missing why_independent"
     return None
 
 
@@ -965,6 +986,8 @@ def build_skill_plan(
                 "knowledge_card_ids": list(raw_candidate.get("knowledge_card_ids") or []),
                 "robustness_plan": dict(raw_candidate.get("robustness_plan") or {}),
                 "candidate_evidence_policy": dict(raw_candidate.get("candidate_evidence_policy") or {}),
+                "failure_signature": dict(raw_candidate.get("failure_signature") or {}),
+                "diversity_case": dict(raw_candidate.get("diversity_case") or {}),
             }
         )
     return out
