@@ -804,6 +804,66 @@ REQUIRED_WQ_SKILL_CHAIN = (
     "wq-candidate-evidence",
 )
 
+_SIMULATION_SETTING_KEYS = ("region", "universe", "delay", "decay", "neutralization", "truncation")
+
+
+def _simulation_variant_key(expression: str, settings: dict[str, Any] | None) -> tuple[str, ...] | None:
+    normalized = normalize_wq_expression(expression)
+    if not normalized or not isinstance(settings, dict):
+        return None
+    values: list[str] = [normalized]
+    for key in _SIMULATION_SETTING_KEYS:
+        value = settings.get(key)
+        if key in {"region", "universe", "neutralization"}:
+            values.append(str(value or "").upper())
+        elif key in {"delay", "decay"}:
+            try:
+                values.append(str(int(value)))
+            except (TypeError, ValueError):
+                values.append(str(value or ""))
+        elif key == "truncation":
+            try:
+                values.append(f"{float(value):.10g}")
+            except (TypeError, ValueError):
+                values.append(str(value or ""))
+    return tuple(values)
+
+
+def _settings_only_repair_allowed(
+    candidate: dict[str, Any],
+    *,
+    current_settings: dict[str, Any] | None,
+    seen_variants: set[tuple[str, ...]] | None,
+) -> bool:
+    """Allow an exact-expression repair only for one explicit, not-yet-tested setting delta."""
+    chain = {str(value).strip() for value in (candidate.get("skill_chain") or []) if str(value).strip()}
+    if "wq-alpha-repair" not in chain or not isinstance(current_settings, dict):
+        return False
+    delta = candidate.get("settings_delta")
+    if not isinstance(delta, dict) or len(delta) != 1:
+        return False
+    setting, change = next(iter(delta.items()))
+    if setting not in _SIMULATION_SETTING_KEYS or not isinstance(change, dict):
+        return False
+    if "from" not in change or "to" not in change or change.get("from") == change.get("to"):
+        return False
+
+    target_settings = dict(current_settings)
+    target_settings[setting] = change.get("to")
+    source_settings = dict(current_settings)
+    source_settings[setting] = change.get("from")
+    expression = str(candidate.get("expression") or "")
+    target_key = _simulation_variant_key(expression, target_settings)
+    source_key = _simulation_variant_key(expression, source_settings)
+    current_key = _simulation_variant_key(expression, current_settings)
+    # The top-level autonomous-research settings must actually represent the requested target.
+    if target_key is None or source_key is None or current_key != target_key:
+        return False
+    prior_variants = seen_variants or set()
+    if prior_variants and source_key not in prior_variants:
+        return False
+    return target_key not in prior_variants
+
 
 def validate_skill_candidate_contract(candidate: dict[str, Any]) -> str | None:
     """Validate client-side DevSpace skill provenance before spending BRAIN budget."""
@@ -861,6 +921,8 @@ def build_skill_plan(
     seen: set[str],
     limit: int,
     hypothesis: str,
+    current_settings: dict[str, Any] | None = None,
+    seen_variants: set[tuple[str, ...]] | None = None,
 ) -> list[dict[str, Any]]:
     """Validate DevSpace skill-authored candidates and preserve their research provenance."""
     if limit <= 0 or not candidates:
@@ -888,7 +950,11 @@ def build_skill_plan(
             continue
         expression = validation.expression
         normalized = normalize_wq_expression(expression)
-        if not normalized or normalized in seen:
+        if not normalized:
+            continue
+        if normalized in seen and not _settings_only_repair_allowed(
+            raw_candidate, current_settings=current_settings, seen_variants=seen_variants
+        ):
             continue
 
         # Skill-first candidates are authored after ChatGPT has read the live Data
@@ -988,6 +1054,7 @@ def build_skill_plan(
                 "candidate_evidence_policy": dict(raw_candidate.get("candidate_evidence_policy") or {}),
                 "failure_signature": dict(raw_candidate.get("failure_signature") or {}),
                 "diversity_case": dict(raw_candidate.get("diversity_case") or {}),
+                "settings_delta": dict(raw_candidate.get("settings_delta") or {}),
             }
         )
     return out
@@ -2111,6 +2178,23 @@ def run_autonomous_research(
                 family_counts[classify_wq_family(expression)] += 1
     memory["family_counts"] = dict(family_counts)
     memory["normalized_expressions"] = sorted(normalized)
+    effective_settings = {
+        "region": region,
+        "universe": universe,
+        "delay": delay,
+        "decay": decay,
+        "neutralization": neutralization,
+        "truncation": truncation,
+    }
+    seen_variants: set[tuple[str, ...]] = set()
+    for trial in memory.get("recent_trials") or []:
+        key = _simulation_variant_key(str(trial.get("expression") or ""), trial.get("settings"))
+        if key is not None:
+            seen_variants.add(key)
+    for alpha in recent_alphas:
+        key = _simulation_variant_key(str(alpha.get("expression") or ""), alpha.get("settings"))
+        if key is not None:
+            seen_variants.add(key)
 
     first_budget = max_simulations if generations == 1 else max(4, math.ceil(max_simulations * 0.65))
     if strict_skill_mode:
@@ -2222,6 +2306,8 @@ def run_autonomous_research(
         seen=seen,
         limit=exploration_budget,
         hypothesis=goal,
+        current_settings=effective_settings,
+        seen_variants=seen_variants,
     )
     legacy_budget = 0 if strict_skill_mode else max(0, exploration_budget - len(skill_plan))
     chatgpt_plan = build_chatgpt_plan(

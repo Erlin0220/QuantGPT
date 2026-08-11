@@ -551,6 +551,104 @@ def test_skill_plan_preserves_devspace_provenance_and_live_dataset():
     assert plan[0]["hypothesis"].startswith("positive analyst revisions")
 
 
+def test_skill_plan_allows_unseen_single_setting_repair_for_seen_expression():
+    class FakeClient:
+        def list_operator_names(self):
+            return {"rank"}
+
+    expression = "rank(close)"
+    candidate = {
+        "expression": expression,
+        "hypothesis": "preserve the same price signal while testing whether higher decay reduces execution drag",
+        "family": "price_volume",
+        "skill_chain": [
+            "wq-alpha-hypothesis",
+            "wq-failure-diagnosis",
+            "wq-experiment-allocation",
+            "wq-alpha-repair",
+            "wq-alpha-review",
+            "wq-robustness-validation",
+            "wq-candidate-evidence",
+        ],
+        "review_decision": "RUN",
+        "robustness_plan": {"mode": "skill_defined", "checks": [{"universe": "TOP1000", "purpose": "liquidity stress"}]},
+        "candidate_evidence_policy": {"mode": "calibrated_evidence_hierarchy"},
+        "failure_signature": {
+            "observed_symptoms": ["turnover_high", "low_fitness"],
+            "plausible_causes": [{"cause": "execution_drag", "confidence": "high"}],
+        },
+        "settings_delta": {"decay": {"from": 5, "to": 10}},
+    }
+    source_settings = {
+        "region": "USA", "universe": "TOP3000", "delay": 1, "decay": 5,
+        "neutralization": "SUBINDUSTRY", "truncation": 0.08,
+    }
+    target_settings = {**source_settings, "decay": 10}
+    source_key = autonomous._simulation_variant_key(expression, source_settings)
+    assert source_key is not None
+
+    plan = autonomous.build_skill_plan(
+        FakeClient(),
+        [candidate],
+        [],
+        seen={autonomous.normalize_wq_expression(expression)},
+        limit=1,
+        hypothesis="fallback goal",
+        current_settings=target_settings,
+        seen_variants={source_key},
+    )
+
+    assert len(plan) == 1
+    assert plan[0]["settings_delta"] == {"decay": {"from": 5, "to": 10}}
+
+
+def test_skill_plan_rejects_settings_repair_when_target_variant_already_seen():
+    class FakeClient:
+        def list_operator_names(self):
+            return {"rank"}
+
+    expression = "rank(close)"
+    candidate = {
+        "expression": expression,
+        "hypothesis": "preserve the same price signal while testing a decay-only repair",
+        "skill_chain": [
+            "wq-alpha-hypothesis", "wq-failure-diagnosis", "wq-experiment-allocation",
+            "wq-alpha-repair", "wq-alpha-review", "wq-robustness-validation", "wq-candidate-evidence",
+        ],
+        "review_decision": "RUN",
+        "robustness_plan": {"mode": "skill_defined", "checks": [{"universe": "TOP1000", "purpose": "liquidity stress"}]},
+        "candidate_evidence_policy": {"mode": "calibrated_evidence_hierarchy"},
+        "failure_signature": {
+            "observed_symptoms": ["turnover_high"],
+            "plausible_causes": [{"cause": "execution_drag", "confidence": "high"}],
+        },
+        "settings_delta": {"decay": {"from": 5, "to": 10}},
+    }
+    source_settings = {
+        "region": "USA", "universe": "TOP3000", "delay": 1, "decay": 5,
+        "neutralization": "SUBINDUSTRY", "truncation": 0.08,
+    }
+    target_settings = {**source_settings, "decay": 10}
+    variants = {
+        autonomous._simulation_variant_key(expression, source_settings),
+        autonomous._simulation_variant_key(expression, target_settings),
+    }
+    variants.discard(None)
+
+    plan = autonomous.build_skill_plan(
+        FakeClient(),
+        [candidate],
+        [],
+        seen={autonomous.normalize_wq_expression(expression)},
+        limit=1,
+        hypothesis="fallback goal",
+        current_settings=target_settings,
+        seen_variants=variants,
+    )
+
+    assert plan == []
+
+
 def test_skill_plan_resolves_declared_field_outside_planner_sample_against_live_catalog():
     class FakeClient:
         def list_operator_names(self):
