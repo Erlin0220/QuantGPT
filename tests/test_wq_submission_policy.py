@@ -165,6 +165,44 @@ async def test_cold_start_inventory_uses_research_readiness_not_probability_tier
 
 
 @pytest.mark.asyncio
+async def test_unreconciled_active_counts_split_today_from_historical(policy_db):
+    import quantgpt.db as db
+
+    today = (await get_submission_policy_status("primary"))["submission_day"]
+    yesterday = (datetime.fromisoformat(today) - timedelta(days=1)).date().isoformat()
+
+    for alpha_id in ("historical-1", "historical-2"):
+        await _seed_ready_candidate(alpha_id)
+        decision = await reserve_submission("primary", alpha_id)
+        assert decision["allowed"] is True
+        await finalize_submission_attempt("primary", alpha_id, {"ok": True, "final_status": "ACTIVE"})
+        async with db._get_session_factory()() as session:
+            result = await session.execute(
+                select(WQSubmissionAttempt).where(
+                    WQSubmissionAttempt.account == "primary",
+                    WQSubmissionAttempt.alpha_id == alpha_id,
+                )
+            )
+            result.scalar_one().submission_day = yesterday
+            await session.commit()
+
+    for alpha_id in ("today-1", "today-2"):
+        await _seed_ready_candidate(alpha_id)
+        decision = await reserve_submission("primary", alpha_id)
+        assert decision["allowed"] is True
+        await finalize_submission_attempt("primary", alpha_id, {"ok": True, "final_status": "ACTIVE"})
+
+    status = await get_submission_policy_status("primary")
+
+    assert status["unreconciled_active_submissions"] == 4
+    assert status["unreconciled_active_submissions_today"] == 2
+    assert status["unreconciled_active_submissions_historical"] == 2
+    assert status["platform_pending_score_submissions"] is None
+    assert status["pending_score_submissions"] == 4
+    assert status["pending_score_submissions_semantics"] == "deprecated_local_pending_ledger_not_platform_score_queue"
+
+
+@pytest.mark.asyncio
 async def test_lagging_points_do_not_settle_until_leaderboard_is_current(policy_db):
     await _seed_ready_candidate("alpha-1")
     await reserve_submission("primary", "alpha-1")

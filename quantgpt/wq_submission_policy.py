@@ -1407,6 +1407,22 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             )
         )
         pending_score = int(pending_result.scalar() or 0)
+        unreconciled_active_result = await session.execute(
+            select(WQSubmissionAttempt.submission_day, func.count())
+            .where(
+                WQSubmissionAttempt.account == account,
+                WQSubmissionAttempt.status == "ACTIVE",
+                WQSubmissionAttempt.score_state == "PENDING",
+            )
+            .group_by(WQSubmissionAttempt.submission_day)
+        )
+        unreconciled_active_by_day = {
+            str(submission_day_value): int(count or 0)
+            for submission_day_value, count in unreconciled_active_result.all()
+        }
+        unreconciled_active_today = int(unreconciled_active_by_day.get(day, 0))
+        unreconciled_active_total = sum(unreconciled_active_by_day.values())
+        unreconciled_active_historical = max(0, unreconciled_active_total - unreconciled_active_today)
         conversion_feedback = await _load_conversion_feedback(session, account)
         active_gate = active_feedback_gate(conversion_feedback)
         # Candidate Evidence Skill: official eligibility is enforced separately;
@@ -1545,7 +1561,7 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
         points_sync_unknown = last_points_status == "SYNC_UNKNOWN"
         untracked_active_gap = int(state.untracked_active_gap or 0)
         points_score_unchanged_pending = (
-            pending_score > 0
+            unreconciled_active_total > 0
             and last_points_status == "CURRENT"
             and state.last_observed_points is not None
             and state.last_settled_points is not None
@@ -1598,7 +1614,13 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             "failed_submission_attempts": failed_attempts,
             "budget_remaining_slots": budget_remaining,
             "remaining_submission_slots": budget_remaining,
+            "unreconciled_active_submissions": unreconciled_active_total,
+            "unreconciled_active_submissions_today": unreconciled_active_today,
+            "unreconciled_active_submissions_historical": unreconciled_active_historical,
+            "platform_pending_score_submissions": None,
+            "platform_score_settlement_status": last_points_status or "UNAVAILABLE",
             "pending_score_submissions": pending_score,
+            "pending_score_submissions_semantics": "deprecated_local_pending_ledger_not_platform_score_queue",
             "expired_reservation_ids": expired_reservation_ids,
             "submission_reconciliation_required": bool(reconciliation_required_ids),
             "submission_reconciliation_alpha_ids": reconciliation_required_ids,
