@@ -788,6 +788,83 @@ def test_native_decay_rescue_selects_best_knowledge_parent_and_skips_tested_valu
     assert pending == [4]
 
 
+def test_strict_skill_mode_does_not_run_native_decay_rescue(monkeypatch):
+    class FakeClient:
+        def list_operator_names(self):
+            return {"rank", "close"}
+
+    monkeypatch.setattr(autonomous, "run_list_alphas", lambda *_args, **_kwargs: {"ok": True, "alphas": []})
+    monkeypatch.setattr(autonomous, "_live_field_candidates", lambda *_args, **_kwargs: ([], {"available": False}))
+    monkeypatch.setattr(autonomous, "_active_dataset_sibling_fields", lambda *_args, **_kwargs: ([], {"available": False}))
+    monkeypatch.setattr(
+        autonomous,
+        "_run_native_decay_rescue",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("strict Skill-first must not run native decay rescue")),
+    )
+
+    def fake_research_batch(_client, expressions, **kwargs):
+        item = {
+            "ok": True,
+            "alpha_id": "skill-alpha",
+            "expression": expressions[0],
+            "is_metrics": {"sharpe": 0.8, "fitness": 0.4, "returns": 0.02, "turnover": 0.2, "checks": []},
+            "passes_primary_thresholds": False,
+            "mutation_targets": ["improve_fitness"],
+        }
+        return {
+            "ok": True,
+            "tag": kwargs["tag"],
+            "settings": {},
+            "summary": {"simulated": len(expressions)},
+            "results": [item],
+            "candidates": [],
+            "failed": [],
+            "invalid": [],
+        }
+
+    monkeypatch.setattr(autonomous, "run_research_batch", fake_research_batch)
+
+    result = autonomous.run_autonomous_research(
+        FakeClient(),
+        memory={
+            "family_counts": {},
+            "normalized_expressions": [],
+            "inventory": {"mode": "REPLENISHMENT"},
+            "submission": {"remaining_active_target": 2},
+            "recent_trials": [{
+                "alpha_id": "near-miss",
+                "expression": "rank(close)",
+                "settings": {"decay": 0},
+                "family": "price_volume",
+                "sharpe": 1.4,
+                "fitness": 0.9,
+                "returns": 0.08,
+                "turnover": 0.2,
+                "knowledge_card_ids": ["card-1"],
+            }],
+        },
+        skill_candidates=[{
+            "expression": "rank(close)",
+            "hypothesis": "relative price level is used only as a smoke-test Skill candidate",
+            "family": "price_volume",
+            "data_fields": ["close"],
+            "skill_chain": ["wq-alpha-hypothesis", "wq-alpha-review"],
+            "review_decision": "RUN",
+            "review_notes": "smoke test",
+        }],
+        allow_deterministic_fallback=False,
+        max_simulations=4,
+        generations=1,
+        family_count=1,
+    )
+
+    assert result["mode"] == "skill_first"
+    assert result["summary"]["native_decay_rescue_parent"] is None
+    assert result["summary"]["native_decay_rescue_values"] == []
+    assert result["summary"]["native_decay_rescue_simulations"] == 0
+    assert result["summary"]["native_decay_rescue_budget_upper_bound"] == 0
+
+
 def test_native_decay_rescue_preserves_knowledge_lineage_and_diagnoses_result():
     class FakeClient:
         def list_operator_names(self):

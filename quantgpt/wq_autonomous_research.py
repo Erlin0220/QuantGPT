@@ -2205,24 +2205,31 @@ def run_autonomous_research(
     validation_candidates_used = 0
     validation_simulations = 0
     robustness_feedback_failures = 0
-    native_decay_parent, native_decay_values = _select_native_decay_rescue_parent(
-        memory,
-        min_sharpe=min_sharpe,
-        min_fitness=min_fitness,
-        current_decay=decay,
-    )
-    if active_target_mode:
-        platform_rescue_parent, platform_rescue_values = _select_active_target_native_decay_rescue_parent(
-            recent_alphas,
+    # Strict Skill-first means every repair/diversification child must return to
+    # DevSpace for wq-alpha-repair / wq-alpha-diversify + wq-alpha-review.
+    # Native parameter rescue is a deterministic server-side repair path, so it
+    # must stay behind the explicit fallback opt-in just like template mutations.
+    native_decay_parent: dict[str, Any] | None = None
+    native_decay_values: list[int] = []
+    if not strict_skill_mode:
+        native_decay_parent, native_decay_values = _select_native_decay_rescue_parent(
+            memory,
             min_sharpe=min_sharpe,
             min_fitness=min_fitness,
             current_decay=decay,
         )
-        if platform_rescue_parent is not None and (
-            native_decay_parent is None
-            or _safe_metric(platform_rescue_parent.get("fitness")) >= _safe_metric(native_decay_parent.get("fitness"))
-        ):
-            native_decay_parent, native_decay_values = platform_rescue_parent, platform_rescue_values
+        if active_target_mode:
+            platform_rescue_parent, platform_rescue_values = _select_active_target_native_decay_rescue_parent(
+                recent_alphas,
+                min_sharpe=min_sharpe,
+                min_fitness=min_fitness,
+                current_decay=decay,
+            )
+            if platform_rescue_parent is not None and (
+                native_decay_parent is None
+                or _safe_metric(platform_rescue_parent.get("fitness")) >= _safe_metric(native_decay_parent.get("fitness"))
+            ):
+                native_decay_parent, native_decay_values = platform_rescue_parent, platform_rescue_values
     native_decay_results: list[dict[str, Any]] = []
     remaining = max_simulations
     plan = first_plan
@@ -2461,10 +2468,14 @@ def run_autonomous_research(
             "validation_simulations": validation_simulations,
             "validation_cap": validation_cap,
             "validation_simulation_budget_upper_bound": validation_cap * 2,
-            "native_decay_rescue_budget_upper_bound": 2,
-            "total_simulation_budget_upper_bound": max_simulations + validation_cap * 2 + 2,
+            "native_decay_rescue_budget_upper_bound": 0 if strict_skill_mode else 2,
+            "total_simulation_budget_upper_bound": max_simulations + validation_cap * 2 + (0 if strict_skill_mode else 2),
             "total_simulations": sum(int((item.get("summary") or {}).get("simulated") or 0) for item in generation_results) + validation_simulations + len(native_decay_results),
-            "simulation_budget_note": "max_simulations is the primary-generation budget; robustness validation and a max-2 knowledge native-decay rescue are separately bounded and explicit",
+            "simulation_budget_note": (
+                "max_simulations is the primary-generation budget; strict Skill-first disables server-side native-decay rescue"
+                if strict_skill_mode
+                else "max_simulations is the primary-generation budget; robustness validation and a max-2 knowledge native-decay rescue are separately bounded and explicit"
+            ),
             "directed_mutation_routes": sum(1 for item in all_results if item.get("directed_mutation_routed")),
             "simulation_failed": len(all_failed),
             "invalid": len(all_invalid),
