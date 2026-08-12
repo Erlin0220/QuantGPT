@@ -1334,9 +1334,22 @@ def _run_wq_autonomous_research_mcp_task(task_id: str, params: dict) -> dict:
 
     client = get_client("primary")
     try:
+        from .wq_active_session import ensure_active_first_session
+
+        submission_policy = _run_coro_sync(get_submission_policy_status("primary"))
+        active_first_session = _run_coro_sync(
+            ensure_active_first_session("primary", submission_policy)
+        )
+        params["active_session_id"] = (active_first_session or {}).get("session_id")
+
         update_mcp_task(task_id, status="authenticating", progress=0, progress_message="认证 WQ BRAIN", persist=True)
         if not client.authenticate():
-            return {"ok": False, "error": "WQ BRAIN 认证失败"}
+            from .wq_active_session import record_hard_stop
+
+            active_session = _run_coro_sync(
+                record_hard_stop(params.get("active_session_id"), "primary", "brain_authentication_failed")
+            )
+            return {"ok": False, "error": "WQ BRAIN 认证失败", "active_first_session": active_session}
 
         update_mcp_task(
             task_id,
@@ -1346,7 +1359,6 @@ def _run_wq_autonomous_research_mcp_task(task_id: str, params: dict) -> dict:
             persist=True,
         )
         memory = load_research_memory_sync("primary")
-        submission_policy = _run_coro_sync(get_submission_policy_status("primary"))
         memory["inventory"] = submission_policy.get("inventory") or {}
         memory["submission"] = submission_policy
         memory["research_learning"] = build_research_control_tower(memory, submission_policy)
@@ -1406,6 +1418,15 @@ def _run_wq_autonomous_research_mcp_task(task_id: str, params: dict) -> dict:
         except Exception as exc:
             logger.warning("Failed to persist autonomous WQ candidates: %s", exc)
             result["candidate_queue_saved"] = 0
+        try:
+            from .wq_active_session import record_research_transition
+
+            result["active_first_session"] = _run_coro_sync(
+                record_research_transition(params.get("active_session_id"), result, params)
+            )
+        except Exception as exc:
+            logger.warning("Failed to advance ACTIVE-first research session: %s", exc)
+            result["active_first_session"] = {"error": str(exc)}
         return result
     finally:
         client.close()
@@ -1426,9 +1447,22 @@ def _run_wq_submit_by_ids_mcp_task(task_id: str, params: dict) -> dict:
 
     client = get_client(params["account"])
     try:
+        from .wq_active_session import ensure_active_first_session
+
+        submission_policy = _run_coro_sync(get_submission_policy_status(params["account"]))
+        active_first_session = _run_coro_sync(
+            ensure_active_first_session(params["account"], submission_policy)
+        )
+        params["active_session_id"] = (active_first_session or {}).get("session_id")
+
         update_mcp_task(task_id, status="authenticating", progress=0, progress_message="认证 WQ BRAIN", persist=True)
         if not client.authenticate():
-            return {"ok": False, "error": "WQ BRAIN 认证失败"}
+            from .wq_active_session import record_hard_stop
+
+            active_session = _run_coro_sync(
+                record_hard_stop(params.get("active_session_id"), params["account"], "brain_authentication_failed")
+            )
+            return {"ok": False, "error": "WQ BRAIN 认证失败", "active_first_session": active_session}
 
         update_mcp_task(
             task_id,
@@ -1439,10 +1473,23 @@ def _run_wq_submit_by_ids_mcp_task(task_id: str, params: dict) -> dict:
         )
         submission_recovery = reconcile_submission_uncertainty(client, params["account"])
         if not submission_recovery.get("ok"):
+            from .wq_active_session import record_submission_transition
+
+            active_session = _run_coro_sync(
+                record_submission_transition(
+                    params.get("active_session_id"),
+                    {
+                        "timeout": 1,
+                        "results": {"recovery": {"final_status": "SUBMIT_UNKNOWN"}},
+                    },
+                    params["account"],
+                )
+            )
             return {
                 "ok": False,
                 "error": "存在尚未与 BRAIN 对账完成的正式提交；为避免超额提交，本次提交已冻结",
                 "submission_recovery": submission_recovery,
+                "active_first_session": active_session,
             }
 
         update_mcp_task(
@@ -1535,13 +1582,23 @@ def _run_wq_submit_by_ids_mcp_task(task_id: str, params: dict) -> dict:
             submission_guard=lambda alpha_id: reserve_submission_sync(params["account"], alpha_id),
             submission_result_callback=lambda alpha_id, entry: finalize_submission_attempt_sync(params["account"], alpha_id, entry),
         )
-        return {
+        response = {
             "ok": True,
             "submission_recovery": submission_recovery,
             "preflight": preflight,
             "robustness_revalidation": robustness_revalidation,
             **result,
         }
+        try:
+            from .wq_active_session import record_submission_transition
+
+            response["active_first_session"] = _run_coro_sync(
+                record_submission_transition(params.get("active_session_id"), response, params["account"])
+            )
+        except Exception as exc:
+            logger.warning("Failed to advance ACTIVE-first submission session: %s", exc)
+            response["active_first_session"] = {"error": str(exc)}
+        return response
     finally:
         client.close()
 
@@ -1908,6 +1965,7 @@ async def wq_brain_autonomous_research(
         return json.dumps({"error": "family_count 必须在 1~4 之间"})
 
     params = {
+        "account": "primary",
         "skill_candidates": skill_candidates[:40],
         "chatgpt_expressions": list(chatgpt_expressions or [])[:40],
         "allow_deterministic_fallback": bool(allow_deterministic_fallback),
@@ -1973,6 +2031,30 @@ async def wq_brain_submit_by_ids(
         _run_wq_submit_by_ids_mcp_task,
         legacy_wq_poll=True,
         total=len(alpha_ids),
+    )
+
+
+@mcp.tool()
+async def wq_brain_active_session_state(account: str = "primary") -> str:
+    """读取/恢复当天代码级 ACTIVE-first session 状态机。
+
+    当 daily_active_count < daily_active_target 时，返回的 session 会保持 RUNNING，
+    除非达到 ACTIVE 目标、耗尽 session 迭代预算、出现真实平台不确定状态或硬故障。
+    单次 0 Candidate、STOP_REPAIR、SC_FAIL 或本地提交阻断都不会把 session 标记完成。
+    """
+    if account != "primary":
+        return json.dumps({"error": "ACTIVE-first session 仅用于 primary 账号"}, ensure_ascii=False)
+
+    from .wq_active_session import ensure_active_first_session
+    from .wq_submission_policy import get_submission_policy_status
+
+    policy = await get_submission_policy_status(account)
+    state = await ensure_active_first_session(account, policy)
+    return json.dumps(
+        {"ok": True, "submission_policy": policy, "active_first_session": state},
+        ensure_ascii=False,
+        indent=2,
+        default=str,
     )
 
 
@@ -2048,6 +2130,13 @@ async def wq_brain_account_status(account: str = "primary") -> str:
                 recovery_alphas,
             )
         result["submission_policy"] = await observe_account_status(account, result)
+        if account == "primary":
+            from .wq_active_session import ensure_active_first_session
+
+            result["active_first_session"] = await ensure_active_first_session(
+                account,
+                result["submission_policy"],
+            )
     except Exception as exc:
         logger.warning("Failed to reconcile WQ submission policy: %s", exc)
         result["submission_policy"] = {"error": str(exc)}
