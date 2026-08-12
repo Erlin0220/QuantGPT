@@ -755,6 +755,7 @@ async def reconcile_candidate_platform_statuses(
     updated = 0
     async with factory() as session:
         conversion_feedback = await _load_conversion_feedback(session, account)
+        rechecked_redundant_ids: set[str] = set()
         for alpha_id, info in platform_alphas.items():
             if (info or {}).get("ok") is False:
                 continue
@@ -780,11 +781,13 @@ async def reconcile_candidate_platform_statuses(
                         "validation_pending",
                         "robustness_fail",
                         "submission_unknown",
+                        "redundant",
                     ]),
                 )
             )
             candidate = result.scalar_one_or_none()
             if candidate is not None:
+                was_redundant = str(candidate.status or "").lower() == "redundant"
                 for field in ("sharpe", "fitness", "returns", "turnover"):
                     value = (info or {}).get(field)
                     if value is not None:
@@ -815,28 +818,31 @@ async def reconcile_candidate_platform_statuses(
                         in {"ready", "evidence_collected"}
                     )
                     ready = metrics_ready and robustness_ready
-                    candidate.status = "queued" if ready else "validation_pending"
-                    if ready and str(candidate.validation_status or "").lower() != "evidence_collected":
-                        candidate.validation_status = "ready"
-                    elif metrics_ready and not robustness_ready:
-                        candidate.validation_status = "robustness_pending"
-                        validation_details.update(
-                            {
-                                "status": "robustness_pending",
-                                "reason": "platform_preflight_requires_skill_defined_cross_setting_evidence_before_submission",
-                            }
-                        )
-                        candidate.validation_details = validation_details
+                    if was_redundant:
+                        rechecked_redundant_ids.add(str(alpha_id))
                     else:
-                        candidate.validation_status = "platform_readiness_failed"
-                    if ready:
-                        evidence_blockers = [
-                            blocker
-                            for blocker in _candidate_submission_blockers(candidate)
-                            if blocker in {"local_correlation_high", "overfitting_evidence_weak"}
-                        ]
-                        if evidence_blockers:
-                            candidate.status = "validation_pending"
+                        candidate.status = "queued" if ready else "validation_pending"
+                        if ready and str(candidate.validation_status or "").lower() != "evidence_collected":
+                            candidate.validation_status = "ready"
+                        elif metrics_ready and not robustness_ready:
+                            candidate.validation_status = "robustness_pending"
+                            validation_details.update(
+                                {
+                                    "status": "robustness_pending",
+                                    "reason": "platform_preflight_requires_skill_defined_cross_setting_evidence_before_submission",
+                                }
+                            )
+                            candidate.validation_details = validation_details
+                        else:
+                            candidate.validation_status = "platform_readiness_failed"
+                        if ready:
+                            evidence_blockers = [
+                                blocker
+                                for blocker in _candidate_submission_blockers(candidate)
+                                if blocker in {"local_correlation_high", "overfitting_evidence_weak"}
+                            ]
+                            if evidence_blockers:
+                                candidate.status = "validation_pending"
                 evidence = {
                     "expression": candidate.expression,
                     "family": candidate.family,
@@ -885,6 +891,61 @@ async def reconcile_candidate_platform_statuses(
                 candidate.calibration_details = calibration
                 candidate.priority_score = _priority_score(evidence)
                 updated += 1
+
+        for alpha_id in sorted(rechecked_redundant_ids):
+            candidate_result = await session.execute(
+                select(WQResearchCandidate).where(
+                    WQResearchCandidate.account == account,
+                    WQResearchCandidate.alpha_id == alpha_id,
+                    WQResearchCandidate.status == "redundant",
+                )
+            )
+            candidate = candidate_result.scalar_one_or_none()
+            if candidate is None:
+                continue
+
+            peer_result = await session.execute(
+                select(WQResearchCandidate.alpha_id).where(
+                    WQResearchCandidate.account == account,
+                    WQResearchCandidate.alpha_id != alpha_id,
+                    WQResearchCandidate.structure_signature == candidate.structure_signature,
+                    WQResearchCandidate.status.in_(["queued", "reserved", "submitted"]),
+                )
+            )
+            if peer_result.scalar_one_or_none() is not None:
+                continue
+
+            metrics_ready = (
+                float(candidate.sharpe or 0.0) >= 1.25
+                and float(candidate.fitness or 0.0) >= 1.0
+                and 0.01 <= float(candidate.turnover or 0.0) <= 0.7
+                and str(candidate.sc_status or "").upper() != "FAIL"
+            )
+            validation_details = (
+                dict(candidate.validation_details)
+                if isinstance(candidate.validation_details, dict)
+                else {}
+            )
+            robustness_ready = (
+                str(validation_details.get("status") or candidate.validation_status or "").lower()
+                in {"ready", "evidence_collected"}
+            )
+            ready = metrics_ready and robustness_ready
+            candidate.status = "queued" if ready else "validation_pending"
+            if ready and str(candidate.validation_status or "").lower() != "evidence_collected":
+                candidate.validation_status = "ready"
+            elif metrics_ready and not robustness_ready:
+                candidate.validation_status = "robustness_pending"
+                validation_details.update(
+                    {
+                        "status": "robustness_pending",
+                        "reason": "platform_preflight_requires_skill_defined_cross_setting_evidence_before_submission",
+                    }
+                )
+                candidate.validation_details = validation_details
+            else:
+                candidate.validation_status = "platform_readiness_failed"
+
         await session.commit()
     return updated
 

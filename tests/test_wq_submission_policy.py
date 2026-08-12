@@ -365,6 +365,55 @@ async def test_platform_history_backfills_only_strong_unsubmitted_candidates(pol
 
 
 @pytest.mark.asyncio
+async def test_reconcile_revives_redundant_candidate_when_structure_leader_sc_fails(policy_db):
+    saved = await record_research_candidates(
+        "primary",
+        [
+            {
+                "alpha_id": "leader",
+                "expression": "rank(ts_mean(close, 20))",
+                "is_metrics": {"sharpe": 1.7, "fitness": 1.2, "returns": 0.08, "turnover": 0.2},
+                "validation": {"status": "ready"},
+                "research_meta": {"family": "price_volume", "generation": 1},
+            },
+            {
+                "alpha_id": "backup",
+                "expression": "rank(ts_mean(close, 60))",
+                "is_metrics": {"sharpe": 1.65, "fitness": 1.1, "returns": 0.07, "turnover": 0.18},
+                "validation": {"status": "ready"},
+                "research_meta": {"family": "price_volume", "generation": 1},
+            },
+        ],
+    )
+    assert saved == 2
+
+    status = await get_submission_policy_status("primary")
+    assert status["candidate_queue_count"] == 1
+    assert status["candidate_queue_top"][0]["alpha_id"] == "leader"
+
+    updated = await reconcile_candidate_platform_statuses(
+        "primary",
+        {
+            "leader": {"ok": True, "status": "UNSUBMITTED", "sc_result": "FAIL"},
+            "backup": {
+                "ok": True,
+                "status": "UNSUBMITTED",
+                "sc_result": "PENDING",
+                "sharpe": 1.65,
+                "fitness": 1.1,
+                "returns": 0.07,
+                "turnover": 0.18,
+            },
+        },
+    )
+    assert updated == 2
+
+    status = await get_submission_policy_status("primary")
+    assert status["candidate_queue_count"] == 1
+    assert status["candidate_queue_top"][0]["alpha_id"] == "backup"
+
+
+@pytest.mark.asyncio
 async def test_pending_robustness_can_fill_daily_active_target_as_fallback(policy_db):
     saved = await record_research_candidates(
         "primary",
