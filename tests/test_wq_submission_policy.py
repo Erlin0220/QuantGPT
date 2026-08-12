@@ -102,6 +102,29 @@ async def test_daily_active_target_blocks_third_active_submission(policy_db):
 
 
 @pytest.mark.asyncio
+async def test_redundant_platform_candidate_can_fill_unmet_active_target(policy_db):
+    import quantgpt.db as db
+    from quantgpt.models import WQResearchCandidate
+
+    await _seed_ready_candidate("redundant-target")
+    async with db._get_session_factory()() as session:
+        result = await session.execute(
+            select(WQResearchCandidate).where(WQResearchCandidate.alpha_id == "redundant-target")
+        )
+        candidate = result.scalar_one()
+        candidate.status = "redundant"
+        candidate.validation_status = "platform_recheck"
+        await session.commit()
+
+    decision = await reserve_submission("primary", "redundant-target")
+
+    assert decision["allowed"] is True
+    assert decision["submission_mode"] == "active_target_fallback"
+    assert "candidate_not_queued" in decision["soft_blockers_waived"]
+    assert "validation_not_ready" in decision["soft_blockers_waived"]
+
+
+@pytest.mark.asyncio
 async def test_sc_fail_releases_capacity_until_two_active(policy_db):
     for alpha_id in ("retry-1", "retry-2", "retry-3", "retry-4"):
         await _seed_ready_candidate(alpha_id)

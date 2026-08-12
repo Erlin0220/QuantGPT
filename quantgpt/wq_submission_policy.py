@@ -184,7 +184,7 @@ def _candidate_fallback_submission_blockers(
     blockers: list[str] = []
     candidate_status = str(candidate.status or "").lower()
 
-    if candidate_status not in {"queued", "validation_pending", "robustness_fail"}:
+    if candidate_status not in {"queued", "validation_pending", "robustness_fail", "redundant"}:
         blockers.append("candidate_not_available")
     if float(candidate.sharpe or 0.0) < 1.25:
         blockers.append("sharpe_below_threshold")
