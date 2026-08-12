@@ -404,7 +404,8 @@ def allocate_research_cells(
             "allocation_score": round(posterior * penalty, 6),
             "downstream_evidence": downstream_evidence,
             "active_evidence": active,
-            "formal_outcome_evidence": formal_submissions + terminal_failures,
+            "terminal_failure_evidence": terminal_failures,
+            "formal_outcome_evidence": formal_submissions,
         })
         enriched.append(scored)
 
@@ -437,6 +438,7 @@ def allocate_research_cells(
         return (
             -item["allocation_score"],
             -int(item.get("active_evidence") or 0),
+            int(item.get("terminal_failure_evidence") or 0),
             -int(item.get("formal_outcome_evidence") or 0),
             int(item.get("trials") or 0),
             item["cell_key"],
@@ -462,6 +464,7 @@ def allocate_research_cells(
             tied,
             key=lambda item: (
                 -int(item.get("active_evidence") or 0),
+                int(item.get("terminal_failure_evidence") or 0),
                 -int(item.get("formal_outcome_evidence") or 0),
                 int(item.get("trials") or 0),
                 item["cell_key"],
@@ -474,7 +477,17 @@ def allocate_research_cells(
     by_key = {item["cell_key"]: item for item in enriched}
     exploration_keys = {row["cell_key"] for row in explore_order[:exploration_slots]}
     selected = []
-    for key, slots in sorted(allocations.items(), key=lambda pair: (-pair[1], -by_key[pair[0]]["allocation_score"], pair[0])):
+    for key, slots in sorted(
+        allocations.items(),
+        key=lambda pair: (
+            -pair[1],
+            -by_key[pair[0]]["allocation_score"],
+            -int(by_key[pair[0]].get("active_evidence") or 0),
+            int(by_key[pair[0]].get("terminal_failure_evidence") or 0),
+            -int(by_key[pair[0]].get("formal_outcome_evidence") or 0),
+            pair[0],
+        ),
+    ):
         item = dict(by_key[key])
         item["slots"] = slots
         item["rationale"] = "forced_exploration" if key in exploration_keys else "posterior_exploitation"

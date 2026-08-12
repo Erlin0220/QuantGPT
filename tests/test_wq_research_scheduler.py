@@ -213,6 +213,24 @@ def test_allocator_uses_attributed_active_as_tie_breaker_without_changing_poster
     assert summaries["peer|d|p"]["downstream_evidence"] == "candidate_only"
 
 
+def test_selected_cell_order_keeps_active_evidence_ahead_of_terminal_failure_on_tie():
+    failed_cell = _cell("a_failed|fundamental6|p", trials=1, candidates=1)
+    failed_cell["formal_submissions"] = 1
+    failed_cell["terminal_failures"] = 1
+    active_cell = _cell("z_active|fundamental6|p", trials=1, candidates=1)
+    active_cell["formal_submissions"] = 1
+    active_cell["active"] = 1
+
+    allocation = allocate_research_cells(
+        [failed_cell, active_cell],
+        budget=4,
+        exploration_share=0.0,
+        inventory_mode="REPLENISHMENT",
+    )
+
+    assert allocation["selected_cells"][0]["cell_key"] == "z_active|fundamental6|p"
+
+
 def test_allocator_is_deterministic_for_same_input():
     cells = [_cell("a|d|p", trials=3, candidates=1), _cell("b|d|p", trials=3, candidates=0)]
     first = allocate_research_cells(cells, budget=7)
