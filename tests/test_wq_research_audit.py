@@ -46,6 +46,12 @@ def test_round_audit_measures_skill_compliance_and_simulation_cost():
     assert audit["execution"]["simulation_to_candidate_rate"] == 0.3333
     assert audit["execution"]["simulations_per_candidate"] == 5.0
     assert audit["submission"]["candidate_to_active_rate"] == 1.0
+    assert audit["iteration"]["new_hypotheses"] == 1
+    assert audit["iteration"]["repairs"] == 0
+    assert audit["iteration"]["candidates"] == 1
+    assert audit["iteration"]["formal_submissions"] == 1
+    assert audit["iteration"]["active"] == 1
+    assert audit["iteration"]["end_reason"] == "candidate_found"
     assert audit["created_at"].startswith("2026-08-11T00:00:00")
 
 
@@ -86,3 +92,43 @@ def test_round_audit_requires_failure_signature_and_diversity_case_for_routed_ch
     assert audit["skill_compliance"]["repair_with_failure_signature"] == 0
     assert audit["skill_compliance"]["diversify_with_diversity_case"] == 1
     assert audit["skill_compliance"]["rate"] == 0.5
+    assert audit["iteration"]["repairs"] == 1
+    assert audit["iteration"]["diversifications"] == 1
+
+
+def test_round_audit_marks_failed_active_target_iteration_for_continuation():
+    task = {
+        "task_id": "round-active-target",
+        "status": "completed",
+        "params": {"skill_candidates": [_base_candidate()]},
+        "result": {
+            "summary": {
+                "simulated": 1,
+                "total_simulations": 1,
+                "remaining_active_target": 1,
+                "candidates": 0,
+            }
+        },
+    }
+
+    audit = build_research_round_audit(task, trials=[{"alpha_id": "failed-1"}])
+
+    assert audit["iteration"]["end_reason"] == "iteration_exhausted_no_candidate"
+    assert audit["iteration"]["next_action"] == "failure_diagnosis_then_allocate_next_iteration"
+    assert audit["iteration"]["session_stop_allowed"] is False
+    assert audit["iteration"]["stop_repair_scope"] == "parent_only_never_session"
+
+
+def test_round_audit_allows_hard_failed_task_to_stop_session():
+    task = {
+        "task_id": "round-hard-fail",
+        "status": "failed",
+        "params": {"skill_candidates": [_base_candidate()]},
+        "result": {"summary": {"remaining_active_target": 1}},
+    }
+
+    audit = build_research_round_audit(task)
+
+    assert audit["iteration"]["end_reason"] == "hard_task_failure"
+    assert audit["iteration"]["next_action"] == "stop_for_hard_failure"
+    assert audit["iteration"]["session_stop_allowed"] is True
