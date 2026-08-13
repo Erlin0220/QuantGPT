@@ -135,7 +135,7 @@ async def test_sc_fail_releases_capacity_until_two_active(policy_db):
     await finalize_submission_attempt(
         "primary",
         "retry-1",
-        {"ok": False, "final_status": "SC_FAIL", "detail": "SC FAIL"},
+        {"ok": False, "final_status": "SC_FAIL", "detail": "SC FAIL: value=0.86 > limit=0.7", "sc_value": 0.86, "sc_limit": 0.7},
     )
 
     after_fail = await get_submission_policy_status("primary")
@@ -144,6 +144,19 @@ async def test_sc_fail_releases_capacity_until_two_active(policy_db):
     assert after_fail["failed_submission_attempts"] == 1
     assert after_fail["remaining_active_target"] == 2
     assert after_fail["research_strategy"] == "ACTIVE_FILL"
+    assert after_fail["objective_mode"] == "ACTIVE_FILL"
+    assert after_fail["active_campaign"]["terminal_failures"] == 1
+    assert after_fail["active_campaign"]["sc_fail_clusters"][0]["family"] == "test_family"
+    assert after_fail["active_campaign"]["sc_fail_clusters"][0]["mean_sc"] == 0.86
+
+    import quantgpt.db as db
+    from quantgpt.models import WQResearchCandidate
+    async with db._get_session_factory()() as session:
+        candidate = (await session.execute(
+            select(WQResearchCandidate).where(WQResearchCandidate.alpha_id == "retry-1")
+        )).scalar_one()
+        assert candidate.self_correlation == 0.86
+        assert candidate.sc_status == "FAIL"
 
     for alpha_id in ("retry-2", "retry-3"):
         decision = await reserve_submission("primary", alpha_id)
@@ -163,6 +176,9 @@ async def test_empty_inventory_enters_replenishment_mode(policy_db):
     assert status["inventory"]["deficit"] == 30
     assert status["inventory"]["mode"] == "REPLENISHMENT"
     assert status["research_mode"] == "REPLENISHMENT"
+    assert status["inventory_mode"] == "REPLENISHMENT"
+    assert status["objective_mode"] == "ACTIVE_FILL"
+    assert status["research_mode_semantics"] == "deprecated_alias_of_inventory_mode"
 
 
 @pytest.mark.asyncio

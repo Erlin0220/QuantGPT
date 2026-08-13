@@ -1298,6 +1298,13 @@ async def finalize_submission_attempt(account: str, alpha_id: str, result: dict[
         )
         candidate = candidate_result.scalar_one_or_none()
         if candidate is not None:
+            sc_value = _optional_float(result.get("sc_value"))
+            if sc_value is not None:
+                candidate.self_correlation = sc_value
+            if final_status == "SC_FAIL":
+                candidate.sc_status = "FAIL"
+            elif final_status == "ACTIVE" and sc_value is not None:
+                candidate.sc_status = "PASS"
             if final_status in {"ACTIVE", "SC_PENDING"}:
                 candidate.status = "submitted"
             elif final_status == "SUBMIT_UNKNOWN":
@@ -1543,6 +1550,7 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
                 not _candidate_research_ready(candidate),
                 not _candidate_fallback_submission_ready(candidate),
                 -(float(candidate.active_probability) if active_gate["ready"] and candidate.active_probability is not None else -1.0),
+                float(candidate.self_correlation) if candidate.self_correlation is not None else 999.0,
                 -(float(candidate.fitness or 0.0)),
                 -(float(candidate.sharpe or 0.0)),
                 -(float(candidate.returns or 0.0)),
@@ -1660,6 +1668,55 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
         remaining_active_target = max(0, daily_budget - active_today)
         daily_active_target_met = remaining_active_target == 0
         research_strategy = "ACTIVE_FILL" if remaining_active_target > 0 else "INVENTORY_BUILD"
+
+        campaign_rows_result = await session.execute(
+            select(WQSubmissionAttempt, WQResearchCandidate)
+            .outerjoin(
+                WQResearchCandidate,
+                (WQResearchCandidate.account == WQSubmissionAttempt.account)
+                & (WQResearchCandidate.alpha_id == WQSubmissionAttempt.alpha_id),
+            )
+            .where(
+                WQSubmissionAttempt.account == account,
+                WQSubmissionAttempt.submission_day == day,
+            )
+            .order_by(WQSubmissionAttempt.created_at.asc())
+        )
+        campaign_rows = list(campaign_rows_result.all())
+        sc_fail_clusters: dict[tuple[str, str], dict[str, Any]] = {}
+        for attempt, candidate in campaign_rows:
+            if str(attempt.status or "").upper() != "SC_FAIL" or candidate is None:
+                continue
+            family = str(candidate.family or "unknown")
+            signature = str(candidate.structure_signature or _structure_signature(candidate.expression))
+            key = (family, signature)
+            cluster = sc_fail_clusters.setdefault(
+                key,
+                {"family": family, "structure_signature": signature, "count": 0, "sc_values": []},
+            )
+            cluster["count"] += 1
+            if candidate.self_correlation is not None:
+                cluster["sc_values"].append(float(candidate.self_correlation))
+        campaign_sc_clusters = []
+        for cluster in sorted(sc_fail_clusters.values(), key=lambda item: (-int(item["count"]), item["family"], item["structure_signature"])):
+            values = list(cluster.pop("sc_values"))
+            campaign_sc_clusters.append({
+                **cluster,
+                "mean_sc": round(sum(values) / len(values), 4) if values else None,
+                "max_sc": round(max(values), 4) if values else None,
+            })
+        active_campaign = {
+            "campaign_id": f"{account}:{day}:daily-active",
+            "submission_day": day,
+            "objective_mode": research_strategy,
+            "attempts": len(campaign_rows),
+            "active": active_today,
+            "terminal_failures": failed_attempts,
+            "remaining_active_target": remaining_active_target,
+            "remaining_submission_slots": budget_remaining,
+            "sc_fail_clusters": campaign_sc_clusters[:10],
+            "avoid_structure_signatures": [item["structure_signature"] for item in campaign_sc_clusters[:10]],
+        }
         inventory_status = {
             "floor": inventory_floor,
             "target_low": target_low,
@@ -1688,6 +1745,10 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             "daily_active_target_met": daily_active_target_met,
             "remaining_active_target": remaining_active_target,
             "research_strategy": research_strategy,
+            "objective_mode": research_strategy,
+            "inventory_mode": research_mode,
+            "research_mode_semantics": "deprecated_alias_of_inventory_mode",
+            "active_campaign": active_campaign,
             "inflight_submission_count": inflight_today,
             "daily_submission_budget": daily_budget,
             "used_submission_slots": used_slots,

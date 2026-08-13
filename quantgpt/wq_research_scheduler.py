@@ -214,6 +214,12 @@ def summarize_research_cells(
                 "formal_submissions": 0,
                 "active": 0,
                 "terminal_failures": 0,
+                "sc_samples": 0,
+                "sc_failures": 0,
+                "sc_value_sum": 0.0,
+                "sc_value_count": 0,
+                "sc_fail_excess_sum": 0.0,
+                "sc_value_max": None,
                 "recent_failure_reasons": {},
                 "last_sampled_at": None,
             }
@@ -285,6 +291,36 @@ def summarize_research_cells(
             cell["active"] += 1
         elif status in terminal_failures:
             cell["terminal_failures"] += 1
+        if status in {"ACTIVE", "SC_FAIL"}:
+            sc_value = _get(candidate, "self_correlation") if candidate is not None else None
+            try:
+                numeric_sc = float(sc_value) if sc_value is not None else None
+            except (TypeError, ValueError):
+                numeric_sc = None
+            cell["sc_samples"] += 1
+            if status == "SC_FAIL":
+                cell["sc_failures"] += 1
+            if numeric_sc is not None:
+                cell["sc_value_sum"] += numeric_sc
+                cell["sc_value_count"] += 1
+                cell["sc_value_max"] = numeric_sc if cell["sc_value_max"] is None else max(float(cell["sc_value_max"]), numeric_sc)
+                if status == "SC_FAIL":
+                    cell["sc_fail_excess_sum"] += max(0.0, numeric_sc - 0.7)
+
+    for cell in cells.values():
+        sc_samples = int(cell.pop("sc_samples") or 0)
+        sc_failures = int(cell.pop("sc_failures") or 0)
+        sc_value_sum = float(cell.pop("sc_value_sum") or 0.0)
+        sc_value_count = int(cell.pop("sc_value_count") or 0)
+        sc_fail_excess_sum = float(cell.pop("sc_fail_excess_sum") or 0.0)
+        cell["sc_samples"] = sc_samples
+        cell["sc_failures"] = sc_failures
+        cell["sc_fail_rate"] = round(sc_failures / max(1, sc_samples), 4) if sc_samples else 0.0
+        cell["sc_pass_posterior"] = round((1 + max(0, sc_samples - sc_failures)) / (2 + sc_samples), 4) if sc_samples else 1.0
+        cell["mean_sc"] = round(sc_value_sum / sc_value_count, 4) if sc_value_count else None
+        cell["mean_sc_fail_excess"] = round(sc_fail_excess_sum / sc_failures, 4) if sc_failures else 0.0
+        if cell.get("sc_value_max") is not None:
+            cell["sc_value_max"] = round(float(cell["sc_value_max"]), 4)
 
     return sorted(cells.values(), key=lambda item: item["cell_key"])
 
@@ -394,6 +430,13 @@ def allocate_research_cells(
             if int(cell.get("candidates") or 0) > 0
             else "trial_only"
         )
+        base_allocation_score = posterior * penalty
+        sc_pass_posterior = float(cell.get("sc_pass_posterior") or 1.0)
+        effective_allocation_score = (
+            base_allocation_score * sc_pass_posterior
+            if mode == "ACTIVE_FILL" and int(cell.get("sc_samples") or 0) > 0
+            else base_allocation_score
+        )
         scored.update({
             "posterior_alpha": round(alpha, 4),
             "posterior_beta": round(beta, 4),
@@ -401,7 +444,9 @@ def allocate_research_cells(
             "cooldown": cooling,
             "cooldown_penalty": penalty,
             "cooldown_reason": cooldown_reason,
-            "allocation_score": round(posterior * penalty, 6),
+            "allocation_score": round(base_allocation_score, 6),
+            "effective_allocation_score": round(effective_allocation_score, 6),
+            "sc_risk_policy": "beta_smoothed_sc_pass_tiebreak_and_active_fill_penalty",
             "downstream_evidence": downstream_evidence,
             "active_evidence": active,
             "terminal_failure_evidence": terminal_failures,
@@ -444,8 +489,10 @@ def allocate_research_cells(
         # downstream outcomes are an evidence-hierarchy tie-breaker, not a
         # fabricated ACTIVE probability or hand-weighted score.
         return (
-            -item["allocation_score"],
+            -item["effective_allocation_score"],
             -int(item.get("active_evidence") or 0),
+            float(item.get("sc_fail_rate") or 0.0),
+            float(item.get("mean_sc_fail_excess") or 0.0),
             int(item.get("terminal_failure_evidence") or 0),
             -int(item.get("formal_outcome_evidence") or 0),
             int(item.get("trials") or 0),
@@ -462,14 +509,14 @@ def allocate_research_cells(
     allocations: Counter[str] = Counter()
     for _ in range(exploitation_slots):
         best_adjusted = max(
-            item["allocation_score"] / (1.0 + allocations[item["cell_key"]] * 0.45)
+            item["effective_allocation_score"] / (1.0 + allocations[item["cell_key"]] * 0.45)
             for item in exploitation_pool
         )
         tied = [
             item
             for item in exploitation_pool
             if abs(
-                item["allocation_score"] / (1.0 + allocations[item["cell_key"]] * 0.45)
+                item["effective_allocation_score"] / (1.0 + allocations[item["cell_key"]] * 0.45)
                 - best_adjusted
             ) < 1e-12
         ]
@@ -477,6 +524,8 @@ def allocate_research_cells(
             tied,
             key=lambda item: (
                 -int(item.get("active_evidence") or 0),
+                float(item.get("sc_fail_rate") or 0.0),
+                float(item.get("mean_sc_fail_excess") or 0.0),
                 int(item.get("terminal_failure_evidence") or 0),
                 -int(item.get("formal_outcome_evidence") or 0),
                 int(item.get("trials") or 0),
@@ -494,8 +543,10 @@ def allocate_research_cells(
         allocations.items(),
         key=lambda pair: (
             -pair[1],
-            -by_key[pair[0]]["allocation_score"],
+            -by_key[pair[0]]["effective_allocation_score"],
             -int(by_key[pair[0]].get("active_evidence") or 0),
+            float(by_key[pair[0]].get("sc_fail_rate") or 0.0),
+            float(by_key[pair[0]].get("mean_sc_fail_excess") or 0.0),
             int(by_key[pair[0]].get("terminal_failure_evidence") or 0),
             -int(by_key[pair[0]].get("formal_outcome_evidence") or 0),
             pair[0],

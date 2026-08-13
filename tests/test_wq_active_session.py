@@ -40,6 +40,33 @@ def test_new_active_first_session_cannot_stop_while_target_remains():
     assert state["remaining_active_target"] == 1
 
 
+def test_active_session_carries_day_campaign_across_policy_refreshes():
+    policy = {
+        **_policy(1),
+        "active_campaign": {
+            "campaign_id": "primary:2026-08-13:active-fill",
+            "terminal_failures": 2,
+            "avoid_structure_signatures": ["group_rank(ts_delta(divide(*,#),#),subindustry)"],
+        },
+    }
+    state = new_active_first_state(account="primary", policy=policy, max_iterations=4)
+    assert state["campaign"]["terminal_failures"] == 2
+
+    refreshed = apply_policy(
+        state,
+        {
+            **_policy(1),
+            "active_campaign": {
+                "campaign_id": "primary:2026-08-13:active-fill",
+                "terminal_failures": 3,
+                "avoid_structure_signatures": ["same-family-neighborhood"],
+            },
+        },
+    )
+    assert refreshed["campaign"]["terminal_failures"] == 3
+    assert refreshed["campaign"]["avoid_structure_signatures"] == ["same-family-neighborhood"]
+
+
 def test_new_session_prioritizes_existing_submission_candidate():
     policy = {
         **_policy(2),

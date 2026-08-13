@@ -8,7 +8,7 @@ import re
 from collections import Counter
 from typing import Any, Callable
 
-from .wq_brain_service import run_batch_simulation, run_list_alphas, run_single_simulation
+from .wq_brain_service import run_list_alphas, run_single_simulation
 from .wq_lineage import extract_expression_metadata
 from .wq_mutation_policy import preferred_mutation_classes
 from .wq_operator_registry import validate_wq_expression
@@ -1084,6 +1084,78 @@ def build_skill_plan(
             }
         )
     return out
+
+
+def enforce_active_fill_batch_diversity(
+    plan: list[dict[str, Any]],
+    *,
+    rejections: list[dict[str, Any]] | None = None,
+    max_structure_share: float = 0.4,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Bound same-structure concentration before ACTIVE_FILL spends simulations.
+
+    This is an execution-budget guard, not an Alpha-quality veto: rejected near-
+    clones should be replaced by another Skill-authored causal bucket.
+    """
+    if not plan:
+        return [], {
+            "policy": "active_fill_structure_neighborhood_cap",
+            "max_structure_share": max_structure_share,
+            "unique_structure_neighborhoods": 0,
+            "max_structure_count": 0,
+            "rejected_for_concentration": 0,
+        }
+    signatures = [
+        str(extract_expression_metadata(item["expression"]).get("structure_signature") or item["expression"])
+        for item in plan
+    ]
+    if len(plan) < 4:
+        return list(plan), {
+            "policy": "active_fill_structure_neighborhood_cap",
+            "max_structure_share": max_structure_share,
+            "unique_structure_neighborhoods": len(set(signatures)),
+            "max_structure_count": max(Counter(signatures).values()),
+            "rejected_for_concentration": 0,
+        }
+
+    cap = max(2, math.ceil(len(plan) * max(0.2, min(0.6, float(max_structure_share)))))
+    accepted: list[dict[str, Any]] = []
+    counts: Counter[str] = Counter()
+    rejected = 0
+    for item, signature in zip(plan, signatures):
+        if counts[signature] >= cap:
+            rejected += 1
+            if rejections is not None:
+                rejections.append({
+                    "expression": str(item.get("expression") or ""),
+                    "family": str(item.get("family") or ""),
+                    "reason": "active_fill_structure_concentration",
+                    "detail": f"structure neighborhood capped at {cap}/{len(plan)} supplied candidates",
+                })
+            continue
+        counts[signature] += 1
+        accepted.append(item)
+
+    accepted_signatures = [
+        str(extract_expression_metadata(item["expression"]).get("structure_signature") or item["expression"])
+        for item in accepted
+    ]
+    accepted_counts = Counter(accepted_signatures)
+    return accepted, {
+        "policy": "active_fill_structure_neighborhood_cap",
+        "max_structure_share": max_structure_share,
+        "structure_cap": cap,
+        "unique_structure_neighborhoods": len(accepted_counts),
+        "max_structure_count": max(accepted_counts.values()) if accepted_counts else 0,
+        "rejected_for_concentration": rejected,
+        "family_counts": dict(Counter(str(item.get("family") or "unknown") for item in accepted)),
+        "route_counts": dict(Counter(
+            "repair" if "wq-alpha-repair" in (item.get("skill_chain") or [])
+            else "diversify" if "wq-alpha-diversify" in (item.get("skill_chain") or [])
+            else "new_hypothesis"
+            for item in accepted
+        )),
+    }
 
 
 def build_chatgpt_plan(
@@ -2341,6 +2413,12 @@ def run_autonomous_research(
         seen_variants=seen_variants,
         rejections=skill_plan_rejections,
     )
+    skill_batch_diversity = None
+    if active_target_mode and strict_skill_mode:
+        skill_plan, skill_batch_diversity = enforce_active_fill_batch_diversity(
+            skill_plan,
+            rejections=skill_plan_rejections,
+        )
     legacy_budget = 0 if strict_skill_mode else max(0, exploration_budget - len(skill_plan))
     chatgpt_plan = build_chatgpt_plan(
         client,
@@ -2692,6 +2770,7 @@ def run_autonomous_research(
             "skill_candidate_batch_accepted": len(skill_plan),
             "skill_candidate_batch_rejected": len(skill_plan_rejections),
             "skill_candidate_rejection_reasons": dict(Counter(item.get("reason") for item in skill_plan_rejections)),
+            "skill_batch_diversity": skill_batch_diversity,
             "skill_batch_execution_status": (
                 "needs_replacement" if strict_skill_mode and skill_candidates and not skill_plan else "ready"
             ),

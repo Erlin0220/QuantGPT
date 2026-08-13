@@ -585,6 +585,26 @@ def test_skill_plan_reports_duplicate_history_rejection():
     }]
 
 
+def test_active_fill_batch_diversity_caps_same_structure_neighborhood():
+    plan = [
+        {"expression": "rank(ts_mean(close, 5))", "family": "price_volume", "skill_chain": []},
+        {"expression": "rank(ts_mean(close, 10))", "family": "price_volume", "skill_chain": []},
+        {"expression": "rank(ts_mean(close, 20))", "family": "price_volume", "skill_chain": []},
+        {"expression": "rank(ts_delta(close, 5))", "family": "momentum_reversal", "skill_chain": ["wq-alpha-diversify"]},
+        {"expression": "rank(volume)", "family": "price_volume", "skill_chain": ["wq-alpha-repair"]},
+    ]
+    rejections = []
+
+    accepted, report = autonomous.enforce_active_fill_batch_diversity(plan, rejections=rejections)
+
+    assert len(accepted) == 4
+    assert report["structure_cap"] == 2
+    assert report["rejected_for_concentration"] == 1
+    assert report["unique_structure_neighborhoods"] == 3
+    assert rejections[0]["reason"] == "active_fill_structure_concentration"
+    assert report["route_counts"] == {"new_hypothesis": 2, "diversify": 1, "repair": 1}
+
+
 def test_skill_plan_allows_unseen_single_setting_repair_for_seen_expression():
     class FakeClient:
         def list_operator_names(self):

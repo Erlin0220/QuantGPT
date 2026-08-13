@@ -92,6 +92,7 @@ def new_active_first_state(
         "end_reason": "submission_candidate_available" if submission_ready else None if remaining > 0 else "daily_active_target_reached",
         "next_action": "advance_candidate_to_submission_gate" if submission_ready else "generate_skill_candidate" if remaining > 0 else "replenishment",
         "remaining_active_target": remaining,
+        "campaign": deepcopy(policy.get("active_campaign") or {}),
         "max_iterations": max(1, int(max_iterations)),
         "counters": _base_counters(),
         "last_event": "session_started",
@@ -108,6 +109,8 @@ def apply_policy(state: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any
     updated = deepcopy(state)
     remaining = max(0, _int(policy.get("remaining_active_target")))
     updated["remaining_active_target"] = remaining
+    if policy.get("active_campaign") is not None:
+        updated["campaign"] = deepcopy(policy.get("active_campaign") or {})
     if remaining == 0:
         updated.update({
             "status": "COMPLETED",

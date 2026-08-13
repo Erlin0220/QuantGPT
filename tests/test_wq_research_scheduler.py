@@ -49,6 +49,30 @@ def test_cell_summary_tracks_research_candidate_and_formal_outcomes():
     assert row["recent_failure_reasons"] == {"low_fitness": 1}
 
 
+def test_cell_summary_learns_numeric_sc_risk_from_terminal_outcomes():
+    now = datetime.now(timezone.utc)
+    trials = [
+        {"alpha_id": "pass", "family": "fundamental_quality", "dataset_id": "fundamental6", "provenance_state": "resolved", "operator_pattern": "group_rank", "status": "candidate", "created_at": now},
+        {"alpha_id": "fail", "family": "fundamental_quality", "dataset_id": "fundamental6", "provenance_state": "resolved", "operator_pattern": "group_rank", "status": "candidate", "created_at": now},
+    ]
+    passed = {"alpha_id": "pass", "family": "fundamental_quality", "dataset_id": "fundamental6", "provenance_state": "resolved", "operator_pattern": "group_rank", "self_correlation": 0.58}
+    failed = {"alpha_id": "fail", "family": "fundamental_quality", "dataset_id": "fundamental6", "provenance_state": "resolved", "operator_pattern": "group_rank", "self_correlation": 0.86}
+
+    row = summarize_research_cells(
+        trials,
+        [passed, failed],
+        [({"alpha_id": "pass", "status": "ACTIVE"}, passed), ({"alpha_id": "fail", "status": "SC_FAIL"}, failed)],
+    )[0]
+
+    assert row["sc_samples"] == 2
+    assert row["sc_failures"] == 1
+    assert row["sc_fail_rate"] == 0.5
+    assert row["sc_pass_posterior"] == 0.5
+    assert row["mean_sc"] == 0.72
+    assert row["mean_sc_fail_excess"] == 0.16
+    assert row["sc_value_max"] == 0.86
+
+
 def test_submission_credit_stays_on_originating_trial_cell_when_candidate_metadata_changes():
     now = datetime.now(timezone.utc)
     trials = [{
@@ -250,6 +274,25 @@ def test_active_fill_overrides_cold_start_coverage_when_active_evidence_exists()
     assert allocation["exploration_slots"] == 0
     assert allocation["selected_cells"][0]["cell_key"] == active_cell["cell_key"]
     assert allocation["selected_cells"][0]["slots"] == 3
+
+
+def test_active_fill_penalizes_active_backed_cell_with_repeated_sc_failures():
+    clean = _cell("clean|fundamental6|group_rank", trials=4, candidates=1)
+    clean.update({"formal_submissions": 1, "active": 1, "sc_samples": 1, "sc_failures": 0, "sc_pass_posterior": 0.6667, "sc_fail_rate": 0.0, "mean_sc_fail_excess": 0.0})
+    risky = _cell("risky|fundamental6|group_rank", trials=4, candidates=1)
+    risky.update({"formal_submissions": 3, "active": 1, "terminal_failures": 2, "sc_samples": 3, "sc_failures": 2, "sc_pass_posterior": 0.4, "sc_fail_rate": 0.6667, "mean_sc_fail_excess": 0.12})
+
+    allocation = allocate_research_cells(
+        [risky, clean],
+        budget=4,
+        exploration_share=0.0,
+        inventory_mode="ACTIVE_FILL",
+    )
+
+    selected = {row["cell_key"]: row for row in allocation["selected_cells"]}
+    assert selected[clean["cell_key"]]["slots"] > selected.get(risky["cell_key"], {}).get("slots", 0)
+    summaries = {row["cell_key"]: row for row in allocation["cell_summaries"]}
+    assert summaries[clean["cell_key"]]["effective_allocation_score"] > summaries[risky["cell_key"]]["effective_allocation_score"]
 
 
 def test_active_fill_spends_exploitation_slots_only_on_active_backed_cells():
