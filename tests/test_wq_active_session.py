@@ -1,4 +1,5 @@
 from quantgpt.wq_active_session import (
+    apply_policy,
     apply_research_result,
     apply_submission_result,
     new_active_first_state,
@@ -37,6 +38,66 @@ def test_new_active_first_session_cannot_stop_while_target_remains():
     assert state["phase"] == "NEEDS_RESEARCH"
     assert state["session_stop_allowed"] is False
     assert state["remaining_active_target"] == 1
+
+
+def test_new_session_prioritizes_existing_submission_candidate():
+    policy = {
+        **_policy(2),
+        "remaining_submission_slots": 2,
+        "submission_candidate_top": [{"alpha_id": "recovered-ready"}],
+        "fallback_submission_candidate_count": 1,
+        "submission_frozen": False,
+        "submission_reconciliation_required": False,
+    }
+
+    state = new_active_first_state(account="primary", policy=policy, max_iterations=4)
+
+    assert state["phase"] == "NEEDS_SUBMISSION"
+    assert state["next_action"] == "advance_candidate_to_submission_gate"
+    assert state["end_reason"] == "submission_candidate_available"
+    assert state["session_stop_allowed"] is False
+
+
+def test_policy_refresh_promotes_continuation_to_submission_when_candidate_recovers():
+    state = apply_research_result(
+        _new_state(),
+        {"summary": {"simulated": 1}, "candidates": []},
+        {"skill_candidates": [_skill_candidate()]},
+    )
+    assert state["phase"] == "CONTINUE_REQUIRED"
+
+    refreshed = apply_policy(
+        state,
+        {
+            **_policy(1),
+            "remaining_submission_slots": 1,
+            "submission_candidate_top": [{"alpha_id": "platform-backfill"}],
+            "fallback_submission_candidate_count": 1,
+            "submission_frozen": False,
+            "submission_reconciliation_required": False,
+        },
+    )
+
+    assert refreshed["phase"] == "NEEDS_SUBMISSION"
+    assert refreshed["next_action"] == "advance_candidate_to_submission_gate"
+    assert refreshed["last_event"] == "submission_candidate_observed"
+    assert refreshed["session_stop_allowed"] is False
+
+
+def test_policy_refresh_does_not_offer_submission_when_reconciliation_is_required():
+    refreshed = apply_policy(
+        _new_state(),
+        {
+            **_policy(1),
+            "remaining_submission_slots": 1,
+            "submission_candidate_top": [{"alpha_id": "uncertain"}],
+            "fallback_submission_candidate_count": 1,
+            "submission_reconciliation_required": True,
+        },
+    )
+
+    assert refreshed["phase"] == "NEEDS_RESEARCH"
+    assert refreshed["next_action"] == "generate_skill_candidate"
 
 
 def test_zero_candidate_iteration_forces_continuation():

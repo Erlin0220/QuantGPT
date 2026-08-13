@@ -59,6 +59,21 @@ def _base_counters() -> dict[str, int]:
     }
 
 
+def _policy_has_submission_candidate(policy: dict[str, Any]) -> bool:
+    """Return whether policy already exposes a candidate that may use a daily slot."""
+    candidates = policy.get("submission_candidate_top") or []
+    fallback_count = max(0, _int(policy.get("fallback_submission_candidate_count")))
+    raw_slots = policy.get("remaining_submission_slots")
+    remaining_slots = (
+        max(0, _int(raw_slots))
+        if raw_slots is not None
+        else max(0, _int(policy.get("remaining_active_target")))
+    )
+    return bool(candidates or fallback_count) and remaining_slots > 0 and not bool(
+        policy.get("submission_frozen") or policy.get("submission_reconciliation_required")
+    )
+
+
 def new_active_first_state(
     *,
     account: str,
@@ -66,15 +81,16 @@ def new_active_first_state(
     max_iterations: int = _DEFAULT_MAX_ITERATIONS,
 ) -> dict[str, Any]:
     remaining = max(0, _int(policy.get("remaining_active_target")))
+    submission_ready = remaining > 0 and _policy_has_submission_candidate(policy)
     return {
         "version": 1,
         "account": account,
         "submission_day": submission_day(),
         "status": "RUNNING" if remaining > 0 else "COMPLETED",
-        "phase": "NEEDS_RESEARCH" if remaining > 0 else "DONE",
+        "phase": "NEEDS_SUBMISSION" if submission_ready else "NEEDS_RESEARCH" if remaining > 0 else "DONE",
         "session_stop_allowed": remaining == 0,
-        "end_reason": None if remaining > 0 else "daily_active_target_reached",
-        "next_action": "generate_skill_candidate" if remaining > 0 else "replenishment",
+        "end_reason": "submission_candidate_available" if submission_ready else None if remaining > 0 else "daily_active_target_reached",
+        "next_action": "advance_candidate_to_submission_gate" if submission_ready else "generate_skill_candidate" if remaining > 0 else "replenishment",
         "remaining_active_target": remaining,
         "max_iterations": max(1, int(max_iterations)),
         "counters": _base_counters(),
@@ -100,6 +116,18 @@ def apply_policy(state: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any
             "end_reason": "daily_active_target_reached",
             "next_action": "replenishment",
             "last_event": "active_target_observed",
+        })
+    elif _policy_has_submission_candidate(policy):
+        # Submission-ready platform/recovered candidates outrank more research.
+        # This is especially important for ACTIVE_FILL, where local robustness
+        # evidence is advisory and the official Submission Gate/SC is final.
+        updated.update({
+            "status": "RUNNING",
+            "phase": "NEEDS_SUBMISSION",
+            "session_stop_allowed": False,
+            "end_reason": "submission_candidate_available",
+            "next_action": "advance_candidate_to_submission_gate",
+            "last_event": "submission_candidate_observed",
         })
     updated["updated_at"] = datetime.now(timezone.utc).isoformat()
     return updated
