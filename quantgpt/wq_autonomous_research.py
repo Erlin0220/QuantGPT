@@ -923,6 +923,7 @@ def build_skill_plan(
     hypothesis: str,
     current_settings: dict[str, Any] | None = None,
     seen_variants: set[tuple[str, ...]] | None = None,
+    rejections: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Validate DevSpace skill-authored candidates and preserve their research provenance."""
     if limit <= 0 or not candidates:
@@ -939,22 +940,45 @@ def build_skill_plan(
         if _live_field_id(field)
     }
     out: list[dict[str, Any]] = []
+
+    def reject(raw_candidate: Any, reason: str, detail: str | None = None) -> None:
+        if rejections is None:
+            return
+        item = raw_candidate if isinstance(raw_candidate, dict) else {}
+        row: dict[str, Any] = {
+            "expression": str(item.get("expression") or "").strip(),
+            "family": str(item.get("family") or "").strip(),
+            "reason": reason,
+        }
+        if detail:
+            row["detail"] = detail[:300]
+        rejections.append(row)
+
     for raw_candidate in candidates:
         if len(out) >= limit:
-            break
-        if not isinstance(raw_candidate, dict) or validate_skill_candidate_contract(raw_candidate):
+            reject(raw_candidate, "batch_limit_exceeded")
+            continue
+        if not isinstance(raw_candidate, dict):
+            reject(raw_candidate, "invalid_candidate_type")
+            continue
+        contract_error = validate_skill_candidate_contract(raw_candidate)
+        if contract_error:
+            reject(raw_candidate, "skill_contract_rejected", contract_error)
             continue
         expression = str(raw_candidate.get("expression") or "").strip()
         validation = validate_wq_expression(expression, supported)
         if not validation.ok:
+            reject(raw_candidate, "expression_validation_rejected", str(validation.error or "invalid expression"))
             continue
         expression = validation.expression
         normalized = normalize_wq_expression(expression)
         if not normalized:
+            reject(raw_candidate, "empty_normalized_expression")
             continue
         if normalized in seen and not _settings_only_repair_allowed(
             raw_candidate, current_settings=current_settings, seen_variants=seen_variants
         ):
+            reject(raw_candidate, "duplicate_expression_history")
             continue
 
         # Skill-first candidates are authored after ChatGPT has read the live Data
@@ -989,6 +1013,7 @@ def build_skill_plan(
 
         allowed_fields = set(usable_fields) | set(declared_fields)
         if not _expression_uses_only_catalog_fields(expression, supported, allowed_fields):
+            reject(raw_candidate, "field_catalog_rejected")
             continue
         # Do not trust caller-declared field names by themselves: every non-core
         # field used by the expression must have been observed in either the
@@ -1006,6 +1031,7 @@ def build_skill_plan(
             and token not in field_items
         }
         if unresolved:
+            reject(raw_candidate, "unresolved_data_fields", ",".join(sorted(unresolved)))
             continue
         seen.add(normalized)
 
@@ -2303,6 +2329,7 @@ def run_autonomous_research(
     # server templates remain available only behind an explicit fallback opt-in.
     # ACTIVE_FILL therefore depends on ChatGPT supplying a *batch* of reviewed
     # skill candidates rather than one boutique expression per research round.
+    skill_plan_rejections: list[dict[str, Any]] = []
     skill_plan = build_skill_plan(
         client,
         skill_candidates,
@@ -2312,6 +2339,7 @@ def run_autonomous_research(
         hypothesis=goal,
         current_settings=effective_settings,
         seen_variants=seen_variants,
+        rejections=skill_plan_rejections,
     )
     legacy_budget = 0 if strict_skill_mode else max(0, exploration_budget - len(skill_plan))
     chatgpt_plan = build_chatgpt_plan(
@@ -2661,6 +2689,12 @@ def run_autonomous_research(
             "remaining_active_target": remaining_active_target,
             "research_strategy": research_strategy,
             "skill_candidate_batch_supplied": len(skill_candidates),
+            "skill_candidate_batch_accepted": len(skill_plan),
+            "skill_candidate_batch_rejected": len(skill_plan_rejections),
+            "skill_candidate_rejection_reasons": dict(Counter(item.get("reason") for item in skill_plan_rejections)),
+            "skill_batch_execution_status": (
+                "needs_replacement" if strict_skill_mode and skill_candidates and not skill_plan else "ready"
+            ),
             "skill_candidate_batch_target": min(max_simulations, 12) if active_target_mode and strict_skill_mode else None,
             "skill_candidate_batch_underfilled": bool(
                 active_target_mode and strict_skill_mode and len(skill_candidates) < min(max_simulations, 8)
@@ -2715,5 +2749,6 @@ def run_autonomous_research(
         "research_high_confidence_candidates": ready_candidates,
         "failed": all_failed,
         "invalid": all_invalid,
+        "skill_plan_rejections": skill_plan_rejections,
         "best": best,
     }

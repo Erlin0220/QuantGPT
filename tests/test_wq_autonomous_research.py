@@ -551,6 +551,40 @@ def test_skill_plan_preserves_devspace_provenance_and_live_dataset():
     assert plan[0]["hypothesis"].startswith("positive analyst revisions")
 
 
+def test_skill_plan_reports_duplicate_history_rejection():
+    class FakeClient:
+        def list_operator_names(self):
+            return {"rank"}
+
+    candidate = {
+        "expression": "rank(close)",
+        "hypothesis": "simple price ranking used only to verify duplicate diagnostics",
+        "family": "price_volume",
+        "skill_chain": ["wq-alpha-hypothesis", "wq-alpha-review", "wq-robustness-validation", "wq-candidate-evidence"],
+        "review_decision": "RUN",
+        "robustness_plan": {"mode": "skill_defined", "checks": [{"universe": "TOP1000", "purpose": "coverage sensitivity"}]},
+        "candidate_evidence_policy": {"mode": "calibrated_evidence_hierarchy"},
+    }
+    rejections = []
+
+    plan = autonomous.build_skill_plan(
+        FakeClient(),
+        [candidate],
+        [],
+        seen={autonomous.normalize_wq_expression("rank(close)")},
+        limit=1,
+        hypothesis="fallback goal",
+        rejections=rejections,
+    )
+
+    assert plan == []
+    assert rejections == [{
+        "expression": "rank(close)",
+        "family": "price_volume",
+        "reason": "duplicate_expression_history",
+    }]
+
+
 def test_skill_plan_allows_unseen_single_setting_repair_for_seen_expression():
     class FakeClient:
         def list_operator_names(self):
