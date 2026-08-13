@@ -1659,6 +1659,7 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
         budget_remaining = max(0, daily_budget - used_slots)
         remaining_active_target = max(0, daily_budget - active_today)
         daily_active_target_met = remaining_active_target == 0
+        research_strategy = "ACTIVE_FILL" if remaining_active_target > 0 else "INVENTORY_BUILD"
         inventory_status = {
             "floor": inventory_floor,
             "target_low": target_low,
@@ -1686,6 +1687,7 @@ async def get_submission_policy_status(account: str = "primary") -> dict[str, An
             "daily_active_count": active_today,
             "daily_active_target_met": daily_active_target_met,
             "remaining_active_target": remaining_active_target,
+            "research_strategy": research_strategy,
             "inflight_submission_count": inflight_today,
             "daily_submission_budget": daily_budget,
             "used_submission_slots": used_slots,

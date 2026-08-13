@@ -1923,8 +1923,11 @@ async def wq_brain_autonomous_research(
     QuantGPT 服务端不调用任何 LLM。
     ``max_simulations`` 是主研究 generations 的 Simulation 预算；Robustness Validation 使用独立、显式上报的有界预算，
     并严格执行 Skill 提供的 targeted robustness plan，不再使用固定跨 Universe/Neutralization 网格或 magic pass ratio。
-    Primary Pass 携带可审计 robustness evidence 后才进入正式候选库存。工具永远不会正式提交
-    Alpha，正式提交仍由 Submission Gate 控制。
+    当 daily ACTIVE 目标尚未完成时进入 ACTIVE_FILL：调用方应一次提供 8~12 个逐个通过上述 Skill 链的
+    RUN 候选，以批量 Simulation 提高召回；Primary eligibility pass 可进入 submission-candidate 层，
+    本地 robustness/correlation/overfit 只用于排序与诊断，最终仍由官方 Submission Gate/SC 判定。
+    达到 2 ACTIVE 后切换 INVENTORY_BUILD，只有带齐严格 robustness/evidence 的候选才计入高置信库存。
+    工具永远不会正式提交 Alpha，正式提交仍由 Submission Gate 控制。
 
     Returns:
         JSON with task_id. Uses the same single-flight ``wq_research`` gate as manual research.

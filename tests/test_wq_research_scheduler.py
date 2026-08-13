@@ -231,6 +231,47 @@ def test_selected_cell_order_keeps_active_evidence_ahead_of_terminal_failure_on_
     assert allocation["selected_cells"][0]["cell_key"] == "z_active|fundamental6|p"
 
 
+def test_active_fill_overrides_cold_start_coverage_when_active_evidence_exists():
+    active_cell = _cell("fundamental_quality|fundamental6|group_rank", trials=2, candidates=1)
+    active_cell["formal_submissions"] = 1
+    active_cell["active"] = 1
+    unexplored = _cell("novel|other1|rank", trials=0, candidates=0)
+
+    allocation = allocate_research_cells(
+        [active_cell, unexplored],
+        budget=3,
+        inventory_mode="ACTIVE_FILL",
+        learning_maturity={"scheduler_adaptation": {"ready": False}},
+    )
+
+    assert allocation["policy"] == "active_fill"
+    assert allocation["learning_status"] == "cold_start_active_fill_override"
+    assert allocation["cooldown_enabled"] is False
+    assert allocation["exploration_slots"] == 0
+    assert allocation["selected_cells"][0]["cell_key"] == active_cell["cell_key"]
+    assert allocation["selected_cells"][0]["slots"] == 3
+
+
+def test_active_fill_spends_exploitation_slots_only_on_active_backed_cells():
+    active_cell = _cell("fundamental_quality|fundamental6|group_rank", trials=12, candidates=2)
+    active_cell["formal_submissions"] = 2
+    active_cell["active"] = 2
+    high_candidate_no_active = _cell("analyst_revision|analyst4|rank", trials=4, candidates=3)
+
+    allocation = allocate_research_cells(
+        [active_cell, high_candidate_no_active],
+        budget=10,
+        exploration_share=0.5,
+        inventory_mode="ACTIVE_FILL",
+    )
+
+    selected = {row["cell_key"]: row for row in allocation["selected_cells"]}
+    assert allocation["policy"] == "active_fill"
+    assert allocation["exploration_share"] == 0.2
+    assert allocation["exploitation_slots"] == 8
+    assert selected[active_cell["cell_key"]]["slots"] >= 8
+
+
 def test_allocator_is_deterministic_for_same_input():
     cells = [_cell("a|d|p", trials=3, candidates=1), _cell("b|d|p", trials=3, candidates=0)]
     first = allocate_research_cells(cells, budget=7)

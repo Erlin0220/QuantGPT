@@ -96,6 +96,7 @@ async def test_daily_active_target_blocks_third_active_submission(policy_db):
     assert status["daily_active_count"] == 2
     assert status["daily_active_target_met"] is True
     assert status["remaining_active_target"] == 0
+    assert status["research_strategy"] == "INVENTORY_BUILD"
     assert status["used_submission_slots"] == 2
     assert status["remaining_submission_slots"] == 0
     assert status["pending_score_submissions"] == 2
@@ -142,6 +143,7 @@ async def test_sc_fail_releases_capacity_until_two_active(policy_db):
     assert after_fail["used_submission_slots"] == 0
     assert after_fail["failed_submission_attempts"] == 1
     assert after_fail["remaining_active_target"] == 2
+    assert after_fail["research_strategy"] == "ACTIVE_FILL"
 
     for alpha_id in ("retry-2", "retry-3"):
         decision = await reserve_submission("primary", alpha_id)

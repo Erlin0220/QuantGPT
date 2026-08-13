@@ -1072,6 +1072,10 @@ def test_strict_skill_mode_does_not_run_native_decay_rescue(monkeypatch):
     )
 
     assert result["mode"] == "skill_first"
+    assert result["research_strategy"] == "ACTIVE_FILL"
+    assert result["summary"]["skill_candidate_batch_supplied"] == 1
+    assert result["summary"]["skill_candidate_batch_target"] == 4
+    assert result["summary"]["skill_candidate_batch_underfilled"] is True
     assert result["summary"]["native_decay_rescue_parent"] is None
     assert result["summary"]["native_decay_rescue_values"] == []
     assert result["summary"]["native_decay_rescue_simulations"] == 0
@@ -1386,8 +1390,14 @@ def test_active_target_mode_defers_robustness_to_official_submission_gate(monkey
     )
 
     assert result["active_target_mode"] is True
+    assert result["research_strategy"] == "ACTIVE_FILL"
+    assert result["summary"]["research_strategy"] == "ACTIVE_FILL"
     assert result["summary"]["validation_cap"] == 0
+    assert result["summary"]["submission_eligible_candidates"] == 1
+    assert result["summary"]["research_high_confidence_candidates"] == 0
+    assert result["submission_candidates"] == result["candidates"]
     assert result["candidates"][0]["validation"]["status"] == "validation_pending"
+    assert result["research_high_confidence_candidates"] == []
     assert result["ready_candidates"] == []
 
 

@@ -35,10 +35,13 @@ def build_research_control_tower(
     """
     policy = submission_policy or {}
     inventory = _inventory_view(policy)
+    remaining_active_target = max(0, int(policy.get("remaining_active_target") or 0))
+    research_strategy = "ACTIVE_FILL" if remaining_active_target > 0 else "INVENTORY_BUILD"
+    allocation_mode = "ACTIVE_FILL" if research_strategy == "ACTIVE_FILL" else inventory["mode"]
     allocation = allocate_research_cells(
         memory.get("research_cells") or [],
         budget=max(1, int(research_budget)),
-        inventory_mode=inventory["mode"],
+        inventory_mode=allocation_mode,
         learning_maturity=memory.get("learning_maturity") or {},
     )
     selected = list(allocation.get("selected_cells") or [])
@@ -59,7 +62,10 @@ def build_research_control_tower(
         "learning_maturity": memory.get("learning_maturity") or {},
         "research_memory": memory.get("research_memory_guidance") or {},
         "scheduler": {
+            "research_strategy": research_strategy,
+            "remaining_active_target": remaining_active_target,
             "inventory_mode": inventory["mode"],
+            "allocation_mode": allocation_mode,
             "policy": allocation.get("policy"),
             "learning_status": allocation.get("learning_status"),
             "cooldown_enabled": allocation.get("cooldown_enabled"),
@@ -69,7 +75,13 @@ def build_research_control_tower(
             "selected_cells": selected,
             "next_focus": selected[0] if selected else None,
             "cooldown_cells": [item for item in allocation.get("cell_summaries") or [] if item.get("cooldown")],
-            "rationale": "coverage_first_until_learning_maturity" if allocation.get("policy") == "coverage_first" else "smoothed_adaptive_allocation",
+            "rationale": (
+                "active_backed_exploitation_with_bounded_exploration"
+                if research_strategy == "ACTIVE_FILL"
+                else "coverage_first_until_learning_maturity"
+                if allocation.get("policy") == "coverage_first"
+                else "smoothed_adaptive_allocation"
+            ),
         },
         "inventory": inventory,
         "correlation": memory.get("local_correlation_risk") or {},

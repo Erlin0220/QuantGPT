@@ -420,16 +420,24 @@ def allocate_research_cells(
             "cell_summaries": enriched,
             "cooldown_enabled": not cold_start,
         }
-    if cold_start:
+    if cold_start and mode != "ACTIVE_FILL":
         return _coverage_first(enriched, budget, mode)
 
     share = max(0.0, min(0.8, float(exploration_share)))
-    if mode in {"EXPLORATION", "OVER_TARGET", "HEALTHY"}:
+    if mode == "ACTIVE_FILL":
+        # Daily ACTIVE completion is a short-horizon exploitation problem. Keep
+        # a small exploration lane, but spend most slots on cells with actual
+        # downstream ACTIVE evidence instead of inventory coverage.
+        share = min(share, 0.2)
+    elif mode in {"EXPLORATION", "OVER_TARGET", "HEALTHY"}:
         share = max(share, 0.4)
     elif mode in {"REPLENISHMENT", "DEFICIT"}:
         share = min(share, 0.2)
 
-    exploration_slots = min(budget, max(1, ceil(budget * share)))
+    if mode == "ACTIVE_FILL" and budget < 4:
+        exploration_slots = 0
+    else:
+        exploration_slots = min(budget, max(1, ceil(budget * share)))
     exploitation_slots = budget - exploration_slots
     def exploitation_rank(item: dict[str, Any]) -> tuple[Any, ...]:
         # Keep the Candidate posterior as the quantitative model. Attributed
@@ -445,16 +453,21 @@ def allocate_research_cells(
         )
 
     exploit_order = sorted(enriched, key=exploitation_rank)
+    if mode == "ACTIVE_FILL":
+        active_backed = [item for item in exploit_order if int(item.get("active_evidence") or 0) > 0]
+        exploitation_pool = active_backed or exploit_order
+    else:
+        exploitation_pool = exploit_order
     explore_order = sorted(enriched, key=lambda item: (int(item.get("trials") or 0), item.get("last_sampled_at") or "", item["cell_key"]))
     allocations: Counter[str] = Counter()
     for _ in range(exploitation_slots):
         best_adjusted = max(
             item["allocation_score"] / (1.0 + allocations[item["cell_key"]] * 0.45)
-            for item in exploit_order
+            for item in exploitation_pool
         )
         tied = [
             item
-            for item in exploit_order
+            for item in exploitation_pool
             if abs(
                 item["allocation_score"] / (1.0 + allocations[item["cell_key"]] * 0.45)
                 - best_adjusted
@@ -494,8 +507,8 @@ def allocate_research_cells(
         selected.append(item)
     return {
         "budget": budget,
-        "policy": "adaptive",
-        "learning_status": "ready",
+        "policy": "active_fill" if mode == "ACTIVE_FILL" else "adaptive",
+        "learning_status": "cold_start_active_fill_override" if cold_start and mode == "ACTIVE_FILL" else "ready",
         "exploration_share": share,
         "exploration_slots": exploration_slots,
         "exploitation_slots": exploitation_slots,
@@ -503,5 +516,5 @@ def allocate_research_cells(
         "selected_cells": selected,
         "cell_summaries": enriched,
         "prior": {"alpha": _GLOBAL_PRIOR_ALPHA, "beta": _GLOBAL_PRIOR_BETA},
-        "cooldown_enabled": True,
+        "cooldown_enabled": not cold_start,
     }

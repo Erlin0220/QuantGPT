@@ -83,6 +83,7 @@ def test_control_tower_exposes_learning_loop_and_safeguards():
         {
             "daily_submission_budget": 2,
             "remaining_submission_slots": 1,
+            "remaining_active_target": 1,
             "submission_frozen": False,
             "inventory": {
                 "floor": 30,
@@ -107,8 +108,13 @@ def test_control_tower_exposes_learning_loop_and_safeguards():
     assert snapshot["inventory"]["target_low"] == 40
     assert snapshot["inventory"]["target_high"] == 50
     assert snapshot["inventory"]["tier_counts"]["A"] == 10
+    assert snapshot["scheduler"]["research_strategy"] == "ACTIVE_FILL"
+    assert snapshot["scheduler"]["allocation_mode"] == "ACTIVE_FILL"
+    assert snapshot["scheduler"]["policy"] == "active_fill"
+    assert snapshot["scheduler"]["exploration_share"] == 0.2
     assert snapshot["scheduler"]["inventory_mode"] == "REPLENISHMENT"
     assert snapshot["scheduler"]["next_focus"] is not None
+    assert snapshot["scheduler"]["next_focus"]["active_evidence"] > 0
     assert snapshot["points_feedback"]["coverage"]["usable_attempts"] == 2
     assert snapshot["calibration"]["samples"] == 10
     assert snapshot["overfitting"]["official_platform_check"] is False
@@ -143,5 +149,7 @@ def test_control_tower_preserves_inventory_defaults_and_sparse_evidence_neutrali
     assert snapshot["funnel"] == {}
     assert snapshot["correlation"] == {}
     assert snapshot["overfitting"] == {}
+    assert snapshot["scheduler"]["research_strategy"] == "INVENTORY_BUILD"
+    assert snapshot["scheduler"]["allocation_mode"] == "NORMAL"
     assert snapshot["scheduler"]["selected_cells"] == []
     assert snapshot["safeguards"]["daily_submission_budget"] == 2

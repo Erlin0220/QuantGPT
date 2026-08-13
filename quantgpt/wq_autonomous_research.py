@@ -2207,24 +2207,26 @@ def run_autonomous_research(
     inventory_mode = explicit_inventory_mode or (
         "REPLENISHMENT" if high_confidence_inventory < 30 else "EXPLORATION" if high_confidence_inventory > 50 else "NORMAL"
     )
-    adaptive_allocation = allocate_research_cells(
-        memory.get("research_cells") or [],
-        budget=first_budget,
-        inventory_mode=inventory_mode,
-        learning_maturity=memory.get("learning_maturity") or {},
-    )
-    memory["adaptive_allocation"] = adaptive_allocation
-    seen = set(normalized)
 
-    # While today's ACTIVE target is still open, bias harder toward sources with
-    # demonstrated platform conversion.  Once the target is filled, fall back to
-    # the normal inventory policy and rebuild a stricter candidate stockpile.
+    # Two different objectives share this engine but must not share the same
+    # allocation policy. Before two daily ACTIVE outcomes are reached, optimize
+    # short-horizon ACTIVE conversion; afterwards rebuild strict inventory.
     submission_state = memory.get("submission") or {}
     try:
         remaining_active_target = max(0, int(submission_state.get("remaining_active_target") or 0))
     except (TypeError, ValueError):
         remaining_active_target = 0
     active_target_mode = remaining_active_target > 0
+    research_strategy = "ACTIVE_FILL" if active_target_mode else "INVENTORY_BUILD"
+    allocation_mode = "ACTIVE_FILL" if active_target_mode else inventory_mode
+    adaptive_allocation = allocate_research_cells(
+        memory.get("research_cells") or [],
+        budget=first_budget,
+        inventory_mode=allocation_mode,
+        learning_maturity=memory.get("learning_maturity") or {},
+    )
+    memory["adaptive_allocation"] = adaptive_allocation
+    seen = set(normalized)
 
     # In inventory replenishment, exploit two sources that are much closer to
     # ACTIVE than random seeds: motifs from actual platform ACTIVE alphas and
@@ -2299,6 +2301,8 @@ def run_autonomous_research(
     # Skill-first candidates get first claim on the entire fresh research budget.
     # In strict mode they are the only source of new expressions; deterministic
     # server templates remain available only behind an explicit fallback opt-in.
+    # ACTIVE_FILL therefore depends on ChatGPT supplying a *batch* of reviewed
+    # skill candidates rather than one boutique expression per research round.
     skill_plan = build_skill_plan(
         client,
         skill_candidates,
@@ -2642,6 +2646,7 @@ def run_autonomous_research(
         "research_memory_guidance": memory.get("research_memory_guidance") or {},
         "knowledge_guidance": memory.get("knowledge_guidance") or {},
         "inventory_mode": inventory_mode,
+        "research_strategy": research_strategy,
         "active_target_mode": active_target_mode,
         "active_reference_profile": active_reference_profile,
         "live_catalog": live_catalog,
@@ -2654,6 +2659,12 @@ def run_autonomous_research(
             "generations_requested": generations,
             "generations_completed": len(generation_results),
             "remaining_active_target": remaining_active_target,
+            "research_strategy": research_strategy,
+            "skill_candidate_batch_supplied": len(skill_candidates),
+            "skill_candidate_batch_target": min(max_simulations, 12) if active_target_mode and strict_skill_mode else None,
+            "skill_candidate_batch_underfilled": bool(
+                active_target_mode and strict_skill_mode and len(skill_candidates) < min(max_simulations, 8)
+            ),
             "primary_simulation_budget": max_simulations,
             "primary_simulation_budget_scope": "research_generations_only",
             "native_decay_rescue_parent": (native_decay_parent or {}).get("alpha_id") if native_decay_parent else None,
@@ -2673,6 +2684,8 @@ def run_autonomous_research(
             "seed_expressions": len(seed_plan),
             "simulated": sum(int((item.get("summary") or {}).get("simulated") or 0) for item in generation_results),
             "primary_candidates": len(ranked_primary_candidates),
+            "submission_eligible_candidates": len(ranked_primary_candidates),
+            "research_high_confidence_candidates": len(ready_candidates),
             "candidates": len(ready_candidates),
             "validation_pending": sum(1 for item in ranked_primary_candidates if (item.get("validation") or {}).get("status") == "validation_pending"),
             "robustness_failed": sum(1 for item in ranked_primary_candidates if (item.get("validation") or {}).get("status") == "robustness_fail"),
@@ -2697,7 +2710,9 @@ def run_autonomous_research(
         "generations": generation_results,
         "results": all_results,
         "candidates": ranked_primary_candidates,
+        "submission_candidates": ranked_primary_candidates,
         "ready_candidates": ready_candidates,
+        "research_high_confidence_candidates": ready_candidates,
         "failed": all_failed,
         "invalid": all_invalid,
         "best": best,
