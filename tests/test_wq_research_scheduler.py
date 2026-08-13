@@ -295,6 +295,25 @@ def test_active_fill_penalizes_active_backed_cell_with_repeated_sc_failures():
     assert summaries[clean["cell_key"]]["effective_allocation_score"] > summaries[risky["cell_key"]]["effective_allocation_score"]
 
 
+def test_active_fill_final_slot_tightens_forced_exploration_to_ten_percent():
+    active_cell = _cell("fundamental_quality|fundamental6|group_rank", trials=12, candidates=2)
+    active_cell["formal_submissions"] = 2
+    active_cell["active"] = 2
+    unexplored = _cell("novel|other1|rank", trials=0, candidates=0)
+
+    allocation = allocate_research_cells(
+        [active_cell, unexplored],
+        budget=20,
+        exploration_share=0.5,
+        inventory_mode="ACTIVE_FILL",
+        remaining_active_target=1,
+    )
+
+    assert allocation["exploration_share"] == 0.1
+    assert allocation["exploration_slots"] == 2
+    assert allocation["exploitation_slots"] == 18
+
+
 def test_active_fill_spends_exploitation_slots_only_on_active_backed_cells():
     active_cell = _cell("fundamental_quality|fundamental6|group_rank", trials=12, candidates=2)
     active_cell["formal_submissions"] = 2

@@ -1091,6 +1091,7 @@ def enforce_active_fill_batch_diversity(
     *,
     rejections: list[dict[str, Any]] | None = None,
     max_structure_share: float = 0.4,
+    max_repairs_per_parent: int = 2,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Bound same-structure concentration before ACTIVE_FILL spends simulations.
 
@@ -1104,26 +1105,37 @@ def enforce_active_fill_batch_diversity(
             "unique_structure_neighborhoods": 0,
             "max_structure_count": 0,
             "rejected_for_concentration": 0,
+            "rejected_for_parent_repair_concentration": 0,
+            "max_repairs_per_parent": max(1, int(max_repairs_per_parent)),
         }
     signatures = [
         str(extract_expression_metadata(item["expression"]).get("structure_signature") or item["expression"])
         for item in plan
     ]
-    if len(plan) < 4:
-        return list(plan), {
-            "policy": "active_fill_structure_neighborhood_cap",
-            "max_structure_share": max_structure_share,
-            "unique_structure_neighborhoods": len(set(signatures)),
-            "max_structure_count": max(Counter(signatures).values()),
-            "rejected_for_concentration": 0,
-        }
-
-    cap = max(2, math.ceil(len(plan) * max(0.2, min(0.6, float(max_structure_share)))))
+    cap = max(2, math.ceil(len(plan) * max(0.2, min(0.6, float(max_structure_share))))) if len(plan) >= 4 else None
     accepted: list[dict[str, Any]] = []
     counts: Counter[str] = Counter()
+    repair_parent_counts: Counter[str] = Counter()
     rejected = 0
+    parent_rejected = 0
+    repair_parent_cap = max(1, int(max_repairs_per_parent))
     for item, signature in zip(plan, signatures):
-        if counts[signature] >= cap:
+        chain = set(item.get("skill_chain") or [])
+        parent_expression = str(item.get("parent_expression") or "").strip()
+        parent_key = None
+        if "wq-alpha-repair" in chain and parent_expression:
+            parent_key = normalize_wq_expression(parent_expression)
+            if repair_parent_counts[parent_key] >= repair_parent_cap:
+                parent_rejected += 1
+                if rejections is not None:
+                    rejections.append({
+                        "expression": str(item.get("expression") or ""),
+                        "family": str(item.get("family") or ""),
+                        "reason": "active_fill_parent_repair_concentration",
+                        "detail": f"repair parent capped at {repair_parent_cap} candidates per batch",
+                    })
+                continue
+        if cap is not None and counts[signature] >= cap:
             rejected += 1
             if rejections is not None:
                 rejections.append({
@@ -1133,6 +1145,8 @@ def enforce_active_fill_batch_diversity(
                     "detail": f"structure neighborhood capped at {cap}/{len(plan)} supplied candidates",
                 })
             continue
+        if parent_key is not None:
+            repair_parent_counts[parent_key] += 1
         counts[signature] += 1
         accepted.append(item)
 
@@ -1148,6 +1162,9 @@ def enforce_active_fill_batch_diversity(
         "unique_structure_neighborhoods": len(accepted_counts),
         "max_structure_count": max(accepted_counts.values()) if accepted_counts else 0,
         "rejected_for_concentration": rejected,
+        "rejected_for_parent_repair_concentration": parent_rejected,
+        "max_repairs_per_parent": repair_parent_cap,
+        "repair_parent_counts": dict(repair_parent_counts),
         "family_counts": dict(Counter(str(item.get("family") or "unknown") for item in accepted)),
         "route_counts": dict(Counter(
             "repair" if "wq-alpha-repair" in (item.get("skill_chain") or [])
@@ -2321,6 +2338,7 @@ def run_autonomous_research(
         memory.get("research_cells") or [],
         budget=first_budget,
         inventory_mode=allocation_mode,
+        remaining_active_target=remaining_active_target if active_target_mode else None,
         learning_maturity=memory.get("learning_maturity") or {},
     )
     memory["adaptive_allocation"] = adaptive_allocation

@@ -605,6 +605,31 @@ def test_active_fill_batch_diversity_caps_same_structure_neighborhood():
     assert report["route_counts"] == {"new_hypothesis": 2, "diversify": 1, "repair": 1}
 
 
+def test_active_fill_batch_diversity_caps_repairs_from_same_parent():
+    parent = "group_rank(ts_zscore(divide(ts_backfill(cashflow_op, 120), cap), 60), subindustry)"
+    plan = [
+        {
+            "expression": f"ts_decay_linear({parent}, {decay})",
+            "family": "fundamental_quality",
+            "parent_expression": parent,
+            "skill_chain": ["wq-alpha-repair"],
+        }
+        for decay in (3, 5, 7, 10)
+    ] + [
+        {"expression": "rank(ts_delta(close, 5))", "family": "momentum_reversal", "skill_chain": ["wq-alpha-diversify"]},
+        {"expression": "rank(volume)", "family": "price_volume", "skill_chain": []},
+    ]
+    rejections = []
+
+    accepted, report = autonomous.enforce_active_fill_batch_diversity(plan, rejections=rejections)
+
+    repairs = [item for item in accepted if "wq-alpha-repair" in item["skill_chain"]]
+    assert len(repairs) == 2
+    assert report["max_repairs_per_parent"] == 2
+    assert report["rejected_for_parent_repair_concentration"] == 2
+    assert sum(1 for item in rejections if item["reason"] == "active_fill_parent_repair_concentration") == 2
+
+
 def test_skill_plan_allows_unseen_single_setting_repair_for_seen_expression():
     class FakeClient:
         def list_operator_names(self):

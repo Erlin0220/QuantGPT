@@ -111,7 +111,7 @@ def test_control_tower_exposes_learning_loop_and_safeguards():
     assert snapshot["scheduler"]["research_strategy"] == "ACTIVE_FILL"
     assert snapshot["scheduler"]["allocation_mode"] == "ACTIVE_FILL"
     assert snapshot["scheduler"]["policy"] == "active_fill"
-    assert snapshot["scheduler"]["exploration_share"] == 0.2
+    assert snapshot["scheduler"]["exploration_share"] == 0.1
     assert snapshot["scheduler"]["inventory_mode"] == "REPLENISHMENT"
     assert snapshot["scheduler"]["next_focus"] is not None
     assert snapshot["scheduler"]["next_focus"]["active_evidence"] > 0

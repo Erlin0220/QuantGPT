@@ -42,6 +42,7 @@ def build_research_control_tower(
         memory.get("research_cells") or [],
         budget=max(1, int(research_budget)),
         inventory_mode=allocation_mode,
+        remaining_active_target=remaining_active_target if research_strategy == "ACTIVE_FILL" else None,
         learning_maturity=memory.get("learning_maturity") or {},
     )
     selected = list(allocation.get("selected_cells") or [])

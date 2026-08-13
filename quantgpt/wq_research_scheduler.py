@@ -400,6 +400,7 @@ def allocate_research_cells(
     budget: int,
     exploration_share: float = _DEFAULT_EXPLORATION_SHARE,
     inventory_mode: str = "NORMAL",
+    remaining_active_target: int | None = None,
     learning_maturity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Allocate research budget; use coverage-first policy until evidence is mature."""
@@ -472,8 +473,11 @@ def allocate_research_cells(
     if mode == "ACTIVE_FILL":
         # Daily ACTIVE completion is a short-horizon exploitation problem. Keep
         # a small exploration lane, but spend most slots on cells with actual
-        # downstream ACTIVE evidence instead of inventory coverage.
-        share = min(share, 0.2)
+        # downstream ACTIVE evidence instead of inventory coverage. When only
+        # the final ACTIVE remains, tighten exploration further without making
+        # it zero for non-trivial budgets.
+        target_remaining = max(0, int(remaining_active_target)) if remaining_active_target is not None else None
+        share = min(share, 0.1 if target_remaining == 1 else 0.2)
     elif mode in {"EXPLORATION", "OVER_TARGET", "HEALTHY"}:
         share = max(share, 0.4)
     elif mode in {"REPLENISHMENT", "DEFICIT"}:
