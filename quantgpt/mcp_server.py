@@ -2205,7 +2205,7 @@ async def wq_brain_account_status(account: str = "primary") -> str:
                 },
                 "candidate_funnel": memory.get("candidate_funnel", {}),
                 "learning_funnel": memory.get("learning_funnel", {}),
-                "research_cells": memory.get("research_cells", []),
+                "research_cells_omitted": len(memory.get("research_cells") or []),
                 "local_correlation_risk": memory.get("local_correlation_risk", {}),
                 "overfitting_evidence": memory.get("overfitting_evidence", {}),
                 "active_conversion": memory.get("active_conversion", {}),
