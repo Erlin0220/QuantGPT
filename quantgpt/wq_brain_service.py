@@ -657,8 +657,14 @@ def _normalize_level(value: Any) -> str | None:
     return None
 
 
-def run_account_status(client) -> dict:
-    """Return the BRAIN account progress needed by autonomous research loops."""
+def run_account_status(client, *, allow_alpha_count_fallback: bool = True) -> dict:
+    """Return the BRAIN account progress needed by autonomous research loops.
+
+    ``allow_alpha_count_fallback=False`` keeps latency bounded for MCP status calls.
+    BRAIN's alpha-summary endpoint may omit submission-state counts; enumerating the
+    full alpha history is useful for offline reconciliation but must not delay the
+    Points/level truth path.
+    """
     user_info = client.get_user_info()
     if not user_info:
         return {"ok": False, "error": "Failed to fetch BRAIN user info"}
@@ -666,7 +672,9 @@ def run_account_status(client) -> dict:
     user_id = str(user_info.get("id") or "").strip()
     competitions = client.get_user_competitions(user_id) if user_id else {}
     alpha_summary = client.get_user_alpha_summary()
-    if not any(key in alpha_summary for key in ("active", "unsubmitted", "decommissioned")):
+    if allow_alpha_count_fallback and not any(
+        key in alpha_summary for key in ("active", "unsubmitted", "decommissioned")
+    ):
         fallback_counts = {"active": 0, "unsubmitted": 0, "decommissioned": 0}
         offset = 0
         for _ in range(100):

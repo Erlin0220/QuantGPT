@@ -349,6 +349,22 @@ class TestAccountStatusService:
         assert result["points_status"] == "SYNC_UNKNOWN"
 
     @patch("quantgpt.wq_brain_service.run_list_alphas")
+    def test_can_skip_expensive_alpha_count_fallback(self, mock_list_alphas):
+        client = MagicMock()
+        client.get_user_info.return_value = {"id": "U1", "geniusLevel": "GOLD", "level": "GOLD"}
+        client.get_user_competitions.return_value = {
+            "results": [{"id": "challenge", "leaderboard": {"score": 11939.0, "level": "GOLD"}}],
+        }
+        client.get_user_alpha_summary.return_value = {"is": {}, "os": {}}
+
+        result = run_account_status(client, allow_alpha_count_fallback=False)
+
+        assert result["points"] == 11939
+        assert result["genius_level"] == "GOLD"
+        assert result["alpha_counts"]["active"] is None
+        mock_list_alphas.assert_not_called()
+
+    @patch("quantgpt.wq_brain_service.run_list_alphas")
     def test_falls_back_to_paginated_alpha_counts(self, mock_list_alphas):
         client = MagicMock()
         client.get_user_info.return_value = {"id": "U1", "geniusLevel": None, "level": "NONE"}

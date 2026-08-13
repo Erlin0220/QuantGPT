@@ -2088,7 +2088,11 @@ async def wq_brain_account_status(account: str = "primary") -> str:
         authenticated = await asyncio.to_thread(client.authenticate)
         if not authenticated:
             return json.dumps({"error": "WQ BRAIN 认证失败"})
-        result = await asyncio.to_thread(run_account_status, client)
+        result = await asyncio.to_thread(
+            run_account_status,
+            client,
+            allow_alpha_count_fallback=False,
+        )
         if account == "primary" and result.get("ok"):
             platform_candidate_backfill = await asyncio.to_thread(
                 run_list_alphas,
