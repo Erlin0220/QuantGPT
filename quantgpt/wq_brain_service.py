@@ -20,10 +20,50 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable
 
-from .wq_brain_client import HTTP_TIMEOUT
+import requests
+
+from .wq_brain_client import HTTP_TIMEOUT, build_wq_error
 from .wq_operator_registry import WQ_FALLBACK_OPERATORS, validate_wq_expression
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_request_id(client, request_id: str | None = None) -> str | None:
+    resolved = request_id or getattr(client, "request_id", None)
+    if resolved and getattr(client, "request_id", None) != resolved:
+        client.request_id = resolved
+        session = getattr(client, "_session", None)
+        if session is not None and hasattr(session, "request_id"):
+            session.request_id = resolved
+    return resolved
+
+
+def _with_request_id(payload: dict, request_id: str | None) -> dict:
+    if request_id:
+        payload.setdefault("request_id", request_id)
+    return payload
+
+
+def _service_error(
+    client,
+    message: str,
+    *,
+    request_id: str | None = None,
+    kind: str = "service_error",
+    http_status: int | None = None,
+    retryable: bool = False,
+    **extra,
+) -> dict:
+    resolved = _resolve_request_id(client, request_id)
+    return build_wq_error(
+        message,
+        request_id=resolved,
+        layer="wq_service",
+        kind=kind,
+        http_status=http_status,
+        retryable=retryable,
+        **extra,
+    )
 
 
 def _env_int(name: str, default: int, minimum: int = 1) -> int:
@@ -312,17 +352,25 @@ def run_single_simulation(
     check_cancelled: Callable[[], bool] | None = None,
     submission_guard: Callable[[str], dict | bool] | None = None,
     submission_result_callback: Callable[[str, dict], None] | None = None,
+    request_id: str | None = None,
 ) -> dict:
     """Simulate one expression and optionally auto-submit. Returns result dict."""
+    request_id = _resolve_request_id(client, request_id)
     canonical_expression, validation_error, operator_catalog_source = prepare_wq_expression(client, expression)
     if validation_error:
-        return {"ok": False, "error": validation_error}
+        return _service_error(client, validation_error, request_id=request_id, kind="validation_error")
     assert canonical_expression is not None
     expression = canonical_expression
 
     acquired = _acquire_global_simulation_slot(check_cancelled)
     if acquired is None:
-        return {"ok": False, "cancelled": True, "error": "WQ simulation cancelled"}
+        return _service_error(
+            client,
+            "WQ simulation cancelled",
+            request_id=request_id,
+            kind="cancelled",
+            cancelled=True,
+        )
     try:
         result = client.simulate(
             expression,
@@ -339,11 +387,15 @@ def run_single_simulation(
         _release_global_simulation_slot(acquired)
 
     if not result.get("ok"):
-        return {
+        error_result = {
             "ok": False,
             "cancelled": bool(result.get("cancelled")),
             "error": result.get("error", "Simulation failed"),
         }
+        for key in ("request_id", "layer", "kind", "http_status", "retryable"):
+            if key in result:
+                error_result[key] = result.get(key)
+        return _with_request_id(error_result, request_id)
 
     alpha_id = result.get("alpha_id")
     is_data = result.get("is", {})
@@ -376,6 +428,7 @@ def run_single_simulation(
 
     out = {
         "ok": True,
+        "request_id": request_id,
         "expression": expression,
         "alpha_id": alpha_id,
         "is_metrics": is_data,
@@ -406,11 +459,13 @@ def run_batch_simulation(
     check_cancelled: Callable[[], bool] | None = None,
     submission_guard: Callable[[str], dict | bool] | None = None,
     submission_result_callback: Callable[[str, dict], None] | None = None,
+    request_id: str | None = None,
 ) -> dict:
     """Sweep expression over region×delay×universe×neutralization grid. Returns result dict."""
+    request_id = _resolve_request_id(client, request_id)
     canonical_expression, validation_error, _operator_catalog_source = prepare_wq_expression(client, expression)
     if validation_error:
-        return {"ok": False, "error": validation_error}
+        return _service_error(client, validation_error, request_id=request_id, kind="validation_error")
     assert canonical_expression is not None
     expression = canonical_expression
 
@@ -437,7 +492,7 @@ def run_batch_simulation(
         )
 
         if not sim_result.get("ok"):
-            return {
+            failed = {
                 "key": key,
                 "region": region,
                 "delay": delay_val,
@@ -446,6 +501,10 @@ def run_batch_simulation(
                 "status": "failed",
                 "error": sim_result.get("error", "unknown"),
             }
+            for field in ("request_id", "layer", "kind", "http_status", "retryable"):
+                if field in sim_result:
+                    failed[field] = sim_result.get(field)
+            return failed
 
         alpha_id = sim_result.get("alpha_id")
         is_data = sim_result.get("is", {})
@@ -510,7 +569,7 @@ def run_batch_simulation(
     out = _aggregate_batch_result(expression, len(combos), sub_results)
     out["concurrency"] = concurrency
     out["cancelled"] = cancelled
-    return out
+    return _with_request_id(out, request_id)
 
 
 def reconcile_submission_uncertainty(client, account: str = "primary") -> dict[str, Any]:
@@ -568,8 +627,10 @@ def run_submit_by_ids(
     on_each_done: Callable[[str, dict], None] | None = None,
     submission_guard: Callable[[str], dict | bool] | None = None,
     submission_result_callback: Callable[[str, dict], None] | None = None,
+    request_id: str | None = None,
 ) -> dict:
     """Submit a list of already-simulated alphas. Returns summary dict."""
+    request_id = _resolve_request_id(client, request_id)
     results: dict[str, dict] = {}
     active = sc_fail = timeout = blocked = 0
 
@@ -584,12 +645,16 @@ def run_submit_by_ids(
         allowed = decision if isinstance(decision, bool) else bool(decision.get("allowed"))
         if not allowed:
             blocked += 1
-            entry = {
-                "ok": False,
-                "final_status": "POLICY_BLOCKED",
-                "detail": "submission blocked by local daily policy",
-                "submission_policy": decision if isinstance(decision, dict) else {"allowed": False},
-            }
+            entry = build_wq_error(
+                "submission blocked by local daily policy",
+                request_id=request_id,
+                layer="wq_service",
+                kind="policy_blocked",
+                retryable=False,
+                final_status="POLICY_BLOCKED",
+                detail="submission blocked by local daily policy",
+                submission_policy=decision if isinstance(decision, dict) else {"allowed": False},
+            )
             results[alpha_id] = entry
             if on_each_done:
                 on_each_done(alpha_id, entry)
@@ -601,10 +666,14 @@ def run_submit_by_ids(
         result = client.submit_alpha(alpha_id)
         entry: dict[str, Any] = {
             "ok": result.get("ok", False),
+            "request_id": result.get("request_id") or request_id,
             "detail": result.get("detail", ""),
             "platform_status": result.get("platform_status", ""),
             "status_code": result.get("status_code"),
         }
+        for field in ("layer", "kind", "http_status", "retryable"):
+            if field in result:
+                entry[field] = result.get(field)
         if result.get("sc_value") is not None:
             entry["sc_value"] = result["sc_value"]
             entry["sc_limit"] = result.get("sc_limit")
@@ -636,6 +705,7 @@ def run_submit_by_ids(
             on_each_done(alpha_id, entry)
 
     return {
+        "request_id": request_id,
         "total": len(alpha_ids),
         "active": active,
         "sc_fail": sc_fail,
@@ -657,7 +727,12 @@ def _normalize_level(value: Any) -> str | None:
     return None
 
 
-def run_account_status(client, *, allow_alpha_count_fallback: bool = True) -> dict:
+def run_account_status(
+    client,
+    *,
+    allow_alpha_count_fallback: bool = True,
+    request_id: str | None = None,
+) -> dict:
     """Return the BRAIN account progress needed by autonomous research loops.
 
     ``allow_alpha_count_fallback=False`` keeps latency bounded for MCP status calls.
@@ -665,9 +740,19 @@ def run_account_status(client, *, allow_alpha_count_fallback: bool = True) -> di
     full alpha history is useful for offline reconciliation but must not delay the
     Points/level truth path.
     """
+    request_id = _resolve_request_id(client, request_id)
     user_info = client.get_user_info()
     if not user_info:
-        return {"ok": False, "error": "Failed to fetch BRAIN user info"}
+        last_error = getattr(client, "last_error", None)
+        if isinstance(last_error, dict):
+            return _with_request_id(dict(last_error), request_id)
+        return _service_error(
+            client,
+            "Failed to fetch BRAIN user info",
+            request_id=request_id,
+            kind="account_status_unavailable",
+            retryable=True,
+        )
 
     user_id = str(user_info.get("id") or "").strip()
     competitions = client.get_user_competitions(user_id) if user_id else {}
@@ -711,7 +796,10 @@ def run_account_status(client, *, allow_alpha_count_fallback: bool = True) -> di
     raw_progress_score = progress.get("score")
     progress_score = raw_progress_score if isinstance(raw_progress_score, dict) else {}
 
-    points = safe_float(leaderboard.get("score"))
+    challenge_scoring = str(challenge.get("scoring") or "").strip().upper()
+    leaderboard_score = safe_float(leaderboard.get("score"))
+    leaderboard_score_is_points = challenge_scoring != "PERFORMANCE"
+    points = leaderboard_score if leaderboard_score_is_points else None
     points_source = "challenge.leaderboard.score" if points is not None else None
     if points is None:
         genius_data = user_info.get("geniusLevel")
@@ -766,12 +854,21 @@ def run_account_status(client, *, allow_alpha_count_fallback: bool = True) -> di
 
     target_points = 10_000
     points_value = int(points) if points is not None and float(points).is_integer() else points
+    leaderboard_score_value = (
+        int(leaderboard_score)
+        if leaderboard_score is not None and float(leaderboard_score).is_integer()
+        else leaderboard_score
+    )
     points_remaining = None if points is None else max(0, target_points - points)
     if points_remaining is not None and float(points_remaining).is_integer():
         points_remaining = int(points_remaining)
-    gold_reached = genius_level == "GOLD"
+    gold_reached = genius_level in {"GOLD", "GRANDMASTER"} or consultant_level in {"GOLD", "GRANDMASTER"}
     if points is None:
-        points_status = "UNAVAILABLE"
+        # Challenge PERFORMANCE leaderboards expose a performance metric (for
+        # example 0.36), not cumulative Challenge Points. Keep the Points
+        # channel explicitly unresolved so callers can fall back to the last
+        # trusted Points observation without corrupting the local ledger.
+        points_status = "SYNC_UNKNOWN" if challenge_scoring == "PERFORMANCE" and leaderboard_score is not None else "UNAVAILABLE"
     elif active is None or leaderboard_alpha_count is None:
         # Points can only be considered settled when both platform ACTIVE count
         # and Challenge leaderboard Alpha count are known. Treat missing count
@@ -790,6 +887,7 @@ def run_account_status(client, *, allow_alpha_count_fallback: bool = True) -> di
 
     return {
         "ok": True,
+        "request_id": request_id,
         "points": points_value,
         "points_source": points_source,
         "points_status": points_status,
@@ -810,7 +908,8 @@ def run_account_status(client, *, allow_alpha_count_fallback: bool = True) -> di
         },
         "leaderboard": {
             "rank": leaderboard_rank,
-            "score": points_value,
+            "score": leaderboard_score_value,
+            "score_semantics": challenge_scoring or None,
             "level": _normalize_level(leaderboard.get("level")),
             "alpha_count": leaderboard_alpha_count,
             "active_alpha_gap": active_alpha_gap,
@@ -825,14 +924,24 @@ def run_account_status(client, *, allow_alpha_count_fallback: bool = True) -> di
     }
 
 
-def run_check_alphas(client, alpha_ids: list[str]) -> dict:
+def run_check_alphas(
+    client,
+    alpha_ids: list[str],
+    *,
+    request_id: str | None = None,
+) -> dict:
     """Check platform status of multiple alphas. Returns summary + per-alpha dict."""
+    request_id = _resolve_request_id(client, request_id)
     results: dict[str, dict] = {}
 
     for alpha_id in alpha_ids:
         data = client.check_alpha_status(alpha_id)
         if not data.get("ok"):
-            results[alpha_id] = {"ok": False, "error": data.get("error", "not found")}
+            failed = {"ok": False, "error": data.get("error", "not found")}
+            for field in ("request_id", "layer", "kind", "http_status", "retryable"):
+                if field in data:
+                    failed[field] = data.get(field)
+            results[alpha_id] = _with_request_id(failed, request_id)
             continue
 
         is_data = data.get("is", {})
@@ -859,7 +968,7 @@ def run_check_alphas(client, alpha_ids: list[str]) -> dict:
         "sc_fail": sum(1 for r in results.values() if r.get("sc_result") == "FAIL"),
         "sc_pending": sum(1 for r in results.values() if r.get("sc_result") == "PENDING"),
     }
-    return {"summary": summary, "alphas": results}
+    return {"request_id": request_id, "summary": summary, "alphas": results}
 
 
 def run_list_alphas(
@@ -868,21 +977,39 @@ def run_list_alphas(
     offset: int = 0,
     min_fitness: float | None = None,
     status_filter: str | None = None,
+    request_id: str | None = None,
 ) -> dict:
     """List alphas from the platform with optional filtering."""
+    request_id = _resolve_request_id(client, request_id)
     s = client._get_session()
     params = {"limit": min(limit, 100), "offset": offset, "order": "-dateCreated"}
     normalized_status = str(status_filter or "").strip().upper()
     if normalized_status:
         params["status"] = normalized_status
 
-    r = s.get(
-        "https://api.worldquantbrain.com/users/self/alphas",
-        params=params,
-        timeout=HTTP_TIMEOUT,
-    )
+    try:
+        r = s.get(
+            "https://api.worldquantbrain.com/users/self/alphas",
+            params=params,
+            timeout=HTTP_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        return _service_error(
+            client,
+            f"Failed to list BRAIN alphas: {exc}",
+            request_id=request_id,
+            kind=type(exc).__name__,
+            retryable=True,
+        )
     if r.status_code != 200:
-        return {"ok": False, "error": f"HTTP {r.status_code}: {r.text[:300]}"}
+        return _service_error(
+            client,
+            f"HTTP {r.status_code}: {r.text[:300]}",
+            request_id=request_id,
+            kind="http_error",
+            http_status=r.status_code,
+            retryable=r.status_code in {408, 425, 429, 500, 502, 503, 504},
+        )
 
     data = r.json()
     raw_alphas = data if isinstance(data, list) else data.get("results", [])
@@ -915,7 +1042,7 @@ def run_list_alphas(
             }
         )
 
-    return {"ok": True, "total": len(alphas), "alphas": alphas}
+    return {"ok": True, "request_id": request_id, "total": len(alphas), "alphas": alphas}
 
 
 # ---------------------------------------------------------------------------

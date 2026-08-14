@@ -7,7 +7,7 @@ import pytest
 import requests
 
 from quantgpt.wq_brain_client import WQBrainClient, configured_accounts, get_client, is_configured
-from quantgpt.wq_brain_service import run_account_status, run_list_alphas, run_submit_by_ids
+from quantgpt.wq_brain_service import run_account_status, run_list_alphas, run_single_simulation, run_submit_by_ids
 
 
 class TestIsConfigured:
@@ -78,6 +78,28 @@ class TestWQBrainClient:
     def test_close_without_session(self):
         c = WQBrainClient(email="a", password="b")
         c.close()
+
+    def test_http_log_contains_request_id_and_502_status(self, caplog):
+        c = WQBrainClient(email="a", password="b", request_id="req-http-log")
+        response = MagicMock(status_code=502)
+        response.raw.retries.history = ()
+
+        with patch.object(requests.Session, "request", return_value=response), caplog.at_level("WARNING"):
+            c._get_session().get("https://api.worldquantbrain.com/test")
+
+        assert "request_id=req-http-log" in caplog.text
+        assert "status=502" in caplog.text
+
+    def test_http_log_keeps_transient_502_retry_history(self, caplog):
+        c = WQBrainClient(email="a", password="b", request_id="req-retry-log")
+        response = MagicMock(status_code=200)
+        response.raw.retries.history = (MagicMock(status=502, error=None),)
+
+        with patch.object(requests.Session, "request", return_value=response), caplog.at_level("WARNING"):
+            c._get_session().get("https://api.worldquantbrain.com/test")
+
+        assert "WQ HTTP retry request_id=req-retry-log" in caplog.text
+        assert "status=502" in caplog.text
 
     def test_authenticate_success(self):
         c = WQBrainClient(email="a@b.com", password="pw")
@@ -155,6 +177,35 @@ class TestWQBrainClient:
         assert c.get_user_alpha_summary()["active"] == 1
         assert mock_session.get.call_args_list[0].args[0].endswith("/users/U1/competitions")
         assert mock_session.get.call_args_list[1].args[0].endswith("/users/self/alphas/summary")
+
+
+class TestRequestCorrelationService:
+    def test_single_simulation_preserves_structured_502_error(self):
+        request_id = "req-service-502"
+        client = MagicMock()
+        client.request_id = request_id
+        client.list_operator_names.return_value = {"rank"}
+        client.simulate.return_value = {
+            "ok": False,
+            "error": "HTTP 502: bad gateway",
+            "request_id": request_id,
+            "layer": "wq_http",
+            "kind": "http_error",
+            "http_status": 502,
+            "retryable": True,
+        }
+
+        result = run_single_simulation(
+            client,
+            "rank(close)",
+            request_id=request_id,
+        )
+
+        assert result["request_id"] == request_id
+        assert result["layer"] == "wq_http"
+        assert result["kind"] == "http_error"
+        assert result["http_status"] == 502
+        assert result["retryable"] is True
 
 
 class TestSubmitByIdsService:
@@ -276,6 +327,36 @@ class TestAccountStatusService:
             "unsubmitted": 12,
             "decommissioned": 1,
         }
+        assert result["goal_reached"] is False
+
+    def test_performance_leaderboard_score_is_not_treated_as_points(self):
+        client = MagicMock()
+        client.get_user_info.return_value = {
+            "id": "U1",
+            "geniusLevel": None,
+            "level": "GOLD",
+            "onboarding": None,
+        }
+        client.get_user_competitions.return_value = {
+            "results": [{
+                "id": "challenge",
+                "status": "ACCEPTED",
+                "scoring": "PERFORMANCE",
+                "leaderboard": {"rank": 2318, "score": 0.36, "level": None},
+                "progress": {"level": "GRANDMASTER", "score": {"remaining": 0.64}},
+            }],
+        }
+        client.get_user_alpha_summary.return_value = {"is": {}, "os": {}}
+
+        result = run_account_status(client, allow_alpha_count_fallback=False)
+
+        assert result["points"] is None
+        assert result["points_source"] is None
+        assert result["points_status"] == "SYNC_UNKNOWN"
+        assert result["leaderboard"]["score"] == 0.36
+        assert result["leaderboard"]["score_semantics"] == "PERFORMANCE"
+        assert result["consultant_level"] == "GOLD"
+        assert result["gold_reached"] is True
         assert result["goal_reached"] is False
 
     def test_does_not_treat_next_level_as_current_level(self):

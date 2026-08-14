@@ -265,6 +265,24 @@ async def test_lagging_points_do_not_settle_until_leaderboard_is_current(policy_
 
 
 @pytest.mark.asyncio
+async def test_non_points_leaderboard_observation_preserves_last_points(policy_db):
+    seeded = await observe_account_status("primary", _current_points(11939))
+    assert seeded["last_observed_points"] == 11939
+
+    unresolved = await observe_account_status(
+        "primary",
+        {
+            "points": None,
+            "points_status": "SYNC_UNKNOWN",
+            "leaderboard": {"score": 0.36, "score_semantics": "PERFORMANCE", "active_alpha_gap": None},
+        },
+    )
+
+    assert unresolved["last_observed_points"] == 11939
+    assert unresolved["last_points_status"] == "SYNC_UNKNOWN"
+
+
+@pytest.mark.asyncio
 async def test_points_settlement_records_confidence_weighted_research_feedback(policy_db):
     import quantgpt.db as db
 

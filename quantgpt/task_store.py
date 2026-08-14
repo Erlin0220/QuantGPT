@@ -108,6 +108,9 @@ def cleanup_reports(user_id: str | None = None):
 def sanitize_task_response(task_dict: dict) -> dict:
     if not isinstance(task_dict, dict):
         return task_dict
+    params = task_dict.get("params") or {}
+    if isinstance(params, dict) and params.get("request_id"):
+        task_dict.setdefault("request_id", params.get("request_id"))
     if task_dict.get("status") in ("completed", "iteration_completed"):
         task_dict["progress"] = 100
         if task_dict.get("progress_total") is not None:
@@ -155,13 +158,17 @@ async def _persist_task_impl(task_id: str, user_id: str, task_data: dict, report
             if isinstance(real_completed, (int, float)):
                 ts_completed = datetime.fromtimestamp(real_completed, tz=timezone.utc)
 
+            params = dict(task_data.get("params") or {})
+            request_id = task_data.get("request_id") or params.get("request_id")
+            if request_id:
+                params["request_id"] = request_id
             task_record = TaskModel(
                 id=task_id,
                 user_id=uuid_mod.UUID(user_id) if isinstance(user_id, str) else user_id,
                 session_id=session_id,
                 status=task_data.get("status", "failed"),
                 task_type=task_data.get("task_type", "backtest"),
-                params=task_data.get("params"),
+                params=params,
                 expression=task_data.get("expression"),
                 result=task_data.get("result"),
                 error=task_data.get("error"),
@@ -189,7 +196,7 @@ async def _persist_task_impl(task_id: str, user_id: str, task_data: dict, report
                         sess_record.name = prompt[:30]
 
             await session.commit()
-            logger.info(f"[{task_id}] persisted to DB")
+            logger.info("[%s] persisted to DB request_id=%s", task_id, request_id)
         except Exception as e:
             await session.rollback()
             logger.error(f"[{task_id}] DB persist failed: {e}")

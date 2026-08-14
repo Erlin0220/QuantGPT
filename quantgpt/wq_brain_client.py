@@ -52,6 +52,76 @@ _ACCOUNT_ENV = {
     "primary": ("WQ_BRAIN_EMAIL", "WQ_BRAIN_PASSWORD"),
     "alt": ("WQ_BRAIN_ALT_EMAIL", "WQ_BRAIN_ALT_PASSWORD"),
 }
+_RETRYABLE_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+
+def build_wq_error(
+    message: str,
+    *,
+    request_id: str | None,
+    layer: str,
+    kind: str,
+    http_status: int | None = None,
+    retryable: bool = False,
+    **extra,
+) -> dict:
+    """Build the stable cross-layer error contract returned to MCP callers."""
+    return {
+        "ok": False,
+        "error": message,
+        "request_id": request_id,
+        "layer": layer,
+        "kind": kind,
+        "http_status": http_status,
+        "retryable": bool(retryable),
+        **extra,
+    }
+
+
+class _RequestLoggingSession(requests.Session):
+    """requests Session that logs the final BRAIN HTTP outcome with correlation id."""
+
+    def __init__(self, request_id: str | None):
+        super().__init__()
+        self.request_id = request_id
+
+    def request(self, method, url, *args, **kwargs):
+        started = time.monotonic()
+        try:
+            response = super().request(method, url, *args, **kwargs)
+        except requests.RequestException as exc:
+            logger.warning(
+                "WQ HTTP request failed request_id=%s method=%s url=%s duration_ms=%s kind=%s error=%s",
+                self.request_id,
+                str(method).upper(),
+                url,
+                round((time.monotonic() - started) * 1000),
+                type(exc).__name__,
+                exc,
+            )
+            raise
+        retry_state = getattr(getattr(response, "raw", None), "retries", None)
+        for retry_event in getattr(retry_state, "history", ()) or ():
+            logger.warning(
+                "WQ HTTP retry request_id=%s method=%s url=%s status=%s kind=%s",
+                self.request_id,
+                str(method).upper(),
+                url,
+                getattr(retry_event, "status", None),
+                type(getattr(retry_event, "error", None)).__name__
+                if getattr(retry_event, "error", None)
+                else None,
+            )
+        log = logger.warning if response.status_code >= 500 else logger.info
+        log(
+            "WQ HTTP request request_id=%s method=%s url=%s status=%s duration_ms=%s",
+            self.request_id,
+            str(method).upper(),
+            url,
+            response.status_code,
+            round((time.monotonic() - started) * 1000),
+        )
+        return response
 
 
 def is_configured(account: str | None = None) -> bool:
@@ -65,18 +135,26 @@ def configured_accounts() -> list[str]:
     return [name for name, (e, p) in _ACCOUNT_ENV.items() if os.environ.get(e) and os.environ.get(p)]
 
 
-def get_client(account: str = "primary") -> "WQBrainClient":
+def get_client(account: str = "primary", *, request_id: str | None = None) -> "WQBrainClient":
     env_email, env_pwd = _ACCOUNT_ENV.get(account, _ACCOUNT_ENV["primary"])
     return WQBrainClient(
         email=os.environ.get(env_email, ""),
         password=os.environ.get(env_pwd, ""),
+        request_id=request_id,
     )
 
 
 class WQBrainClient:
-    def __init__(self, email: str | None = None, password: str | None = None):
+    def __init__(
+        self,
+        email: str | None = None,
+        password: str | None = None,
+        request_id: str | None = None,
+    ):
         self.email = email or os.environ.get("WQ_BRAIN_EMAIL", "")
         self.password = password or os.environ.get("WQ_BRAIN_PASSWORD", "")
+        self.request_id = request_id
+        self.last_error: dict | None = None
         self._session: requests.Session | None = None
         self._operators_cache: list[dict] | None = None
         self._data_fields_cache: dict[tuple, list[dict]] = {}
@@ -85,9 +163,14 @@ class WQBrainClient:
 
     def _get_session(self) -> requests.Session:
         if self._session is None:
-            self._session = requests.Session()
+            self._session = _RequestLoggingSession(self.request_id)
             self._session.trust_env = False
-            retry = Retry(total=3, backoff_factor=1, status_forcelist=[502, 503, 504])
+            retry = Retry(
+                total=3,
+                backoff_factor=1,
+                status_forcelist=[502, 503, 504],
+                raise_on_status=False,
+            )
             adapter = HTTPAdapter(max_retries=retry)
             self._session.mount("https://", adapter)
             self._session.mount("http://", adapter)
@@ -98,6 +181,28 @@ class WQBrainClient:
             self._session.close()
             self._session = None
 
+    def _error(
+        self,
+        message: str,
+        *,
+        layer: str = "wq_client",
+        kind: str = "client_error",
+        http_status: int | None = None,
+        retryable: bool = False,
+        **extra,
+    ) -> dict:
+        error = build_wq_error(
+            message,
+            request_id=self.request_id,
+            layer=layer,
+            kind=kind,
+            http_status=http_status,
+            retryable=retryable,
+            **extra,
+        )
+        self.last_error = error
+        return error
+
     def fork_authenticated(self) -> "WQBrainClient":
         """Create an independent worker client reusing this client's auth state.
 
@@ -105,7 +210,7 @@ class WQBrainClient:
         headers and the operator catalog are copied so parallel workers do not
         need to authenticate or refetch operators for every Alpha.
         """
-        child = WQBrainClient(email=self.email, password=self.password)
+        child = WQBrainClient(email=self.email, password=self.password, request_id=self.request_id)
         if self._session is not None:
             child_session = child._get_session()
             child_session.headers.update(self._session.headers)
@@ -119,12 +224,24 @@ class WQBrainClient:
 
     def authenticate(self, _max_retries: int = 5) -> bool:
         s = self._get_session()
+        self.last_error = None
         for attempt in range(_max_retries):
-            r = s.post(
-                f"{API_BASE}/authentication",
-                auth=(self.email, self.password),
-                timeout=HTTP_TIMEOUT,
-            )
+            try:
+                r = s.post(
+                    f"{API_BASE}/authentication",
+                    auth=(self.email, self.password),
+                    timeout=HTTP_TIMEOUT,
+                )
+            except requests.RequestException as exc:
+                self.last_error = build_wq_error(
+                    f"WQ auth connection error: {exc}",
+                    request_id=self.request_id,
+                    layer="wq_http",
+                    kind=type(exc).__name__,
+                    retryable=True,
+                )
+                logger.warning("WQ auth failed request_id=%s: %s", self.request_id, exc)
+                return False
             if r.status_code == 429:
                 retry = int(r.headers.get("Retry-After", "60"))
                 logger.info(f"WQ auth rate-limited, waiting {retry}s (attempt {attempt + 1}/{_max_retries})")
@@ -132,7 +249,15 @@ class WQBrainClient:
                 continue
 
             if r.status_code not in (200, 201):
-                logger.error(f"WQ auth failed: HTTP {r.status_code}")
+                self.last_error = build_wq_error(
+                    f"WQ auth failed: HTTP {r.status_code}",
+                    request_id=self.request_id,
+                    layer="wq_http",
+                    kind="http_error",
+                    http_status=r.status_code,
+                    retryable=r.status_code in _RETRYABLE_HTTP_STATUS,
+                )
+                logger.error("WQ auth failed request_id=%s: HTTP %s", self.request_id, r.status_code)
                 return False
 
             data = r.json()
@@ -147,8 +272,27 @@ class WQBrainClient:
         return False
 
     def get_user_info(self) -> dict:
-        r = self._get_session().get(f"{API_BASE}/users/self", timeout=HTTP_TIMEOUT)
-        return r.json() if r.status_code == 200 else {}
+        try:
+            r = self._get_session().get(f"{API_BASE}/users/self", timeout=HTTP_TIMEOUT)
+        except requests.RequestException as exc:
+            self._error(
+                f"Failed to fetch WQ user info: {exc}",
+                layer="wq_http",
+                kind=type(exc).__name__,
+                retryable=True,
+            )
+            return {}
+        if r.status_code != 200:
+            self._error(
+                f"Failed to fetch WQ user info: HTTP {r.status_code}",
+                layer="wq_http",
+                kind="http_error",
+                http_status=r.status_code,
+                retryable=r.status_code in _RETRYABLE_HTTP_STATUS,
+            )
+            return {}
+        self.last_error = None
+        return r.json()
 
     def get_user_competitions(self, user_id: str) -> dict:
         """Return competition/Challenge progress for the authenticated user."""
@@ -379,9 +523,21 @@ class WQBrainClient:
             try:
                 r = s.post(f"{API_BASE}/simulations", json=payload, timeout=HTTP_TIMEOUT)
             except (requests.ConnectionError, requests.Timeout) as e:
+                self.last_error = build_wq_error(
+                    f"WQ simulation connection error: {e}",
+                    request_id=self.request_id,
+                    layer="wq_http",
+                    kind=type(e).__name__,
+                    retryable=True,
+                )
                 wait_seconds = _CONCURRENT_BACKOFF * (attempt + 1)
                 logger.warning(
-                    f"WQ connection error (attempt {attempt + 1}/{_MAX_RETRIES}): {e}, retrying in {wait_seconds}s"
+                    "WQ connection error request_id=%s (attempt %s/%s): %s, retrying in %ss",
+                    self.request_id,
+                    attempt + 1,
+                    _MAX_RETRIES,
+                    e,
+                    wait_seconds,
                 )
                 if progress_callback:
                     progress_callback(0, f"连接异常，等待 {wait_seconds}s（第 {attempt + 1} 次重试）")
@@ -416,13 +572,25 @@ class WQBrainClient:
                     return {"ok": False, "cancelled": True, "error": "WQ simulation cancelled"}
                 continue
 
-            return {"ok": False, "error": f"HTTP {r.status_code}: {r.text[:300]}"}
+            return self._error(
+                f"HTTP {r.status_code}: {r.text[:300]}",
+                layer="wq_http",
+                kind="http_error",
+                http_status=r.status_code,
+                retryable=r.status_code in _RETRYABLE_HTTP_STATUS,
+            )
         else:
-            return {"ok": False, "error": "WQ concurrent retry limit exceeded"}
+            if self.last_error:
+                return dict(self.last_error)
+            return self._error(
+                "WQ concurrent retry limit exceeded",
+                kind="retry_exhausted",
+                retryable=True,
+            )
 
         location = r.headers.get("Location", "")
         if not location:
-            return {"ok": False, "error": "No Location header in response"}
+            return self._error("No Location header in response", kind="protocol_error")
 
         url = location if location.startswith("http") else f"{API_BASE}{location}"
         simulation_id = url.rstrip("/").split("/")[-1]
@@ -481,11 +649,11 @@ class WQBrainClient:
                     "simulation_id": data.get("id") or simulation_id,
                 }
             if status in ("ERROR", "FAILED"):
-                return {
-                    "ok": False,
-                    "error": f"WQ simulation failed: {data.get('message', status)}",
-                    "simulation_id": data.get("id") or simulation_id,
-                }
+                return self._error(
+                    f"WQ simulation failed: {data.get('message', status)}",
+                    kind="simulation_failed",
+                    simulation_id=data.get("id") or simulation_id,
+                )
 
             if (i + 1) % _RECOVERY_LOOKUP_EVERY == 0:
                 recovered = recover_from_alpha_list(simulation_id)
@@ -503,20 +671,42 @@ class WQBrainClient:
         recovered = recover_from_alpha_list(simulation_id)
         if recovered:
             return recovered
-        return {
-            "ok": False,
-            "error": f"WQ simulation polling timeout ({_SIM_POLL_MAX_WAIT}s)",
-            "simulation_id": simulation_id,
-        }
+        return self._error(
+            f"WQ simulation polling timeout ({_SIM_POLL_MAX_WAIT}s)",
+            kind="poll_timeout",
+            retryable=True,
+            simulation_id=simulation_id,
+        )
 
     def _fetch_alpha(self, alpha_id: str) -> dict:
-        r = self._get_session().get(f"{API_BASE}/alphas/{alpha_id}", timeout=HTTP_TIMEOUT)
+        try:
+            r = self._get_session().get(f"{API_BASE}/alphas/{alpha_id}", timeout=HTTP_TIMEOUT)
+        except requests.RequestException as exc:
+            self._error(
+                f"Failed to fetch alpha {alpha_id}: {exc}",
+                layer="wq_http",
+                kind=type(exc).__name__,
+                retryable=True,
+            )
+            return {}
         if r.status_code == 200:
             try:
+                self.last_error = None
                 return r.json()
             except Exception:
-                logger.warning(f"Empty/invalid JSON from /alphas/{alpha_id}")
+                logger.warning("Empty/invalid JSON from /alphas/%s request_id=%s", alpha_id, self.request_id)
+                self._error(
+                    f"Invalid JSON from alpha {alpha_id}",
+                    kind="invalid_json",
+                )
                 return {}
+        self._error(
+            f"Failed to fetch alpha {alpha_id}: HTTP {r.status_code}",
+            layer="wq_http",
+            kind="http_error",
+            http_status=r.status_code,
+            retryable=r.status_code in _RETRYABLE_HTTP_STATUS,
+        )
         return {}
 
     def _list_matching_alphas(
@@ -615,7 +805,9 @@ class WQBrainClient:
         """Fetch actual platform-side alpha status including submission state."""
         data = self._fetch_alpha(alpha_id)
         if not data:
-            return {"ok": False, "error": f"Alpha {alpha_id} not found"}
+            if self.last_error:
+                return dict(self.last_error)
+            return self._error(f"Alpha {alpha_id} not found", kind="not_found")
         return {
             "ok": True,
             "alpha_id": alpha_id,
@@ -670,17 +862,20 @@ class WQBrainClient:
                 body = r.text[:500]
                 logger.info(f"Submit {alpha_id}: HTTP {r.status_code}, body={body}")
             except (requests.ConnectionError, requests.Timeout) as e:
-                logger.warning(f"Submit {alpha_id}: connection outcome unknown: {e}")
+                logger.warning("Submit %s request_id=%s: connection outcome unknown: %s", alpha_id, self.request_id, e)
                 # A POST timeout does not prove the platform rejected the request.
                 # Never retry the formal POST blindly or release the local slot;
                 # reconciliation must query BRAIN before any later submission.
-                return {
-                    "status_code": 0,
-                    "ok": False,
-                    "detail": f"submit request outcome unknown after connection error: {e}",
-                    "platform_status": "UNKNOWN",
-                    "submission_uncertain": True,
-                }
+                return self._error(
+                    f"submit request outcome unknown after connection error: {e}",
+                    layer="wq_http",
+                    kind=type(e).__name__,
+                    retryable=True,
+                    status_code=0,
+                    detail=f"submit request outcome unknown after connection error: {e}",
+                    platform_status="UNKNOWN",
+                    submission_uncertain=True,
+                )
 
             if r.status_code == 403:
                 try:
@@ -689,17 +884,26 @@ class WQBrainClient:
                     sc = next((c for c in checks if c.get("name") == "SELF_CORRELATION"), None)
                     if sc and sc.get("result") == "FAIL":
                         logger.warning(f"Submit {alpha_id}: SC FAIL value={sc.get('value')} limit={sc.get('limit')}")
-                        return {
-                            "status_code": 403,
-                            "ok": False,
-                            "detail": f"SC FAIL: value={sc.get('value')} > limit={sc.get('limit')}",
-                            "sc_value": sc.get("value"),
-                            "sc_limit": sc.get("limit"),
-                            "checks": checks,
-                        }
+                        return self._error(
+                            f"SC FAIL: value={sc.get('value')} > limit={sc.get('limit')}",
+                            kind="submission_check_failed",
+                            http_status=403,
+                            status_code=403,
+                            detail=f"SC FAIL: value={sc.get('value')} > limit={sc.get('limit')}",
+                            sc_value=sc.get("value"),
+                            sc_limit=sc.get("limit"),
+                            checks=checks,
+                        )
                 except Exception:
                     pass
-                return {"status_code": 403, "ok": False, "detail": body}
+                return self._error(
+                    body or "WQ submission rejected",
+                    layer="wq_http",
+                    kind="http_error",
+                    http_status=403,
+                    status_code=403,
+                    detail=body,
+                )
 
             if r.status_code == 429:
                 wait = 30 * (submit_try + 1)
@@ -708,7 +912,22 @@ class WQBrainClient:
                 continue
 
             if r.status_code not in (200, 201, 202):
-                logger.warning(f"Submit {alpha_id}: unexpected HTTP {r.status_code}, waiting 15s before retry")
+                self.last_error = build_wq_error(
+                    f"Submit {alpha_id}: HTTP {r.status_code}: {body}",
+                    request_id=self.request_id,
+                    layer="wq_http",
+                    kind="http_error",
+                    http_status=r.status_code,
+                    retryable=r.status_code in _RETRYABLE_HTTP_STATUS,
+                    status_code=r.status_code,
+                    detail=body,
+                )
+                logger.warning(
+                    "Submit %s request_id=%s: unexpected HTTP %s, waiting 15s before retry",
+                    alpha_id,
+                    self.request_id,
+                    r.status_code,
+                )
                 time.sleep(15)
                 continue
 
@@ -769,13 +988,17 @@ class WQBrainClient:
                 "detail": "platform confirms ACTIVE after submit retries",
                 "platform_status": "ACTIVE",
             }
-        return {
-            "status_code": 0,
-            "ok": False,
-            "detail": f"submission outcome unresolved after retries (status={actual_status or 'UNKNOWN'})",
-            "platform_status": actual_status or "UNKNOWN",
-            "submission_uncertain": True,
-        }
+        last_http_status = (self.last_error or {}).get("http_status")
+        return self._error(
+            f"submission outcome unresolved after retries (status={actual_status or 'UNKNOWN'})",
+            kind="submission_uncertain",
+            http_status=last_http_status,
+            retryable=bool((self.last_error or {}).get("retryable", True)),
+            status_code=0,
+            detail=f"submission outcome unresolved after retries (status={actual_status or 'UNKNOWN'})",
+            platform_status=actual_status or "UNKNOWN",
+            submission_uncertain=True,
+        )
 
     def _poll_alpha_submission(self, alpha_id: str, max_polls: int = 12, interval: int = 10) -> dict:
         """Poll alpha status until platform confirms submission or SC check completes."""

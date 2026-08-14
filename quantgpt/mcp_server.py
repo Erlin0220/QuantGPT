@@ -20,6 +20,7 @@ import os
 import sys
 import time
 import traceback
+import uuid
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 from typing import cast
@@ -47,6 +48,7 @@ from .mcp_task_helper import (
 from .report import generate_report
 from .task_executor import _run_backtest_in_process, get_executor
 from .wq_autonomous_research import REQUIRED_WQ_SKILL_CHAIN, run_autonomous_research, validate_skill_candidate_contract
+from .wq_brain_client import build_wq_error
 from .wq_brain_service import (
     prepare_wq_expression,
     reconcile_submission_uncertainty,
@@ -63,6 +65,22 @@ from .wq_research_agent import run_research_batch
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s", stream=sys.stderr)
 logger = logging.getLogger(__name__)
+
+
+def _wq_auth_error(client, request_id: str | None) -> dict:
+    last_error = getattr(client, "last_error", None)
+    if isinstance(last_error, dict):
+        error = dict(last_error)
+        error.setdefault("request_id", request_id)
+        return error
+    return build_wq_error(
+        "WQ BRAIN 认证失败",
+        request_id=request_id,
+        layer="wq_client",
+        kind="authentication_failed",
+        retryable=True,
+    )
+
 
 _DEFAULT_MCP_ALLOWED_HOSTS = "localhost,localhost:8003,127.0.0.1,127.0.0.1:8003"
 _MCP_ALLOWED_HOSTS = [
@@ -89,6 +107,20 @@ mcp = FastMCP(
         allowed_hosts=_MCP_ALLOWED_HOSTS,
     ),
 )
+
+
+def _current_mcp_request_id() -> str:
+    """Inherit the proxy correlation id for this HTTP request, else create one."""
+    try:
+        context = mcp.get_context()
+        request = context.request_context.request
+        headers = getattr(request, "headers", None)
+        inherited = headers.get("x-request-id") if headers is not None else None
+        if inherited:
+            return str(inherited)[:128]
+    except (AttributeError, LookupError, ValueError):
+        pass
+    return uuid.uuid4().hex
 
 
 def _enrich_with_fundamentals(expression: str, market_df, stock_codes: list, start_date: str, end_date: str):
@@ -124,6 +156,8 @@ async def _enqueue_mcp_tool(
     **response_extra,
 ) -> str:
     """Atomically accept a bounded background task and return its polling contract."""
+    request_id = str(params.get("request_id") or _current_mcp_request_id())
+    params = {**params, "request_id": request_id}
     try:
         task_id = await start_mcp_task(
             task_type,
@@ -132,11 +166,20 @@ async def _enqueue_mcp_tool(
             status="pending",
             singleflight=singleflight,
             stale_after_seconds=stale_after_seconds,
+            request_id=request_id,
+        )
+        logger.info(
+            "MCP task accepted request_id=%s task_id=%s task_type=%s",
+            request_id,
+            task_id,
+            task_type,
         )
     except MCPTaskAlreadyRunningError as exc:
         task = exc.task
+        reused_request_id = task.get("request_id") or (task.get("params") or {}).get("request_id")
         response = {
             "task_id": task.get("task_id"),
+            "request_id": reused_request_id,
             "status": task.get("status", "running"),
             "async": True,
             "new_task": False,
@@ -153,7 +196,17 @@ async def _enqueue_mcp_tool(
             }
         return json.dumps(response, ensure_ascii=False)
     except MCPTaskCapacityError as exc:
-        return json.dumps({"error": str(exc), "retryable": True}, ensure_ascii=False)
+        return json.dumps(
+            {
+                "error": str(exc),
+                "request_id": request_id,
+                "layer": "mcp_entry",
+                "kind": "task_capacity",
+                "http_status": None,
+                "retryable": True,
+            },
+            ensure_ascii=False,
+        )
 
     try:
         start_mcp_background_task(
@@ -163,11 +216,26 @@ async def _enqueue_mcp_tool(
             expression=expression,
         )
     except Exception as exc:
-        await complete_mcp_task(task_id, error=f"Failed to enqueue background task: {exc}", expression=expression)
-        return json.dumps({"error": str(exc), "task_id": task_id}, ensure_ascii=False)
+        error_result = {
+            "ok": False,
+            "error": f"Failed to enqueue background task: {exc}",
+            "request_id": request_id,
+            "layer": "mcp_entry",
+            "kind": "background_enqueue_failed",
+            "http_status": None,
+            "retryable": True,
+        }
+        await complete_mcp_task(
+            task_id,
+            result=error_result,
+            error=error_result["error"],
+            expression=expression,
+        )
+        return json.dumps({**error_result, "task_id": task_id}, ensure_ascii=False)
 
     return _async_task_response(
         task_id,
+        request_id=request_id,
         legacy_wq_poll=legacy_wq_poll,
         **response_extra,
     )
@@ -593,8 +661,9 @@ async def list_wq_operators() -> str:
     from .wq_brain_client import get_client
     from .wq_brain_client import is_configured as _wq_configured
 
+    request_id = _current_mcp_request_id()
     if _wq_configured("primary"):
-        client = get_client("primary")
+        client = get_client("primary", request_id=request_id)
         try:
             authenticated = await asyncio.to_thread(client.authenticate)
             if authenticated:
@@ -602,6 +671,7 @@ async def list_wq_operators() -> str:
                 return json.dumps(
                     {
                         "source": "live",
+                        "request_id": request_id,
                         "count": len(operators),
                         "operators": [
                             {
@@ -616,13 +686,14 @@ async def list_wq_operators() -> str:
                     indent=2,
                 )
         except Exception as e:
-            logger.warning(f"WQ operator catalog fetch failed, using fallback: {e}")
+            logger.warning("WQ operator catalog fetch failed request_id=%s, using fallback: %s", request_id, e)
         finally:
             await asyncio.to_thread(client.close)
 
     return json.dumps(
         {
             "source": "fallback",
+            "request_id": request_id,
             "count": len(WQ_FALLBACK_OPERATORS),
             "operators": sorted(WQ_FALLBACK_OPERATORS),
         },
@@ -649,15 +720,32 @@ async def wq_brain_data_catalog(
     from .wq_brain_client import get_client
     from .wq_brain_client import is_configured as _wq_configured
 
+    request_id = _current_mcp_request_id()
     if account not in {"primary", "alt"}:
-        return json.dumps({"error": "account 必须是 primary 或 alt"}, ensure_ascii=False)
+        return json.dumps(
+            build_wq_error(
+                "account 必须是 primary 或 alt",
+                request_id=request_id,
+                layer="mcp_entry",
+                kind="validation_error",
+            ),
+            ensure_ascii=False,
+        )
     if not _wq_configured(account):
-        return json.dumps({"error": f"WQ BRAIN 未配置 (account={account})"}, ensure_ascii=False)
+        return json.dumps(
+            build_wq_error(
+                f"WQ BRAIN 未配置 (account={account})",
+                request_id=request_id,
+                layer="mcp_entry",
+                kind="not_configured",
+            ),
+            ensure_ascii=False,
+        )
     limit = max(1, min(200, int(limit)))
-    client = get_client(account)
+    client = get_client(account, request_id=request_id)
     try:
         if not await asyncio.to_thread(client.authenticate):
-            return json.dumps({"error": "WQ BRAIN 认证失败"}, ensure_ascii=False)
+            return json.dumps(_wq_auth_error(client, request_id), ensure_ascii=False)
         try:
             datasets = await asyncio.to_thread(
                 client.list_datasets,
@@ -682,6 +770,7 @@ async def wq_brain_data_catalog(
         return json.dumps(
             {
                 "source": "live",
+                "request_id": request_id,
                 "account": account,
                 "scope": {"region": region, "universe": universe, "delay": delay},
                 "dataset_filter": dataset_id,
@@ -712,7 +801,16 @@ async def wq_brain_data_catalog(
             indent=2,
         )
     except Exception as exc:
-        return json.dumps({"error": str(exc)[:500]}, ensure_ascii=False)
+        return json.dumps(
+            build_wq_error(
+                str(exc)[:500],
+                request_id=request_id,
+                layer="mcp_handler",
+                kind=type(exc).__name__,
+                retryable=False,
+            ),
+            ensure_ascii=False,
+        )
     finally:
         await asyncio.to_thread(client.close)
 
@@ -877,8 +975,9 @@ def validate_expression(expression: str, mode: str = "local") -> str:
 
             canonical = expression
             catalog_source = "fallback"
+            request_id = _current_mcp_request_id()
             if _wq_configured("primary"):
-                client = get_client("primary")
+                client = get_client("primary", request_id=request_id)
                 try:
                     if client.authenticate():
                         canonical, error, catalog_source = prepare_wq_expression(client, expression)
@@ -1145,11 +1244,12 @@ def _run_wq_single_mcp_task(task_id: str, params: dict) -> dict:
     from .wq_brain_client import get_client
     from .wq_submission_policy import finalize_submission_attempt_sync, reserve_submission_sync
 
-    client = get_client("primary")
+    request_id = params.get("request_id")
+    client = get_client("primary", request_id=request_id)
     try:
         update_mcp_task(task_id, status="authenticating", progress=0, progress_message="认证 WQ BRAIN", persist=True)
         if not client.authenticate():
-            return {"ok": False, "error": "WQ BRAIN 认证失败"}
+            return _wq_auth_error(client, request_id)
 
         update_mcp_task(
             task_id, status="simulating", progress=0, progress_message="Simulation 已提交，等待 BRAIN", persist=True
@@ -1173,6 +1273,7 @@ def _run_wq_single_mcp_task(task_id: str, params: dict) -> dict:
             check_cancelled=lambda: is_mcp_task_cancelled(task_id),
             submission_guard=lambda alpha_id: reserve_submission_sync("primary", alpha_id),
             submission_result_callback=lambda alpha_id, result: finalize_submission_attempt_sync("primary", alpha_id, result),
+            request_id=request_id,
         )
     finally:
         client.close()
@@ -1182,11 +1283,12 @@ def _run_wq_batch_mcp_task(task_id: str, params: dict) -> dict:
     from .wq_brain_client import get_client
     from .wq_submission_policy import finalize_submission_attempt_sync, reserve_submission_sync
 
-    client = get_client("primary")
+    request_id = params.get("request_id")
+    client = get_client("primary", request_id=request_id)
     try:
         update_mcp_task(task_id, status="authenticating", progress=0, progress_message="认证 WQ BRAIN", persist=True)
         if not client.authenticate():
-            return {"ok": False, "error": "WQ BRAIN 认证失败"}
+            return _wq_auth_error(client, request_id)
 
         def on_progress(current: int, total: int, key: str) -> None:
             pct = int((current - 1) * 100 / total) if total else 0
@@ -1217,6 +1319,7 @@ def _run_wq_batch_mcp_task(task_id: str, params: dict) -> dict:
             check_cancelled=lambda: is_mcp_task_cancelled(task_id),
             submission_guard=lambda alpha_id: reserve_submission_sync("primary", alpha_id),
             submission_result_callback=lambda alpha_id, result: finalize_submission_attempt_sync("primary", alpha_id, result),
+            request_id=request_id,
         )
     finally:
         client.close()
@@ -1254,11 +1357,12 @@ def _stamp_wq_research_source_run(result: dict, task_id: str) -> dict:
 def _run_wq_research_mcp_task(task_id: str, params: dict) -> dict:
     from .wq_brain_client import get_client
 
-    client = get_client("primary")
+    request_id = params.get("request_id")
+    client = get_client("primary", request_id=request_id)
     try:
         update_mcp_task(task_id, status="authenticating", progress=0, progress_message="认证 WQ BRAIN", persist=True)
         if not client.authenticate():
-            return {"ok": False, "error": "WQ BRAIN 认证失败"}
+            return _wq_auth_error(client, request_id)
         update_mcp_task(
             task_id, status="researching", progress=0, progress_message="执行 WQ Alpha 批量研究", persist=True
         )
@@ -1321,6 +1425,7 @@ def _run_wq_research_mcp_task(task_id: str, params: dict) -> dict:
         except Exception as exc:
             logger.warning("Failed to persist WQ research candidates: %s", exc)
             result["candidate_queue_saved"] = 0
+        result.setdefault("request_id", request_id)
         return result
     finally:
         client.close()
@@ -1332,7 +1437,8 @@ def _run_wq_autonomous_research_mcp_task(task_id: str, params: dict) -> dict:
     from .wq_research_memory import load_research_memory_sync, record_research_trials_sync
     from .wq_submission_policy import _run_coro_sync, get_submission_policy_status, record_research_candidates_sync
 
-    client = get_client("primary")
+    request_id = params.get("request_id")
+    client = get_client("primary", request_id=request_id)
     try:
         from .wq_active_session import ensure_active_first_session
 
@@ -1349,7 +1455,9 @@ def _run_wq_autonomous_research_mcp_task(task_id: str, params: dict) -> dict:
             active_session = _run_coro_sync(
                 record_hard_stop(params.get("active_session_id"), "primary", "brain_authentication_failed")
             )
-            return {"ok": False, "error": "WQ BRAIN 认证失败", "active_first_session": active_session}
+            error = _wq_auth_error(client, request_id)
+            error["active_first_session"] = active_session
+            return error
 
         update_mcp_task(
             task_id,
@@ -1427,6 +1535,7 @@ def _run_wq_autonomous_research_mcp_task(task_id: str, params: dict) -> dict:
         except Exception as exc:
             logger.warning("Failed to advance ACTIVE-first research session: %s", exc)
             result["active_first_session"] = {"error": str(exc)}
+        result.setdefault("request_id", request_id)
         return result
     finally:
         client.close()
@@ -1445,7 +1554,8 @@ def _run_wq_submit_by_ids_mcp_task(task_id: str, params: dict) -> dict:
         reserve_submission_sync,
     )
 
-    client = get_client(params["account"])
+    request_id = params.get("request_id")
+    client = get_client(params["account"], request_id=request_id)
     try:
         from .wq_active_session import ensure_active_first_session
 
@@ -1462,7 +1572,9 @@ def _run_wq_submit_by_ids_mcp_task(task_id: str, params: dict) -> dict:
             active_session = _run_coro_sync(
                 record_hard_stop(params.get("active_session_id"), params["account"], "brain_authentication_failed")
             )
-            return {"ok": False, "error": "WQ BRAIN 认证失败", "active_first_session": active_session}
+            error = _wq_auth_error(client, request_id)
+            error["active_first_session"] = active_session
+            return error
 
         update_mcp_task(
             task_id,
@@ -1485,12 +1597,15 @@ def _run_wq_submit_by_ids_mcp_task(task_id: str, params: dict) -> dict:
                     params["account"],
                 )
             )
-            return {
-                "ok": False,
-                "error": "存在尚未与 BRAIN 对账完成的正式提交；为避免超额提交，本次提交已冻结",
-                "submission_recovery": submission_recovery,
-                "active_first_session": active_session,
-            }
+            return build_wq_error(
+                "存在尚未与 BRAIN 对账完成的正式提交；为避免超额提交，本次提交已冻结",
+                request_id=request_id,
+                layer="wq_service",
+                kind="submission_recovery_unresolved",
+                retryable=True,
+                submission_recovery=submission_recovery,
+                active_first_session=active_session,
+            )
 
         update_mcp_task(
             task_id,
@@ -1499,7 +1614,7 @@ def _run_wq_submit_by_ids_mcp_task(task_id: str, params: dict) -> dict:
             progress_message="正式提交前刷新 BRAIN 指标与 SC 状态",
             persist=True,
         )
-        preflight = run_check_alphas(client, params["alpha_ids"])
+        preflight = run_check_alphas(client, params["alpha_ids"], request_id=request_id)
         _run_coro_sync(
             reconcile_candidate_platform_statuses(
                 params["account"],
@@ -1581,6 +1696,7 @@ def _run_wq_submit_by_ids_mcp_task(task_id: str, params: dict) -> dict:
             check_cancelled=lambda: is_mcp_task_cancelled(task_id),
             submission_guard=lambda alpha_id: reserve_submission_sync(params["account"], alpha_id),
             submission_result_callback=lambda alpha_id, entry: finalize_submission_attempt_sync(params["account"], alpha_id, entry),
+            request_id=request_id,
         )
         response = {
             "ok": True,
@@ -1607,14 +1723,15 @@ def _run_wq_finalize_mcp_task(task_id: str, params: dict) -> dict:
     from .routes.wq_brain_batch import _finalize_alpha_statuses
     from .wq_brain_client import get_client
 
-    client = get_client(params["account"])
+    request_id = params.get("request_id")
+    client = get_client(params["account"], request_id=request_id)
     try:
         update_mcp_task(task_id, status="authenticating", progress=0, progress_message="认证 WQ BRAIN", persist=True)
         if not client.authenticate():
-            return {"ok": False, "error": "WQ BRAIN 认证失败"}
+            return _wq_auth_error(client, request_id)
         update_mcp_task(task_id, status="finalizing", progress=0, progress_message="查询最终 SC 状态", persist=True)
         result = _finalize_alpha_statuses(client, params["alpha_ids"], None)
-        return {"ok": True, **result}
+        return {"ok": True, "request_id": request_id, **result}
     finally:
         client.close()
 
@@ -1622,12 +1739,14 @@ def _run_wq_finalize_mcp_task(task_id: str, params: dict) -> dict:
 def _async_task_response(
     task_id: str,
     *,
+    request_id: str | None = None,
     legacy_wq_poll: bool = False,
     **extra,
 ) -> str:
     """Build the stable response returned by every long-running MCP tool."""
     response = {
         "task_id": task_id,
+        "request_id": request_id,
         "status": "pending",
         "async": True,
         **extra,
@@ -2065,8 +2184,9 @@ async def wq_brain_active_session_state(account: str = "primary") -> str:
 async def wq_brain_account_status(account: str = "primary") -> str:
     """读取当前 WorldQuant BRAIN 账号的 Points、等级和 Alpha 数量。
 
-    这是 Autonomous WQ Research 的停止条件/进度工具。Points 优先使用 BRAIN Challenge
-    leaderboard score；Gold 使用平台实际 genius level，progress.level 仅表示下一目标等级。
+    这是 Autonomous WQ Research 的停止条件/进度工具。只有当 Challenge leaderboard
+    score 的语义确实是 Points 时才作为累计 Points；PERFORMANCE 排名分数不会污染 Points。
+    Gold 使用平台实际当前等级，progress.level 仅表示下一目标等级。
 
     Args:
         account: WQ 账号 ('primary' 或 'alt')
@@ -2078,20 +2198,30 @@ async def wq_brain_account_status(account: str = "primary") -> str:
     from .wq_brain_client import get_client
     from .wq_brain_client import is_configured as _wq_configured
 
+    request_id = _current_mcp_request_id()
     if not _wq_configured(account):
-        return json.dumps({"error": f"WQ BRAIN 未配置 (account={account})"})
+        return json.dumps(
+            build_wq_error(
+                f"WQ BRAIN 未配置 (account={account})",
+                request_id=request_id,
+                layer="mcp_entry",
+                kind="not_configured",
+            ),
+            ensure_ascii=False,
+        )
 
-    client = get_client(account)
+    client = get_client(account, request_id=request_id)
     platform_candidate_backfill = None
     reservation_recovery = None
     try:
         authenticated = await asyncio.to_thread(client.authenticate)
         if not authenticated:
-            return json.dumps({"error": "WQ BRAIN 认证失败"})
+            return json.dumps(_wq_auth_error(client, request_id), ensure_ascii=False)
         result = await asyncio.to_thread(
             run_account_status,
             client,
             allow_alpha_count_fallback=False,
+            request_id=request_id,
         )
         if account == "primary" and result.get("ok"):
             platform_candidate_backfill = await asyncio.to_thread(
@@ -2101,17 +2231,23 @@ async def wq_brain_account_status(account: str = "primary") -> str:
                 offset=0,
                 min_fitness=1.0,
                 status_filter="UNSUBMITTED",
+                request_id=request_id,
             )
             from .wq_submission_policy import get_submission_reservation_recovery_ids
 
             recovery_ids = await get_submission_reservation_recovery_ids(account)
             if recovery_ids:
-                reservation_recovery = await asyncio.to_thread(run_check_alphas, client, recovery_ids)
+                reservation_recovery = await asyncio.to_thread(
+                    run_check_alphas,
+                    client,
+                    recovery_ids,
+                    request_id=request_id,
+                )
     finally:
         await asyncio.to_thread(client.close)
 
     if not result.get("ok"):
-        return json.dumps({"error": result.get("error", "unknown")}, ensure_ascii=False)
+        return json.dumps(result, ensure_ascii=False, default=str)
     result["account"] = account
     try:
         from .wq_submission_policy import (
@@ -2137,6 +2273,28 @@ async def wq_brain_account_status(account: str = "primary") -> str:
                 recovery_alphas,
             )
         result["submission_policy"] = await observe_account_status(account, result)
+        if result.get("points") is None:
+            cached_points = result["submission_policy"].get("last_observed_points")
+            try:
+                cached_points_value = float(cached_points) if cached_points is not None else None
+            except (TypeError, ValueError):
+                cached_points_value = None
+            if cached_points_value is not None:
+                target_points = float(result.get("target_points") or 10_000)
+                result["points"] = (
+                    int(cached_points_value) if cached_points_value.is_integer() else cached_points_value
+                )
+                result["points_source"] = "submission_state.last_observed_points"
+                result["points_status"] = "SYNC_UNKNOWN"
+                remaining = max(0.0, target_points - cached_points_value)
+                result["points_remaining"] = int(remaining) if remaining.is_integer() else remaining
+                result["goal_reached"] = bool(
+                    cached_points_value >= target_points
+                    and (
+                        result.get("gold_reached")
+                        or result.get("consultant_status") in {"ONBOARDING", "ACTIVE"}
+                    )
+                )
         if account == "primary":
             from .wq_active_session import ensure_active_first_session
 
@@ -2247,26 +2405,35 @@ async def wq_brain_list_alphas(
     from .wq_brain_client import get_client
     from .wq_brain_client import is_configured as _wq_configured
 
+    request_id = _current_mcp_request_id()
     if not _wq_configured(account):
-        return json.dumps({"error": f"WQ BRAIN 未配置 (account={account})"})
+        return json.dumps(
+            build_wq_error(
+                f"WQ BRAIN 未配置 (account={account})",
+                request_id=request_id,
+                layer="mcp_entry",
+                kind="not_configured",
+            ),
+            ensure_ascii=False,
+        )
 
-    client = get_client(account)
-    authenticated = await asyncio.to_thread(client.authenticate)
-    if not authenticated:
-        return json.dumps({"error": "WQ BRAIN 认证失败"})
+    client = get_client(account, request_id=request_id)
+    try:
+        authenticated = await asyncio.to_thread(client.authenticate)
+        if not authenticated:
+            return json.dumps(_wq_auth_error(client, request_id), ensure_ascii=False)
 
-    result = await asyncio.to_thread(
-        run_list_alphas,
-        client,
-        limit=limit,
-        offset=offset,
-        min_fitness=min_fitness,
-        status_filter=status_filter,
-    )
-    await asyncio.to_thread(client.close)
-
-    if not result.get("ok"):
-        return json.dumps({"error": result.get("error", "unknown")})
+        result = await asyncio.to_thread(
+            run_list_alphas,
+            client,
+            limit=limit,
+            offset=offset,
+            min_fitness=min_fitness,
+            status_filter=status_filter,
+            request_id=request_id,
+        )
+    finally:
+        await asyncio.to_thread(client.close)
 
     return json.dumps(result, ensure_ascii=False, indent=2, default=str)
 
@@ -2302,18 +2469,42 @@ async def wq_brain_check_alphas(
     from .wq_brain_client import get_client
     from .wq_brain_client import is_configured as _wq_configured
 
+    request_id = _current_mcp_request_id()
     if not _wq_configured(account):
-        return json.dumps({"error": f"WQ BRAIN 未配置 (account={account})"})
+        return json.dumps(
+            build_wq_error(
+                f"WQ BRAIN 未配置 (account={account})",
+                request_id=request_id,
+                layer="mcp_entry",
+                kind="not_configured",
+            ),
+            ensure_ascii=False,
+        )
     if len(alpha_ids) > 50:
-        return json.dumps({"error": f"alpha_ids 数量 {len(alpha_ids)} 超过上限 50"})
+        return json.dumps(
+            build_wq_error(
+                f"alpha_ids 数量 {len(alpha_ids)} 超过上限 50",
+                request_id=request_id,
+                layer="mcp_entry",
+                kind="validation_error",
+            ),
+            ensure_ascii=False,
+        )
 
-    client = get_client(account)
-    authenticated = await asyncio.to_thread(client.authenticate)
-    if not authenticated:
-        return json.dumps({"error": "WQ BRAIN 认证失败"})
+    client = get_client(account, request_id=request_id)
+    try:
+        authenticated = await asyncio.to_thread(client.authenticate)
+        if not authenticated:
+            return json.dumps(_wq_auth_error(client, request_id), ensure_ascii=False)
 
-    result = await asyncio.to_thread(run_check_alphas, client, alpha_ids)
-    await asyncio.to_thread(client.close)
+        result = await asyncio.to_thread(
+            run_check_alphas,
+            client,
+            alpha_ids,
+            request_id=request_id,
+        )
+    finally:
+        await asyncio.to_thread(client.close)
 
     try:
         from .wq_submission_policy import reconcile_candidate_platform_statuses

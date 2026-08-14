@@ -68,6 +68,8 @@ class MCPTaskAlreadyRunningError(RuntimeError):
 
 def _safe_task_snapshot(task: dict) -> dict:
     safe = {k: v for k, v in task.items() if k != "user_id"}
+    params = safe.get("params") or {}
+    safe.setdefault("request_id", params.get("request_id"))
     return sanitize_task_response(dict(safe))
 
 
@@ -93,11 +95,13 @@ async def _get_persisted_active_mcp_task(task_type: str) -> dict | None:
         db_task = result.scalar_one_or_none()
         if not db_task:
             return None
+        params = db_task.params or {}
         return {
             "task_id": db_task.id,
+            "request_id": params.get("request_id"),
             "status": db_task.status,
             "task_type": db_task.task_type,
-            "params": db_task.params or {},
+            "params": params,
             "expression": db_task.expression,
             "result": db_task.result,
             "error": db_task.error,
@@ -220,12 +224,15 @@ async def _create_mcp_task(
     status: str,
     singleflight: bool,
     stale_after_seconds: int | None,
+    request_id: str | None,
 ) -> str:
     task_id = uuid_mod.uuid4().hex[:12]
+    request_id = str(request_id or uuid_mod.uuid4().hex)
     now = time.time()
     params = {
         **params,
         "source": "mcp",
+        "request_id": request_id,
         "_mcp_instance_id": _MCP_INSTANCE_ID,
         "_singleflight": singleflight,
         "_heartbeat_at": now,
@@ -236,6 +243,7 @@ async def _create_mcp_task(
         )
     task = {
         "task_id": task_id,
+        "request_id": request_id,
         "user_id": _DEV_USER_ID_STR,
         "session_id": None,
         "status": status,
@@ -267,6 +275,7 @@ async def start_mcp_task(
     status: str = "running",
     singleflight: bool = False,
     stale_after_seconds: int | None = None,
+    request_id: str | None = None,
 ) -> str:
     if not singleflight:
         return await _create_mcp_task(
@@ -276,6 +285,7 @@ async def start_mcp_task(
             status=status,
             singleflight=False,
             stale_after_seconds=None,
+            request_id=request_id,
         )
 
     async with _SINGLEFLIGHT_LOCK:
@@ -289,6 +299,7 @@ async def start_mcp_task(
             status=status,
             singleflight=True,
             stale_after_seconds=stale_after_seconds,
+            request_id=request_id,
         )
 
 
@@ -328,18 +339,30 @@ def _apply_completion(
         task = tasks.get(task_id)
         if not task:
             logger.warning(f"[{task_id}] task evicted from memory, reconstructing for DB persist")
+            request_id = uuid_mod.uuid4().hex
             task = {
                 "task_id": task_id,
+                "request_id": request_id,
                 "user_id": _DEV_USER_ID_STR,
                 "session_id": None,
                 "status": "failed" if error else "completed",
                 "task_type": "mcp_unknown",
                 "cancelled": False,
-                "params": {"source": "mcp", "note": "reconstructed after memory eviction"},
+                "params": {
+                    "source": "mcp",
+                    "request_id": request_id,
+                    "note": "reconstructed after memory eviction",
+                },
                 "expression": expression,
                 "created_at": time.time(),
             }
             tasks[task_id] = task
+
+        request_id = task.get("request_id") or (task.get("params") or {}).get("request_id")
+        task["request_id"] = request_id
+        normalized_result = dict(result) if isinstance(result, dict) else result
+        if isinstance(normalized_result, dict):
+            normalized_result.setdefault("request_id", request_id)
 
         task["completed_at"] = time.time()
         if task.get("cancelled"):
@@ -349,6 +372,16 @@ def _apply_completion(
             task["status"] = "failed" if error else "completed"
             if error:
                 task["error"] = error
+                detail = normalized_result if isinstance(normalized_result, dict) else {}
+                task["layer"] = detail.get("layer") or "mcp_background"
+                task["kind"] = detail.get("kind") or "task_failed"
+                task["http_status"] = detail.get("http_status")
+                task["retryable"] = bool(detail.get("retryable", False))
+                if isinstance(normalized_result, dict):
+                    normalized_result.setdefault("layer", task["layer"])
+                    normalized_result.setdefault("kind", task["kind"])
+                    normalized_result.setdefault("http_status", task["http_status"])
+                    normalized_result.setdefault("retryable", task["retryable"])
             else:
                 task.pop("error", None)
                 task["progress"] = 100
@@ -357,8 +390,8 @@ def _apply_completion(
                 task["progress_message"] = "任务完成"
         if expression:
             task["expression"] = expression
-        if result is not None:
-            task["result"] = result
+        if normalized_result is not None:
+            task["result"] = normalized_result
         return dict(task)
 
 
@@ -509,11 +542,13 @@ async def get_mcp_task_snapshot(task_id: str) -> dict | None:
         if not db_task:
             return None
 
+        params = db_task.params or {}
         response = {
             "task_id": db_task.id,
+            "request_id": params.get("request_id"),
             "status": db_task.status,
             "task_type": db_task.task_type,
-            "params": db_task.params,
+            "params": params,
             "expression": db_task.expression,
             "result": db_task.result,
             "error": db_task.error,

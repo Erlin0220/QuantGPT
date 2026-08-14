@@ -31,6 +31,7 @@ class TestWQMCPAsyncSurface(unittest.IsolatedAsyncioTestCase):
             elapsed = time.perf_counter() - started
 
         self.assertEqual(payload["task_id"], f"{name}-task")
+        self.assertTrue(payload["request_id"])
         self.assertTrue(payload["async"])
         self.assertEqual(payload["poll_with"], "get_task_status")
         self.assertEqual(
@@ -43,6 +44,28 @@ class TestWQMCPAsyncSurface(unittest.IsolatedAsyncioTestCase):
         self.assertLess(elapsed, 0.5)
         self.assertEqual(start_task.await_count, 1)
         self.assertEqual(start_background.call_count, 1)
+        self.assertEqual(start_task.await_args.kwargs["request_id"], payload["request_id"])
+        self.assertEqual(start_task.await_args.args[2]["request_id"], payload["request_id"])
+        self.assertEqual(start_background.call_args.args[2]["request_id"], payload["request_id"])
+
+    async def test_proxy_request_id_is_inherited_by_async_task(self):
+        context = Mock()
+        context.request_context.request.headers = {"x-request-id": "proxy-request-123"}
+        with (
+            patch.dict(
+                os.environ,
+                {"WQ_BRAIN_EMAIL": "test@example.com", "WQ_BRAIN_PASSWORD": "pw"},
+                clear=False,
+            ),
+            patch.object(mcp_server.mcp, "get_context", return_value=context),
+            patch.object(mcp_server, "start_mcp_task", new=AsyncMock(return_value="proxy-task")) as start_task,
+            patch.object(mcp_server, "start_mcp_background_task"),
+        ):
+            payload = json.loads(await mcp_server.wq_brain_submit("rank(close)", "proxy-id-test"))
+
+        self.assertEqual(payload["request_id"], "proxy-request-123")
+        self.assertEqual(start_task.await_args.kwargs["request_id"], "proxy-request-123")
+        self.assertEqual(start_task.await_args.args[2]["request_id"], "proxy-request-123")
 
     async def test_all_long_wq_tools_enqueue_and_return_immediately(self):
         cases = [
@@ -180,12 +203,16 @@ class TestLocalMCPAsyncSurface(unittest.IsolatedAsyncioTestCase):
             elapsed = time.perf_counter() - started
 
         self.assertEqual(payload["task_id"], f"{name}-task")
+        self.assertTrue(payload["request_id"])
         self.assertTrue(payload["async"])
         self.assertEqual(payload["poll_with"], "get_task_status")
         self.assertNotIn("legacy_poll", payload)
         self.assertLess(elapsed, 0.5)
         self.assertEqual(start_task.await_count, 1)
         self.assertEqual(start_background.call_count, 1)
+        self.assertEqual(start_task.await_args.kwargs["request_id"], payload["request_id"])
+        self.assertEqual(start_task.await_args.args[2]["request_id"], payload["request_id"])
+        self.assertEqual(start_background.call_args.args[2]["request_id"], payload["request_id"])
 
     async def test_all_long_local_tools_enqueue_and_return_immediately(self):
         cases = [
@@ -198,6 +225,38 @@ class TestLocalMCPAsyncSurface(unittest.IsolatedAsyncioTestCase):
         for name, call in cases:
             with self.subTest(name=name):
                 await self._assert_enqueued(name, call)
+
+    def test_wq_worker_propagates_request_id_to_client_and_service(self):
+        request_id = "req-worker-chain"
+        params = {
+            "request_id": request_id,
+            "expression": "rank(close)",
+            "region": "USA",
+            "universe": "TOP3000",
+            "delay": 1,
+            "decay": 0,
+            "neutralization": "SUBINDUSTRY",
+            "truncation": 0.08,
+            "auto_submit": False,
+            "tag": "request-id-test",
+        }
+        client = Mock()
+        client.authenticate.return_value = True
+
+        with (
+            patch("quantgpt.wq_brain_client.get_client", return_value=client) as get_client,
+            patch.object(
+                mcp_server,
+                "run_single_simulation",
+                return_value={"ok": True, "request_id": request_id},
+            ) as run_single,
+        ):
+            result = mcp_server._run_wq_single_mcp_task("task-request-id", params)
+
+        get_client.assert_called_once_with("primary", request_id=request_id)
+        self.assertEqual(run_single.call_args.kwargs["request_id"], request_id)
+        self.assertEqual(result["request_id"], request_id)
+        client.close.assert_called_once_with()
 
     def test_local_backtest_wait_honors_cooperative_cancellation(self):
         future = Mock()
@@ -286,6 +345,47 @@ class TestMCPBackgroundLifecycle(unittest.IsolatedAsyncioTestCase):
         assert snapshot is not None
         self.assertEqual(snapshot["status"], "failed")
         self.assertEqual(snapshot["error"], "expected failure")
+
+    async def test_request_id_and_http_error_contract_survive_background_lifecycle(self):
+        request_id = "req-502-chain"
+        task_id = await task_helper.start_mcp_task(
+            "wq_brain_submit",
+            "rank(close)",
+            {},
+            status="pending",
+            request_id=request_id,
+        )
+        self.task_ids.append(task_id)
+
+        def worker(_tid):
+            return {
+                "ok": False,
+                "error": "HTTP 502: bad gateway",
+                "request_id": request_id,
+                "layer": "wq_http",
+                "kind": "http_error",
+                "http_status": 502,
+                "retryable": True,
+            }
+
+        task_helper.start_mcp_background_task(task_id, worker)
+
+        deadline = time.time() + 2
+        snapshot = None
+        while time.time() < deadline:
+            snapshot = await task_helper.get_mcp_task_snapshot(task_id)
+            if snapshot and snapshot.get("status") == "failed":
+                break
+            await asyncio.sleep(0.01)
+
+        assert snapshot is not None
+        self.assertEqual(snapshot["request_id"], request_id)
+        self.assertEqual(snapshot["params"]["request_id"], request_id)
+        self.assertEqual(snapshot["result"]["request_id"], request_id)
+        self.assertEqual(snapshot["layer"], "wq_http")
+        self.assertEqual(snapshot["kind"], "http_error")
+        self.assertEqual(snapshot["http_status"], 502)
+        self.assertTrue(snapshot["retryable"])
 
     async def test_task_limit_is_enforced_atomically(self):
         first_task_id = await self._new_task("capacity")
