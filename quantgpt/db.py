@@ -3,6 +3,8 @@
 import logging
 import os
 
+from sqlalchemy import event
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from .models import Base
@@ -22,10 +24,27 @@ def _get_engine():
             kwargs["pool_size"] = 5
             kwargs["max_overflow"] = 10
         elif "sqlite" in url:
-            from sqlalchemy.pool import StaticPool
-            kwargs["connect_args"] = {"check_same_thread": False}
-            kwargs["poolclass"] = StaticPool
+            parsed = make_url(url)
+            is_memory = parsed.database in {None, "", ":memory:"}
+            kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
+            if is_memory:
+                from sqlalchemy.pool import StaticPool
+
+                kwargs["poolclass"] = StaticPool
         _engine = create_async_engine(url, **kwargs)
+        if "sqlite" in url:
+            parsed = make_url(url)
+            is_memory = parsed.database in {None, "", ":memory:"}
+
+            @event.listens_for(_engine.sync_engine, "connect")
+            def _configure_sqlite_connection(dbapi_connection, _connection_record):
+                cursor = dbapi_connection.cursor()
+                try:
+                    cursor.execute("PRAGMA busy_timeout=30000")
+                    if not is_memory:
+                        cursor.execute("PRAGMA journal_mode=WAL")
+                finally:
+                    cursor.close()
     return _engine
 
 
