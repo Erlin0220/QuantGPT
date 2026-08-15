@@ -142,6 +142,50 @@ def test_zero_candidate_iteration_forces_continuation():
     assert state["session_stop_allowed"] is False
 
 
+def test_research_cycle_progress_persists_across_calls_and_resets_on_new_cycle():
+    state = _new_state()
+    state = apply_research_result(
+        state,
+        {"summary": {"simulated": 8}, "candidates": []},
+        {"skill_candidates": [_skill_candidate()], "research_cycle_id": "20260815-15"},
+    )
+    state = apply_research_result(
+        state,
+        {"summary": {"simulated": 9}, "candidates": [{"alpha_id": "alpha-1"}]},
+        {"skill_candidates": [_skill_candidate()], "research_cycle_id": "20260815-15"},
+    )
+
+    assert state["research_cycle"]["cycle_id"] == "20260815-15"
+    assert state["research_cycle"]["iterations"] == 2
+    assert state["research_cycle"]["simulations"] == 17
+    assert state["research_cycle"]["candidates"] == 1
+    assert state["counters"]["simulations"] == 17
+
+    state = apply_research_result(
+        state,
+        {"summary": {"simulated": 7}, "candidates": []},
+        {"skill_candidates": [_skill_candidate()], "research_cycle_id": "20260815-16"},
+    )
+
+    assert state["research_cycle"]["cycle_id"] == "20260815-16"
+    assert state["research_cycle"]["iterations"] == 1
+    assert state["research_cycle"]["simulations"] == 7
+    assert state["research_cycle"]["candidates"] == 0
+    assert state["counters"]["simulations"] == 24
+
+
+def test_missing_research_cycle_id_preserves_legacy_session_behavior():
+    state = apply_research_result(
+        _new_state(),
+        {"summary": {"simulated": 3}, "candidates": []},
+        {"skill_candidates": [_skill_candidate()]},
+    )
+
+    assert state["research_cycle"]["cycle_id"] is None
+    assert state["research_cycle"]["simulations"] == 0
+    assert state["counters"]["simulations"] == 3
+
+
 def test_candidate_found_requires_submission_instead_of_stopping():
     state = apply_research_result(
         _new_state(),

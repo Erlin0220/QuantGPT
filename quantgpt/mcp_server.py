@@ -2029,6 +2029,7 @@ async def wq_brain_autonomous_research(
     family_count: int = 3,
     min_sharpe: float = 1.25,
     min_fitness: float = 1.0,
+    research_cycle_id: str | None = None,
 ) -> str:
     """Skill-first 研究 WQ Alpha；生成式推理由当前 ChatGPT + DevSpace 项目 Skill 负责。
 
@@ -2042,6 +2043,8 @@ async def wq_brain_autonomous_research(
     QuantGPT 服务端不调用任何 LLM。
     ``max_simulations`` 是主研究 generations 的 Simulation 预算；Robustness Validation 使用独立、显式上报的有界预算，
     并严格执行 Skill 提供的 targeted robustness plan，不再使用固定跨 Universe/Neutralization 网格或 magic pass ratio。
+    同一个外层自动化研究轮次应在连续调用中复用同一个 ``research_cycle_id``；ACTIVE session 会据此持久化
+    该轮实际完成的 Simulation/iteration/Candidate 计数，避免把单次异步调用误当成整轮完成。
     当 daily ACTIVE 目标尚未完成时进入 ACTIVE_FILL：调用方应一次提供 8~12 个逐个通过上述 Skill 链的
     RUN 候选，以批量 Simulation 提高召回；Primary eligibility pass 可进入 submission-candidate 层，
     本地 robustness/correlation/overfit 只用于排序与诊断，最终仍由官方 Submission Gate/SC 判定。
@@ -2104,6 +2107,7 @@ async def wq_brain_autonomous_research(
         "family_count": family_count,
         "min_sharpe": min_sharpe,
         "min_fitness": min_fitness,
+        "research_cycle_id": str(research_cycle_id or "").strip() or None,
     }
     return await _enqueue_mcp_tool(
         "wq_research",

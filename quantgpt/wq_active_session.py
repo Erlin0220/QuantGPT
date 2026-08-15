@@ -63,6 +63,37 @@ def _base_counters() -> dict[str, int]:
     }
 
 
+def _research_cycle(cycle_id: str | None = None) -> dict[str, Any]:
+    return {
+        "cycle_id": cycle_id,
+        "started_at": datetime.now(timezone.utc).isoformat() if cycle_id else None,
+        "iterations": 0,
+        "simulations": 0,
+        "candidates": 0,
+    }
+
+
+def _apply_research_cycle_progress(
+    state: dict[str, Any],
+    *,
+    cycle_id: str | None,
+    simulations: int,
+    candidates: int,
+) -> None:
+    """Persist caller-defined automation-run progress across MCP research calls."""
+    if not cycle_id:
+        return
+    cycle = dict(state.get("research_cycle") or {})
+    if str(cycle.get("cycle_id") or "") != cycle_id:
+        cycle = _research_cycle(cycle_id)
+    if simulations > 0:
+        cycle["iterations"] = _int(cycle.get("iterations")) + 1
+    cycle["simulations"] = _int(cycle.get("simulations")) + simulations
+    cycle["candidates"] = _int(cycle.get("candidates")) + candidates
+    cycle["updated_at"] = datetime.now(timezone.utc).isoformat()
+    state["research_cycle"] = cycle
+
+
 def _policy_has_submission_candidate(policy: dict[str, Any]) -> bool:
     """Return whether policy already exposes a candidate that may use a daily slot."""
     candidates = policy.get("submission_candidate_top") or []
@@ -99,6 +130,7 @@ def new_active_first_state(
         "campaign": deepcopy(policy.get("active_campaign") or {}),
         "max_iterations": max(1, int(max_iterations)),
         "counters": _base_counters(),
+        "research_cycle": _research_cycle(),
         "last_event": "session_started",
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -159,6 +191,12 @@ def apply_research_result(
     for key, value in routes.items():
         counters[key] = _int(counters.get(key)) + value
     updated["counters"] = counters
+    _apply_research_cycle_progress(
+        updated,
+        cycle_id=str(params.get("research_cycle_id") or "") or None,
+        simulations=simulations,
+        candidates=candidates,
+    )
     updated["last_event"] = "research_iteration"
 
     if _int(updated.get("remaining_active_target")) <= 0:
