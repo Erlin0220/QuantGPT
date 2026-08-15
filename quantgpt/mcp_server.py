@@ -2058,6 +2058,22 @@ async def wq_brain_autonomous_research(
 
     if not _wq_configured("primary"):
         return json.dumps({"error": "WQ BRAIN 未配置 — 请设置 WQ_BRAIN_EMAIL 和 WQ_BRAIN_PASSWORD"})
+    try:
+        from .wq_research_cycle_runner import get_inflight_research_cycle
+
+        runner_cycle = await get_inflight_research_cycle("primary")
+    except Exception as exc:
+        logger.warning("Failed to inspect local research-cycle runner lease: %s", exc)
+        runner_cycle = None
+    if runner_cycle:
+        return json.dumps({
+            "ok": False,
+            "status": "research_singleflight_busy",
+            "source": "local_research_cycle_runner",
+            "cycle_id": runner_cycle.get("cycle_id"),
+            "batch_started_at": runner_cycle.get("batch_started_at"),
+            "next_step": "等待当前本地 research-cycle batch 完成后再调用",
+        }, ensure_ascii=False)
     if max_simulations < 4 or max_simulations > 40:
         return json.dumps({"error": "max_simulations 必须在 4~40 之间"})
     skill_candidates = list(skill_candidates or [])
