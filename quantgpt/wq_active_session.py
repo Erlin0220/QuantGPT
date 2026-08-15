@@ -22,6 +22,10 @@ from .wq_submission_policy import submission_day
 _TASK_TYPE = "wq_active_session"
 _RUNNING_STATUS = "iterating"
 _FINAL_STATUSES = {"completed", "failed", "cancelled", "iteration_completed"}
+# Compatibility checkpoint retained for telemetry and older persisted sessions.
+# A persistent ACTIVE-first session must not become stoppable merely because it
+# crossed this many research calls; caller-level time/simulation budgets own
+# per-run stopping, while this state machine owns ACTIVE/platform safety gates.
 _DEFAULT_MAX_ITERATIONS = 4
 
 
@@ -173,20 +177,17 @@ def apply_research_result(
             "end_reason": "candidate_found",
             "next_action": "advance_candidate_to_submission_gate",
         })
-    elif _budget_exhausted(updated):
-        updated.update({
-            "status": "COMPLETED",
-            "phase": "BUDGET_EXHAUSTED",
-            "session_stop_allowed": True,
-            "end_reason": "session_iteration_budget_exhausted",
-            "next_action": "stop_session_budget_exhausted",
-        })
     elif simulations > 0:
+        checkpoint_reached = _budget_exhausted(updated)
         updated.update({
             "status": "RUNNING",
             "phase": "CONTINUE_REQUIRED",
             "session_stop_allowed": False,
-            "end_reason": "iteration_exhausted_no_candidate",
+            "end_reason": (
+                "iteration_checkpoint_reached_target_remaining"
+                if checkpoint_reached
+                else "iteration_exhausted_no_candidate"
+            ),
             "next_action": "failure_diagnosis_then_allocate_next_iteration",
         })
     else:
@@ -259,22 +260,17 @@ def apply_submission_result(state: dict[str, Any], result: dict[str, Any]) -> di
             "next_action": "reconcile_platform_before_more_submissions",
         })
     elif sc_fail + other_fail > 0:
-        if _budget_exhausted(updated):
-            updated.update({
-                "status": "COMPLETED",
-                "phase": "BUDGET_EXHAUSTED",
-                "session_stop_allowed": True,
-                "end_reason": "session_iteration_budget_exhausted_after_submission_failure",
-                "next_action": "stop_session_budget_exhausted",
-            })
-        else:
-            updated.update({
-                "status": "RUNNING",
-                "phase": "CONTINUE_REQUIRED",
-                "session_stop_allowed": False,
-                "end_reason": "formal_submission_failed",
-                "next_action": "failure_diagnosis_then_allocate_next_iteration",
-            })
+        updated.update({
+            "status": "RUNNING",
+            "phase": "CONTINUE_REQUIRED",
+            "session_stop_allowed": False,
+            "end_reason": (
+                "formal_submission_failed_after_iteration_checkpoint"
+                if _budget_exhausted(updated)
+                else "formal_submission_failed"
+            ),
+            "next_action": "failure_diagnosis_then_allocate_next_iteration",
+        })
     else:
         # Local policy blocks / candidate readiness issues are not legitimate
         # ACTIVE-first stop conditions.  They require another candidate or a bug fix.

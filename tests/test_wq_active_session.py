@@ -200,7 +200,7 @@ def test_platform_unknown_is_legitimate_stop_condition():
     assert state["end_reason"] == "platform_inflight_or_unknown"
 
 
-def test_four_informative_iterations_exhaust_session_budget():
+def test_iteration_checkpoint_never_allows_stop_while_active_target_remains():
     state = _new_state()
     for _ in range(4):
         state = apply_research_result(
@@ -211,9 +211,33 @@ def test_four_informative_iterations_exhaust_session_budget():
 
     assert state["counters"]["iterations"] == 4
     assert state["counters"]["repairs"] == 4
-    assert state["phase"] == "BUDGET_EXHAUSTED"
-    assert state["session_stop_allowed"] is True
-    assert state["end_reason"] == "session_iteration_budget_exhausted"
+    assert state["phase"] == "CONTINUE_REQUIRED"
+    assert state["session_stop_allowed"] is False
+    assert state["end_reason"] == "iteration_checkpoint_reached_target_remaining"
+    assert state["next_action"] == "failure_diagnosis_then_allocate_next_iteration"
+
+
+def test_submission_failure_after_iteration_checkpoint_still_requires_research():
+    state = _new_state()
+    for _ in range(4):
+        state = apply_research_result(
+            state,
+            {"summary": {"simulated": 1}, "candidates": []},
+            {"skill_candidates": [_skill_candidate()]},
+        )
+
+    state = apply_submission_result(
+        state,
+        {
+            "sc_fail": 1,
+            "results": {"alpha-1": {"final_status": "SC_FAIL"}},
+        },
+    )
+
+    assert state["phase"] == "CONTINUE_REQUIRED"
+    assert state["session_stop_allowed"] is False
+    assert state["end_reason"] == "formal_submission_failed_after_iteration_checkpoint"
+    assert state["next_action"] == "failure_diagnosis_then_allocate_next_iteration"
 
 
 def test_active_completes_session_and_switches_to_replenishment():
