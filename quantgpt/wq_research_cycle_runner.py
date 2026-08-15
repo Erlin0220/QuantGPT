@@ -526,7 +526,49 @@ def _submission_required(policy: dict[str, Any]) -> bool:
     )
 
 
-def _planner_context(memory: dict[str, Any], policy: dict[str, Any], control: dict[str, Any]) -> dict[str, Any]:
+def _current_cycle_trial_evidence(memory: dict[str, Any], cycle: dict[str, Any], *, limit: int = 12) -> list[dict[str, Any]]:
+    source_run_ids = {
+        str(batch.get("source_run_id") or "")
+        for batch in (cycle.get("batches") or [])
+        if str(batch.get("source_run_id") or "")
+    }
+    if not source_run_ids:
+        return []
+
+    evidence: list[dict[str, Any]] = []
+    for trial in memory.get("recent_trials") or []:
+        if str(trial.get("source_run_id") or "") not in source_run_ids:
+            continue
+        evidence.append(
+            {
+                "source_run_id": trial.get("source_run_id"),
+                "expression": trial.get("expression"),
+                "family": trial.get("family"),
+                "status": trial.get("status"),
+                "sharpe": trial.get("sharpe"),
+                "fitness": trial.get("fitness"),
+                "returns": trial.get("returns"),
+                "turnover": trial.get("turnover"),
+                "failure_stage": trial.get("failure_stage"),
+                "failure_reason": trial.get("failure_reason"),
+                "failure_reasons": list(trial.get("failure_reasons") or []),
+                "failure_evidence": trial.get("failure_evidence"),
+                "mutation_targets": list(trial.get("mutation_targets") or []),
+                "dataset_id": trial.get("dataset_id"),
+                "operator_pattern": trial.get("operator_pattern"),
+            }
+        )
+        if len(evidence) >= limit:
+            break
+    return evidence
+
+
+def _planner_context(
+    memory: dict[str, Any],
+    policy: dict[str, Any],
+    control: dict[str, Any],
+    cycle: dict[str, Any],
+) -> dict[str, Any]:
     scheduler = dict(control.get("scheduler") or {})
     campaign = dict(policy.get("active_campaign") or {})
     return {
@@ -546,6 +588,7 @@ def _planner_context(memory: dict[str, Any], policy: dict[str, Any], control: di
         "research_memory_positive": list((control.get("research_memory") or {}).get("positive") or [])[:12],
         "research_memory_negative": list((control.get("research_memory") or {}).get("negative") or [])[:12],
         "recent_round_audits": list(control.get("round_audits") or [])[:5],
+        "current_cycle_trial_evidence": _current_cycle_trial_evidence(memory, cycle),
         "learning_maturity": memory.get("learning_maturity") or {},
     }
 
@@ -705,7 +748,7 @@ def research_cycle_snapshot(
         "research_cycle": cycle,
         "progress": progress,
         "active_first_session": active_session,
-        "planner_context": _planner_context(memory, policy, control),
+        "planner_context": _planner_context(memory, policy, control, cycle),
     }
 
 

@@ -451,3 +451,62 @@ def test_run_skill_batch_refuses_when_mcp_research_is_active(monkeypatch):
     assert result["status"] == "research_singleflight_busy"
     assert result["active_task"]["task_id"] == "mcp-active"
     assert result["batch_executed"] is False
+
+
+def test_planner_context_exposes_only_current_cycle_trial_evidence():
+    state = _cycle()
+    state["batches"] = [
+        {"source_run_id": "run-current-1"},
+        {"source_run_id": "run-current-2"},
+    ]
+    memory = {
+        "recent_trials": [
+            {
+                "source_run_id": "run-current-2",
+                "expression": "rank(ts_mean(returns, 20))",
+                "family": "momentum_reversal",
+                "status": "rejected",
+                "sharpe": 0.4,
+                "fitness": 0.2,
+                "returns": 0.03,
+                "turnover": 0.7,
+                "failure_stage": "metrics",
+                "failure_reason": "low_fitness",
+                "failure_reasons": [{"stage": "metrics", "reason": "low_fitness"}],
+                "failure_evidence": {"fitness": 0.2},
+                "mutation_targets": ["fitness"],
+                "dataset_id": "model16",
+                "operator_pattern": "rank>ts_mean",
+            },
+            {
+                "source_run_id": "run-old",
+                "expression": "rank(close)",
+                "failure_reason": "low_fitness",
+            },
+        ],
+        "learning_maturity": {},
+    }
+    policy = {"active_campaign": {}}
+    control = {"scheduler": {}, "failures": {}, "research_memory": {}, "round_audits": []}
+
+    context = runner._planner_context(memory, policy, control, state)
+
+    assert context["current_cycle_trial_evidence"] == [
+        {
+            "source_run_id": "run-current-2",
+            "expression": "rank(ts_mean(returns, 20))",
+            "family": "momentum_reversal",
+            "status": "rejected",
+            "sharpe": 0.4,
+            "fitness": 0.2,
+            "returns": 0.03,
+            "turnover": 0.7,
+            "failure_stage": "metrics",
+            "failure_reason": "low_fitness",
+            "failure_reasons": [{"stage": "metrics", "reason": "low_fitness"}],
+            "failure_evidence": {"fitness": 0.2},
+            "mutation_targets": ["fitness"],
+            "dataset_id": "model16",
+            "operator_pattern": "rank>ts_mean",
+        }
+    ]
