@@ -225,10 +225,11 @@ def test_run_skill_batch_uses_direct_service_and_persists_cycle(monkeypatch):
     monkeypatch.setattr(runner, "build_research_control_tower", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(runner, "record_research_trials_sync", lambda *_args, **_kwargs: 8)
     monkeypatch.setattr(runner, "record_research_candidates_sync", lambda *_args, **_kwargs: 0)
-    monkeypatch.setattr(
-        runner,
-        "run_autonomous_research",
-        lambda *_args, **kwargs: {
+    research_kwargs = {}
+
+    def run_research(*_args, **kwargs):
+        research_kwargs.update(kwargs)
+        return {
             "ok": True,
             "tag": kwargs["tag"],
             "summary": {"simulated": 8, "total_simulations": 8},
@@ -236,8 +237,9 @@ def test_run_skill_batch_uses_direct_service_and_persists_cycle(monkeypatch):
             "candidates": [],
             "failed": [],
             "invalid": [],
-        },
-    )
+        }
+
+    monkeypatch.setattr(runner, "run_autonomous_research", run_research)
 
     def update_cycle(_cycle_id, _account, updated):
         persisted.update(updated)
@@ -270,6 +272,8 @@ def test_run_skill_batch_uses_direct_service_and_persists_cycle(monkeypatch):
     assert persisted["counters"]["iterations"] == 1
     client.authenticate.assert_called_once_with()
     client.close.assert_called_once_with()
+    assert callable(research_kwargs["check_cancelled"])
+    assert research_kwargs["check_cancelled"]() is False
 
 
 def test_enqueue_skill_batch_reserves_cycle_and_spawns_background_worker(monkeypatch, tmp_path):

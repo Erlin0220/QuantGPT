@@ -728,6 +728,70 @@ def test_skill_plan_rejects_settings_repair_when_target_variant_already_seen():
     assert plan == []
 
 
+def test_registered_skill_fields_reuses_truthful_persisted_field_registry():
+    fields = autonomous._registered_skill_fields(
+        [
+            {"data_fields": ["fscore_bfl_quality", "unknown_field"]},
+            {"data_fields": ["return_equity"]},
+        ],
+        {
+            "field_registry": {
+                "fscore_bfl_quality": {
+                    "dataset_id": "model16",
+                    "dataset_category": "model",
+                    "source": "persisted_local_registry",
+                },
+                "return_equity": {
+                    "dataset_id": "fundamental6",
+                    "dataset_category": "fundamental",
+                    "source": "persisted_local_registry",
+                },
+            }
+        },
+    )
+
+    assert [item["id"] for item in fields] == ["fscore_bfl_quality", "return_equity"]
+    assert fields[0]["dataset"]["id"] == "model16"
+    assert fields[1]["dataset"]["id"] == "fundamental6"
+    assert all(item["registry_source"] == "persisted_local_registry" for item in fields)
+
+
+def test_skill_plan_uses_registered_field_without_exact_catalog_lookup():
+    class FakeClient:
+        def list_operator_names(self):
+            return {"rank", "ts_mean", "ts_backfill"}
+
+        def list_data_fields(self, **_kwargs):
+            raise AssertionError("registered truthful fields must not trigger exact catalog lookup")
+
+    registered = [{
+        "id": "fscore_bfl_quality",
+        "type": "MATRIX",
+        "dataset": {"id": "model16", "category": {"id": "model"}},
+    }]
+    plan = autonomous.build_skill_plan(
+        FakeClient(),
+        [{
+            "expression": "rank(ts_mean(ts_backfill(fscore_bfl_quality, 60), 20))",
+            "hypothesis": "persistent quality composite should predict relative returns",
+            "family": "model_quality",
+            "data_fields": ["fscore_bfl_quality"],
+            "skill_chain": ["wq-alpha-hypothesis", "wq-alpha-review", "wq-robustness-validation", "wq-candidate-evidence"],
+            "review_decision": "RUN",
+            "review_notes": "field already observed in truthful persisted BRAIN lineage",
+            "robustness_plan": {"mode": "skill_defined", "checks": [{"universe": "TOP1000", "purpose": "coverage sensitivity"}]},
+            "candidate_evidence_policy": {"mode": "calibrated_evidence_hierarchy"},
+        }],
+        registered,
+        seen=set(),
+        limit=1,
+        hypothesis="fallback goal",
+    )
+
+    assert len(plan) == 1
+    assert plan[0]["dataset_id"] == "model16"
+
+
 def test_skill_plan_resolves_declared_field_outside_planner_sample_against_live_catalog():
     class FakeClient:
         def list_operator_names(self):

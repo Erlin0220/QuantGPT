@@ -294,6 +294,46 @@ def _select_live_datasets(datasets: list[dict[str, Any]], memory: dict[str, Any]
     return selected
 
 
+def _registered_skill_fields(
+    skill_candidates: list[dict[str, Any]],
+    memory: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Seed strict Skill-first validation from restart-safe truthful field evidence.
+
+    ``field_registry`` is built only from persisted trials/candidates with a
+    non-ambiguous dataset attribution.  Reusing those observations avoids
+    re-querying Data Explorer for fields the project has already executed while
+    unknown fields still fall through to build_skill_plan's exact live lookup.
+    """
+    registry = memory.get("field_registry") or {}
+    declared = {
+        str(field).strip().lower()
+        for candidate in skill_candidates
+        if isinstance(candidate, dict)
+        for field in (candidate.get("data_fields") or [])
+        if str(field).strip()
+    }
+    fields: list[dict[str, Any]] = []
+    for field_id in sorted(declared):
+        metadata = registry.get(field_id)
+        if not isinstance(metadata, dict):
+            continue
+        dataset_id = str(metadata.get("dataset_id") or "").strip()
+        if not dataset_id:
+            continue
+        category = str(metadata.get("dataset_category") or "").strip()
+        dataset: dict[str, Any] = {"id": dataset_id}
+        if category:
+            dataset["category"] = {"id": category}
+        fields.append({
+            "id": field_id,
+            "type": "MATRIX",
+            "dataset": dataset,
+            "registry_source": metadata.get("source") or "persisted_local_registry",
+        })
+    return fields
+
+
 def _live_field_candidates(client, memory: dict[str, Any], *, region: str, universe: str, delay: int, limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Fetch account-visible MATRIX fields and rank underused fields first."""
     if limit <= 0 or not hasattr(client, "list_data_fields"):
@@ -2383,15 +2423,17 @@ def run_autonomous_research(
     field_probe_budget = max(3, min(first_budget, max(active_motif_budget, math.ceil(first_budget * 0.20))))
     if strict_skill_mode:
         # Skill-first candidates already declare the fields ChatGPT selected from
-        # the live Data Explorer. build_skill_plan re-resolves every non-core
-        # declared field exactly against BRAIN before simulation, so a broad
-        # dataset/sibling scan here adds rate-limit cost without adding candidates.
-        live_fields = []
+        # the Data Explorer. Reuse restart-safe field provenance from prior real
+        # trials first; build_skill_plan performs an exact BRAIN lookup only for a
+        # declared field that is still unknown locally. This keeps the strict gate
+        # while removing repeated catalog traffic from the per-batch hot path.
+        live_fields = _registered_skill_fields(skill_candidates, memory)
         live_catalog = {
             "available": True,
-            "count": 0,
+            "count": len(live_fields),
             "broad_probe_skipped": True,
-            "validation_mode": "skill_declared_exact_lookup",
+            "validation_mode": "persisted_registry_then_exact_live_lookup",
+            "sample_ids": [_live_field_id(item) for item in live_fields[:10]],
         }
         active_sibling_catalog = {
             "available": True,

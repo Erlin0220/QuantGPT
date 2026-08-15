@@ -669,6 +669,10 @@ def _run_skill_batch_locked(
     request_id = f"research-cycle-{uuid.uuid4().hex[:12]}"
     source_run_id = f"rcr-{uuid.uuid4().hex[:12]}"
     batch_started = _now_utc()
+    cycle_deadline = _parse_time(cycle.get("deadline_at"))
+
+    def cycle_budget_exhausted() -> bool:
+        return bool(cycle_deadline and _now_utc() >= cycle_deadline)
     client = get_client(account, request_id=request_id)
     params = {
         "account": account,
@@ -732,6 +736,7 @@ def _run_skill_batch_locked(
             family_count=params["family_count"],
             min_sharpe=min_sharpe,
             min_fitness=min_fitness,
+            check_cancelled=cycle_budget_exhausted,
         )
         _stamp_source_run(result, source_run_id)
         result["research_trials_saved"] = record_research_trials_sync(
