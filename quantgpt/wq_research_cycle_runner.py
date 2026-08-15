@@ -148,6 +148,14 @@ def research_cycle_progress(state: dict[str, Any], *, now: datetime | None = Non
     deadline = _parse_time(state.get("deadline_at")) or (
         started + timedelta(minutes=max(1, int(state.get("budget_minutes") or _DEFAULT_BUDGET_MINUTES)))
     )
+    completed_at = _parse_time(state.get("completed_at"))
+    persisted_stop_reason = str(state.get("stop_reason") or "")
+    if completed_at is not None:
+        current = min(current, completed_at)
+    elif str(state.get("status") or "").upper() == "COMPLETED" and persisted_stop_reason == "budget_exhausted":
+        # Legacy cycles completed before ``completed_at`` was persisted should
+        # still report the configured budget duration rather than aging forever.
+        current = min(current, deadline)
     counters = dict(state.get("counters") or {})
     simulations = max(0, int(counters.get("simulations") or 0))
     target = max(1, int(state.get("target_simulations") or _DEFAULT_TARGET_SIMULATIONS))
@@ -234,6 +242,7 @@ def apply_research_batch_to_cycle(
     if progress["stop_reason"]:
         updated["status"] = "COMPLETED" if progress["stop_reason"] in {"target_reached", "budget_exhausted"} else "FAILED"
         updated["stop_reason"] = progress["stop_reason"]
+        updated["completed_at"] = ended.astimezone(timezone.utc).isoformat()
         updated["next_action"] = "cycle_complete"
     return updated
 
@@ -630,6 +639,11 @@ def _reconcile_cycle_from_active_session_sync(
     if progress["stop_reason"]:
         updated["status"] = "COMPLETED" if progress["stop_reason"] in {"target_reached", "budget_exhausted"} else "FAILED"
         updated["stop_reason"] = progress["stop_reason"]
+        if not updated.get("completed_at"):
+            if progress["stop_reason"] == "budget_exhausted":
+                updated["completed_at"] = str(updated.get("deadline_at") or _now_utc().isoformat())
+            else:
+                updated["completed_at"] = _now_utc().isoformat()
         updated["next_action"] = "cycle_complete"
     return update_research_cycle_sync(cycle_id, account, updated)
 

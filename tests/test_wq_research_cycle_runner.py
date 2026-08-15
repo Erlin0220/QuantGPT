@@ -65,6 +65,20 @@ def test_cycle_progress_expires_at_budget_without_target():
     assert progress["remaining_simulations"] == 63
 
 
+def test_completed_budget_cycle_elapsed_time_stays_frozen_at_deadline():
+    started = datetime(2026, 8, 15, 8, 0, tzinfo=timezone.utc)
+    state = _cycle(started)
+    state["status"] = "COMPLETED"
+    state["stop_reason"] = "budget_exhausted"
+    state["counters"]["simulations"] = 21
+
+    progress = runner.research_cycle_progress(state, now=started + timedelta(hours=4))
+
+    assert progress["elapsed_minutes"] == 50.0
+    assert progress["remaining_minutes"] == 0.0
+    assert progress["stop_reason"] == "budget_exhausted"
+
+
 def test_apply_batch_accumulates_primary_and_total_brain_simulations():
     started = datetime(2026, 8, 15, 8, 0, tzinfo=timezone.utc)
     state = _cycle(started)
