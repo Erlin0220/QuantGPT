@@ -11,6 +11,8 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
+import sys
 import time
 import uuid
 from contextlib import contextmanager
@@ -19,6 +21,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import psutil
 from dotenv import load_dotenv
 from sqlalchemy import select
 
@@ -217,6 +220,8 @@ def apply_research_batch_to_cycle(
         }
     )
     updated["batches"] = batches[-50:]
+    updated["batch_inflight"] = False
+    updated["batch_started_at"] = None
     updated["last_error"] = error
     if candidate_count > 0:
         updated["next_action"] = "advance_candidate_to_submission_gate"
@@ -369,11 +374,59 @@ class ResearchCycleBusyError(RuntimeError):
     pass
 
 
+def _runner_runtime_dir() -> Path:
+    return Path(__file__).resolve().parents[1] / ".scratch" / "wq-research-cycle" / ".runtime"
+
+
+def _runner_lock_path(account: str) -> Path:
+    return _runner_runtime_dir() / f"{account}.lock"
+
+
+def _runner_lock_owner_status(lock_path: Path) -> bool | None:
+    """Return True for a live owner, False for a dead/missing owner, None if unreadable."""
+    try:
+        text = lock_path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+    try:
+        pid_text, _token, acquired_text = text.split(":", 2)
+        pid = int(pid_text)
+        acquired_at = float(acquired_text)
+    except (TypeError, ValueError):
+        return None
+    try:
+        process = psutil.Process(pid)
+        created_at = float(process.create_time())
+    except psutil.NoSuchProcess:
+        return False
+    except (psutil.AccessDenied, OSError):
+        return bool(psutil.pid_exists(pid))
+    # A reused PID created after the lock was written is not the original owner.
+    return created_at <= acquired_at + 5.0
+
+
+def _recover_stale_cycle_inflight_sync(account: str, cycle: dict[str, Any]) -> dict[str, Any]:
+    if not bool(cycle.get("batch_inflight")):
+        return cycle
+    batch_started = _parse_time(cycle.get("batch_started_at"))
+    if batch_started is not None and (_now_utc() - batch_started).total_seconds() < 30:
+        return cycle
+    owner_status = _runner_lock_owner_status(_runner_lock_path(account))
+    if owner_status is not False:
+        return cycle
+    recovered = set_research_cycle_inflight(cycle, False)
+    recovered["last_error"] = "stale_batch_inflight_recovered_after_runner_exit"
+    recovered["next_action"] = "diagnose_execution_then_generate_replacement_batch"
+    return update_research_cycle_sync(str(cycle.get("cycle_id") or ""), account, recovered)
+
+
 @contextmanager
 def _runner_process_lock(account: str, *, budget_minutes: int):
-    runtime_dir = Path(__file__).resolve().parents[1] / ".scratch" / "wq-research-cycle" / ".runtime"
+    runtime_dir = _runner_runtime_dir()
     runtime_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = runtime_dir / f"{account}.lock"
+    lock_path = _runner_lock_path(account)
     token = f"{os.getpid()}:{uuid.uuid4().hex}:{time.time()}"
     stale_seconds = max(900, int(budget_minutes) * 60 + 600)
     acquired = False
@@ -381,12 +434,15 @@ def _runner_process_lock(account: str, *, budget_minutes: int):
         try:
             descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
         except FileExistsError:
+            owner_status = _runner_lock_owner_status(lock_path)
+            if owner_status is True:
+                raise ResearchCycleBusyError(f"local research runner already active for account={account}")
             try:
                 age_seconds = max(0.0, time.time() - lock_path.stat().st_mtime)
             except FileNotFoundError:
                 continue
-            if age_seconds <= stale_seconds:
-                raise ResearchCycleBusyError(f"local research runner already active for account={account}")
+            if owner_status is None and age_seconds <= stale_seconds:
+                raise ResearchCycleBusyError(f"local research runner lock owner is unknown for account={account}")
             try:
                 lock_path.unlink()
             except FileNotFoundError:
@@ -534,6 +590,7 @@ def research_cycle_snapshot(
         if cycle is None:
             return {"ok": False, "status": "research_cycle_not_found", "cycle_id": cycle_id}
         cycle_id = str(cycle.get("cycle_id") or cycle_id or "")
+    cycle = _recover_stale_cycle_inflight_sync(account, cycle)
     policy = dict(_run_coro_sync(get_submission_policy_status(account)))
     memory = load_research_memory_sync(account)
     memory["inventory"] = policy.get("inventory") or {}
@@ -543,7 +600,7 @@ def research_cycle_snapshot(
     progress = research_cycle_progress(cycle)
     return {
         "ok": True,
-        "status": _cycle_decision(cycle, policy),
+        "status": "BATCH_INFLIGHT" if bool(cycle.get("batch_inflight")) else _cycle_decision(cycle, policy),
         "cycle_id": cycle_id,
         "research_cycle": cycle,
         "progress": progress,
@@ -831,6 +888,244 @@ def run_skill_batch(
         }
 
 
+def _background_python_executable() -> str:
+    executable = Path(sys.executable)
+    if os.name == "nt":
+        pythonw = executable.with_name("pythonw.exe")
+        if pythonw.is_file():
+            return str(pythonw)
+    return str(executable)
+
+
+def _batch_worker_command(
+    *,
+    account: str,
+    cycle_id: str,
+    batch_file: str,
+    target_simulations: int,
+    budget_minutes: int,
+    goal: str,
+    tag: str | None,
+    region: str,
+    universe: str,
+    delay: int,
+    decay: int,
+    neutralization: str,
+    truncation: float,
+    max_simulations: int,
+    family_count: int,
+    min_sharpe: float,
+    min_fitness: float,
+    submission_deferred: bool,
+) -> list[str]:
+    command = [
+        _background_python_executable(),
+        "-m",
+        "quantgpt.wq_research_cycle_runner",
+        "--account",
+        account,
+        "execute-batch",
+        "--cycle-id",
+        cycle_id,
+        "--batch-file",
+        str(Path(batch_file).resolve()),
+        "--target-simulations",
+        str(target_simulations),
+        "--budget-minutes",
+        str(budget_minutes),
+        "--goal",
+        goal,
+        "--region",
+        region,
+        "--universe",
+        universe,
+        "--delay",
+        str(delay),
+        "--decay",
+        str(decay),
+        "--neutralization",
+        neutralization,
+        "--truncation",
+        str(truncation),
+        "--max-simulations",
+        str(max_simulations),
+        "--family-count",
+        str(family_count),
+        "--min-sharpe",
+        str(min_sharpe),
+        "--min-fitness",
+        str(min_fitness),
+    ]
+    if tag:
+        command.extend(["--tag", tag])
+    if submission_deferred:
+        command.append("--submission-deferred")
+    return command
+
+
+def enqueue_skill_batch(
+    *,
+    account: str,
+    cycle_id: str,
+    batch_file: str,
+    target_simulations: int = _DEFAULT_TARGET_SIMULATIONS,
+    budget_minutes: int = _DEFAULT_BUDGET_MINUTES,
+    goal: str = "maximize robust low-correlation WorldQuant candidates",
+    tag: str | None = None,
+    region: str = "USA",
+    universe: str = "TOP3000",
+    delay: int = 1,
+    decay: int = 0,
+    neutralization: str = "SUBINDUSTRY",
+    truncation: float = 0.08,
+    max_simulations: int = 20,
+    family_count: int = 3,
+    min_sharpe: float = 1.25,
+    min_fitness: float = 1.0,
+    submission_deferred: bool = False,
+) -> dict[str, Any]:
+    candidates = _load_skill_candidates(batch_file)
+    contract_errors = [
+        {"index": index, "error": error}
+        for index, candidate in enumerate(candidates)
+        if (error := _runner_candidate_contract_error(candidate))
+    ]
+    if not candidates:
+        return {"ok": False, "status": "skill_generation_required", "cycle_id": cycle_id}
+    if contract_errors:
+        return {
+            "ok": False,
+            "status": "skill_candidate_contract_invalid",
+            "cycle_id": cycle_id,
+            "details": contract_errors,
+        }
+
+    try:
+        with _runner_process_lock(account, budget_minutes=budget_minutes):
+            cycle = ensure_research_cycle_sync(
+                account,
+                cycle_id,
+                target_simulations=target_simulations,
+                budget_minutes=budget_minutes,
+            )
+            cycle = _recover_stale_cycle_inflight_sync(account, cycle)
+            if bool(cycle.get("batch_inflight")):
+                return {
+                    "ok": True,
+                    "status": "BATCH_INFLIGHT",
+                    "cycle_id": cycle_id,
+                    "coalesced": True,
+                    "research_cycle": cycle,
+                }
+            active_mcp = _active_mcp_research_task()
+            if active_mcp:
+                return {
+                    "ok": False,
+                    "status": "research_singleflight_busy",
+                    "cycle_id": cycle_id,
+                    "active_task": active_mcp,
+                    "batch_executed": False,
+                }
+            policy = dict(_run_coro_sync(get_submission_policy_status(account)))
+            decision = _effective_cycle_decision(
+                cycle,
+                policy,
+                submission_deferred=submission_deferred,
+            )
+            if decision != "NEEDS_SKILL_BATCH":
+                snapshot = research_cycle_snapshot(account=account, cycle_id=cycle_id)
+                snapshot["batch_executed"] = False
+                return snapshot
+
+            reserved = set_research_cycle_inflight(cycle, True)
+            reserved["batch_request_file"] = str(Path(batch_file).resolve())
+            reserved["next_action"] = "wait_for_batch_completion"
+            reserved = update_research_cycle_sync(cycle_id, account, reserved)
+            runtime_dir = _runner_runtime_dir()
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            log_path = runtime_dir / f"{cycle_id}-worker.log"
+            command = _batch_worker_command(
+                account=account,
+                cycle_id=cycle_id,
+                batch_file=batch_file,
+                target_simulations=target_simulations,
+                budget_minutes=budget_minutes,
+                goal=goal,
+                tag=tag,
+                region=region,
+                universe=universe,
+                delay=delay,
+                decay=decay,
+                neutralization=neutralization,
+                truncation=truncation,
+                max_simulations=max_simulations,
+                family_count=family_count,
+                min_sharpe=min_sharpe,
+                min_fitness=min_fitness,
+                submission_deferred=submission_deferred,
+            )
+            creationflags = 0
+            popen_kwargs: dict[str, Any] = {}
+            if os.name == "nt":
+                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+            else:
+                popen_kwargs["start_new_session"] = True
+            try:
+                with log_path.open("ab") as log_handle:
+                    process = subprocess.Popen(
+                        command,
+                        cwd=Path(__file__).resolve().parents[1],
+                        stdin=subprocess.DEVNULL,
+                        stdout=log_handle,
+                        stderr=log_handle,
+                        close_fds=True,
+                        creationflags=creationflags,
+                        **popen_kwargs,
+                    )
+            except Exception as exc:
+                failed = set_research_cycle_inflight(reserved, False)
+                failed["last_error"] = f"worker_spawn_failed:{type(exc).__name__}:{exc}"
+                failed["next_action"] = "diagnose_execution_then_generate_replacement_batch"
+                update_research_cycle_sync(cycle_id, account, failed)
+                return {
+                    "ok": False,
+                    "status": "worker_spawn_failed",
+                    "cycle_id": cycle_id,
+                    "error": str(exc),
+                }
+            reserved["worker_pid"] = process.pid
+            reserved["worker_log"] = str(log_path)
+            update_research_cycle_sync(cycle_id, account, reserved)
+            return {
+                "ok": True,
+                "status": "BATCH_INFLIGHT",
+                "cycle_id": cycle_id,
+                "worker_pid": process.pid,
+                "worker_log": str(log_path),
+                "coalesced": False,
+            }
+    except ResearchCycleBusyError:
+        # Duplicate launch attempts should coalesce onto the already-reserved batch
+        # rather than causing a scheduled task to fail while the real worker runs.
+        for _ in range(10):
+            cycle = get_research_cycle_sync(account, cycle_id)
+            if cycle and bool(cycle.get("batch_inflight")):
+                return {
+                    "ok": True,
+                    "status": "BATCH_INFLIGHT",
+                    "cycle_id": cycle_id,
+                    "coalesced": True,
+                    "research_cycle": cycle,
+                }
+            time.sleep(0.1)
+        return {
+            "ok": False,
+            "status": "research_singleflight_busy",
+            "cycle_id": cycle_id,
+            "batch_executed": False,
+        }
+
+
 def _load_skill_candidates(path: str) -> list[dict[str, Any]]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     if isinstance(payload, dict):
@@ -853,28 +1148,31 @@ def _build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status")
     status.add_argument("--cycle-id")
 
-    run_batch = subparsers.add_parser("run-batch")
-    run_batch.add_argument("--cycle-id", required=True)
-    run_batch.add_argument("--batch-file", required=True)
-    run_batch.add_argument("--target-simulations", type=int, default=_DEFAULT_TARGET_SIMULATIONS)
-    run_batch.add_argument("--budget-minutes", type=int, default=_DEFAULT_BUDGET_MINUTES)
-    run_batch.add_argument("--goal", default="maximize robust low-correlation WorldQuant candidates")
-    run_batch.add_argument("--tag")
-    run_batch.add_argument("--region", default="USA")
-    run_batch.add_argument("--universe", default="TOP3000")
-    run_batch.add_argument("--delay", type=int, default=1)
-    run_batch.add_argument("--decay", type=int, default=0)
-    run_batch.add_argument("--neutralization", default="SUBINDUSTRY")
-    run_batch.add_argument("--truncation", type=float, default=0.08)
-    run_batch.add_argument("--max-simulations", type=int, default=20)
-    run_batch.add_argument("--family-count", type=int, default=3)
-    run_batch.add_argument("--min-sharpe", type=float, default=1.25)
-    run_batch.add_argument("--min-fitness", type=float, default=1.0)
-    run_batch.add_argument(
-        "--submission-deferred",
-        action="store_true",
-        help="Continue research only after the caller explicitly deferred an otherwise-prioritized submission/reconciliation action.",
-    )
+    def add_batch_arguments(batch_parser: argparse.ArgumentParser) -> None:
+        batch_parser.add_argument("--cycle-id", required=True)
+        batch_parser.add_argument("--batch-file", required=True)
+        batch_parser.add_argument("--target-simulations", type=int, default=_DEFAULT_TARGET_SIMULATIONS)
+        batch_parser.add_argument("--budget-minutes", type=int, default=_DEFAULT_BUDGET_MINUTES)
+        batch_parser.add_argument("--goal", default="maximize robust low-correlation WorldQuant candidates")
+        batch_parser.add_argument("--tag")
+        batch_parser.add_argument("--region", default="USA")
+        batch_parser.add_argument("--universe", default="TOP3000")
+        batch_parser.add_argument("--delay", type=int, default=1)
+        batch_parser.add_argument("--decay", type=int, default=0)
+        batch_parser.add_argument("--neutralization", default="SUBINDUSTRY")
+        batch_parser.add_argument("--truncation", type=float, default=0.08)
+        batch_parser.add_argument("--max-simulations", type=int, default=20)
+        batch_parser.add_argument("--family-count", type=int, default=3)
+        batch_parser.add_argument("--min-sharpe", type=float, default=1.25)
+        batch_parser.add_argument("--min-fitness", type=float, default=1.0)
+        batch_parser.add_argument(
+            "--submission-deferred",
+            action="store_true",
+            help="Continue research only after the caller explicitly deferred an otherwise-prioritized submission/reconciliation action.",
+        )
+
+    add_batch_arguments(subparsers.add_parser("run-batch"))
+    add_batch_arguments(subparsers.add_parser("execute-batch", help=argparse.SUPPRESS))
     return parser
 
 
@@ -891,6 +1189,27 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif args.command == "status":
         output = research_cycle_snapshot(account=args.account, cycle_id=args.cycle_id)
+    elif args.command == "run-batch":
+        output = enqueue_skill_batch(
+            account=args.account,
+            cycle_id=args.cycle_id,
+            batch_file=args.batch_file,
+            target_simulations=args.target_simulations,
+            budget_minutes=args.budget_minutes,
+            goal=args.goal,
+            tag=args.tag,
+            region=args.region,
+            universe=args.universe,
+            delay=args.delay,
+            decay=args.decay,
+            neutralization=args.neutralization,
+            truncation=args.truncation,
+            max_simulations=args.max_simulations,
+            family_count=args.family_count,
+            min_sharpe=args.min_sharpe,
+            min_fitness=args.min_fitness,
+            submission_deferred=args.submission_deferred,
+        )
     else:
         output = run_skill_batch(
             account=args.account,

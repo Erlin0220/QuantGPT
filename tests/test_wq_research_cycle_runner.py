@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
@@ -101,6 +102,43 @@ def test_apply_batch_accumulates_primary_and_total_brain_simulations():
     assert state["counters"]["candidates"] == 1
     assert state["next_action"] == "advance_candidate_to_submission_gate"
     assert [item["source_run_id"] for item in state["batches"]] == ["run-1", "run-2"]
+    assert state["batch_inflight"] is False
+    assert state["batch_started_at"] is None
+
+
+def test_recover_stale_batch_inflight_when_runner_owner_is_dead(monkeypatch):
+    state = runner.set_research_cycle_inflight(
+        _cycle(),
+        True,
+        now=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    persisted = {}
+    monkeypatch.setattr(runner, "_runner_lock_owner_status", lambda _path: False)
+    monkeypatch.setattr(runner, "_runner_lock_path", lambda _account: Mock())
+
+    def update_cycle(_cycle_id, _account, updated):
+        persisted.update(updated)
+        return {"task_id": "cycle-task", **updated}
+
+    monkeypatch.setattr(runner, "update_research_cycle_sync", update_cycle)
+
+    recovered = runner._recover_stale_cycle_inflight_sync("primary", state)
+
+    assert recovered["batch_inflight"] is False
+    assert recovered["last_error"] == "stale_batch_inflight_recovered_after_runner_exit"
+    assert recovered["next_action"] == "diagnose_execution_then_generate_replacement_batch"
+    assert persisted["batch_inflight"] is False
+
+
+def test_live_runner_owner_keeps_batch_inflight(monkeypatch):
+    state = runner.set_research_cycle_inflight(_cycle(), True)
+    monkeypatch.setattr(runner, "_runner_lock_owner_status", lambda _path: True)
+    monkeypatch.setattr(runner, "_runner_lock_path", lambda _account: Mock())
+
+    recovered = runner._recover_stale_cycle_inflight_sync("primary", state)
+
+    assert recovered is state
+    assert recovered["batch_inflight"] is True
 
 
 def test_cycle_decision_prioritizes_submission_without_stopping_cycle():
@@ -232,6 +270,56 @@ def test_run_skill_batch_uses_direct_service_and_persists_cycle(monkeypatch):
     assert persisted["counters"]["iterations"] == 1
     client.authenticate.assert_called_once_with()
     client.close.assert_called_once_with()
+
+
+def test_enqueue_skill_batch_reserves_cycle_and_spawns_background_worker(monkeypatch, tmp_path):
+    state = _cycle()
+    persisted = {}
+    batch_file = tmp_path / "batch.json"
+    batch_file.write_text(json.dumps({"skill_candidates": [_skill_candidate()]}), encoding="utf-8")
+
+    async def policy(_account="primary"):
+        return {
+            "remaining_active_target": 1,
+            "remaining_submission_slots": 1,
+            "submission_candidate_top": [],
+            "submission_frozen": False,
+            "submission_reconciliation_required": False,
+        }
+
+    monkeypatch.setattr(runner, "_runner_process_lock", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(runner, "_runner_runtime_dir", lambda: tmp_path)
+    monkeypatch.setattr(runner, "_active_mcp_research_task", lambda: None)
+    monkeypatch.setattr(runner, "ensure_research_cycle_sync", lambda *args, **kwargs: state)
+    monkeypatch.setattr(runner, "_recover_stale_cycle_inflight_sync", lambda _account, cycle: cycle)
+    monkeypatch.setattr(runner, "get_submission_policy_status", policy)
+    monkeypatch.setattr(runner, "_background_python_executable", lambda: "python")
+
+    def update_cycle(_cycle_id, _account, updated):
+        persisted.clear()
+        persisted.update(updated)
+        return {"task_id": "cycle-task", **updated}
+
+    monkeypatch.setattr(runner, "update_research_cycle_sync", update_cycle)
+    process = Mock(pid=4321)
+    popen = Mock(return_value=process)
+    monkeypatch.setattr(runner.subprocess, "Popen", popen)
+
+    result = runner.enqueue_skill_batch(
+        account="primary",
+        cycle_id="20260815-1600",
+        batch_file=str(batch_file),
+        max_simulations=1,
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "BATCH_INFLIGHT"
+    assert result["worker_pid"] == 4321
+    assert persisted["batch_inflight"] is True
+    assert persisted["next_action"] == "wait_for_batch_completion"
+    command = popen.call_args.args[0]
+    assert "execute-batch" in command
+    assert str(batch_file.resolve()) in command
 
 
 def test_run_skill_batch_refuses_when_mcp_research_is_active(monkeypatch):
