@@ -1,8 +1,9 @@
 """Repo-local WorldQuant research-cycle runner.
 
 The runner owns lifecycle control and persistence for one outer research cycle.
-It deliberately does not generate Alpha hypotheses or call an LLM: callers must
-supply Skill-reviewed candidates for each batch.
+Production flows still expect callers to supply Skill-reviewed candidates.  The
+explicit ``local-llm-poc`` command is a bounded adapter test that lets the local
+OpenCode Go / DeepSeek model generate the next Skill-reviewed batch.
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ from .wq_autonomous_research import (
 )
 from .wq_brain_client import get_client, is_configured
 from .wq_control_tower import build_research_control_tower
+from .wq_local_candidate_generator import LocalCandidateGenerationError, generate_local_skill_batch
 from .wq_research_memory import load_research_memory_sync, record_research_trials_sync
 from .wq_submission_policy import (
     _run_coro_sync,
@@ -1283,6 +1285,130 @@ def _load_skill_candidates(path: str) -> list[dict[str, Any]]:
     return [item for item in payload if isinstance(item, dict)]
 
 
+def run_local_llm_poc(
+    *,
+    account: str = "primary",
+    cycle_id: str | None = None,
+    target_simulations: int = 12,
+    budget_minutes: int = 15,
+    max_batches: int = 3,
+    batch_size: int = 2,
+    max_simulations_per_batch: int = 4,
+    model: str | None = None,
+    thinking: str = "disabled",
+    reasoning_effort: str = "max",
+    goal: str = "maximize robust low-correlation WorldQuant candidates",
+) -> dict[str, Any]:
+    """Run a bounded research-only loop with local LLM candidate generation.
+
+    This deliberately never performs formal submission.  Submission/reconciliation
+    priority is deferred only for this PoC so candidate generation → BRAIN
+    Simulation → failure evidence can be exercised end to end.
+    """
+    resolved_cycle_id = cycle_id or generate_research_cycle_id()
+    snapshot = research_cycle_snapshot(
+        account=account,
+        cycle_id=resolved_cycle_id,
+        create=True,
+        target_simulations=target_simulations,
+        budget_minutes=budget_minutes,
+    )
+    if not snapshot.get("ok"):
+        return snapshot
+
+    poc_batches: list[dict[str, Any]] = []
+    limit = max(1, min(5, int(max_batches)))
+    for batch_index in range(1, limit + 1):
+        snapshot = research_cycle_snapshot(account=account, cycle_id=resolved_cycle_id)
+        if not snapshot.get("ok"):
+            break
+        progress = dict(snapshot.get("progress") or {})
+        if progress.get("should_stop") or snapshot.get("status") == "BATCH_INFLIGHT":
+            break
+
+        planner_context = dict(snapshot.get("planner_context") or {})
+        try:
+            generation = generate_local_skill_batch(
+                planner_context,
+                batch_size=batch_size,
+                model=model,
+                thinking=thinking,
+                reasoning_effort=reasoning_effort,
+            )
+        except LocalCandidateGenerationError as exc:
+            return {
+                "ok": False,
+                "status": "local_llm_generation_failed",
+                "cycle_id": resolved_cycle_id,
+                "error": str(exc),
+                "poc_batches": poc_batches,
+                "research_cycle": snapshot.get("research_cycle"),
+                "progress": progress,
+            }
+
+        candidates = list(generation.get("skill_candidates") or [])
+        contract_errors = [
+            {"index": index, "error": error}
+            for index, candidate in enumerate(candidates)
+            if (error := _runner_candidate_contract_error(candidate))
+        ]
+        if contract_errors:
+            return {
+                "ok": False,
+                "status": "local_llm_candidate_contract_invalid",
+                "cycle_id": resolved_cycle_id,
+                "details": contract_errors,
+                "generation": {key: value for key, value in generation.items() if key != "skill_candidates"},
+                "poc_batches": poc_batches,
+            }
+
+        batch_result = run_skill_batch(
+            account=account,
+            cycle_id=resolved_cycle_id,
+            skill_candidates=candidates,
+            target_simulations=target_simulations,
+            budget_minutes=budget_minutes,
+            goal=goal,
+            max_simulations=max(4, min(20, int(max_simulations_per_batch))),
+            family_count=3,
+            submission_deferred=True,
+        )
+        poc_batches.append(
+            {
+                "batch_index": batch_index,
+                "generation": {key: value for key, value in generation.items() if key != "skill_candidates"},
+                "generated_candidates": [
+                    {"expression": item.get("expression"), "family": item.get("family")}
+                    for item in candidates
+                ],
+                "run_status": batch_result.get("status"),
+                "source_run_id": batch_result.get("source_run_id"),
+                "summary": (batch_result.get("batch_result") or {}).get("summary") or {},
+                "progress": batch_result.get("progress") or {},
+            }
+        )
+        snapshot = batch_result
+        if not batch_result.get("ok") or not batch_result.get("batch_executed"):
+            break
+        if (batch_result.get("progress") or {}).get("should_stop"):
+            break
+
+    final_snapshot = research_cycle_snapshot(account=account, cycle_id=resolved_cycle_id)
+    return {
+        "ok": bool(final_snapshot.get("ok")),
+        "status": final_snapshot.get("status"),
+        "cycle_id": resolved_cycle_id,
+        "model": model or os.environ.get("DEEPSEEK_MODEL") or "deepseek-v4-flash",
+        "thinking": thinking,
+        "reasoning_effort": reasoning_effort if thinking == "enabled" else None,
+        "formal_submission": False,
+        "poc_batches": poc_batches,
+        "research_cycle": final_snapshot.get("research_cycle"),
+        "progress": final_snapshot.get("progress"),
+        "planner_context": final_snapshot.get("planner_context"),
+    }
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="QuantGPT repo-local WorldQuant research-cycle runner")
     parser.add_argument("--account", default="primary")
@@ -1295,6 +1421,18 @@ def _build_parser() -> argparse.ArgumentParser:
 
     status = subparsers.add_parser("status")
     status.add_argument("--cycle-id")
+
+    local_poc = subparsers.add_parser("local-llm-poc")
+    local_poc.add_argument("--cycle-id")
+    local_poc.add_argument("--target-simulations", type=int, default=12)
+    local_poc.add_argument("--budget-minutes", type=int, default=15)
+    local_poc.add_argument("--max-batches", type=int, default=3)
+    local_poc.add_argument("--batch-size", type=int, default=2)
+    local_poc.add_argument("--max-simulations-per-batch", type=int, default=4)
+    local_poc.add_argument("--model")
+    local_poc.add_argument("--thinking", choices=["disabled", "enabled"], default="disabled")
+    local_poc.add_argument("--reasoning-effort", choices=["high", "max"], default="max")
+    local_poc.add_argument("--goal", default="maximize robust low-correlation WorldQuant candidates")
 
     def add_batch_arguments(batch_parser: argparse.ArgumentParser) -> None:
         batch_parser.add_argument("--cycle-id", required=True)
@@ -1362,6 +1500,20 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif args.command == "status":
         output = research_cycle_snapshot(account=args.account, cycle_id=args.cycle_id)
+    elif args.command == "local-llm-poc":
+        output = run_local_llm_poc(
+            account=args.account,
+            cycle_id=args.cycle_id,
+            target_simulations=args.target_simulations,
+            budget_minutes=args.budget_minutes,
+            max_batches=args.max_batches,
+            batch_size=args.batch_size,
+            max_simulations_per_batch=args.max_simulations_per_batch,
+            model=args.model,
+            thinking=args.thinking,
+            reasoning_effort=args.reasoning_effort,
+            goal=args.goal,
+        )
     elif args.command == "run-batch":
         output = enqueue_skill_batch(
             account=args.account,
