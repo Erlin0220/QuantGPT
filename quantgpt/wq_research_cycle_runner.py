@@ -569,6 +569,71 @@ def _effective_cycle_decision(
     return decision
 
 
+def _reconcile_cycle_from_active_session_sync(
+    account: str,
+    cycle: dict[str, Any],
+    active_session: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Recover primary-Simulation progress committed before a worker interruption.
+
+    ACTIVE-session progress is written immediately after a real research batch.
+    The repo-local runner writes its richer batch ledger immediately afterwards.
+    If a worker exits between those writes, the ACTIVE session is the restart-safe
+    deterministic witness for primary Simulation/iteration/Candidate counts.
+    Reconciliation is monotonic: it can only move runner counters upward.
+    """
+    if not active_session:
+        return cycle
+    active_cycle = active_session.get("research_cycle") or {}
+    cycle_id = str(cycle.get("cycle_id") or "")
+    if not cycle_id or str(active_cycle.get("cycle_id") or "") != cycle_id:
+        return cycle
+
+    counters = dict(cycle.get("counters") or {})
+    runner_simulations = max(0, int(counters.get("simulations") or 0))
+    runner_iterations = max(0, int(counters.get("iterations") or 0))
+    runner_candidates = max(0, int(counters.get("candidates") or 0))
+    active_simulations = max(0, int(active_cycle.get("simulations") or 0))
+    active_iterations = max(0, int(active_cycle.get("iterations") or 0))
+    active_candidates = max(0, int(active_cycle.get("candidates") or 0))
+    if (
+        active_simulations <= runner_simulations
+        and active_iterations <= runner_iterations
+        and active_candidates <= runner_candidates
+    ):
+        return cycle
+
+    updated = json.loads(json.dumps(cycle))
+    updated_counters = dict(updated.get("counters") or {})
+    updated_counters["simulations"] = max(runner_simulations, active_simulations)
+    updated_counters["iterations"] = max(runner_iterations, active_iterations)
+    updated_counters["candidates"] = max(runner_candidates, active_candidates)
+    updated_counters["total_brain_simulations"] = max(
+        int(updated_counters.get("total_brain_simulations") or 0),
+        updated_counters["simulations"],
+    )
+    updated["counters"] = updated_counters
+    recoveries = list(updated.get("recovery_events") or [])
+    recoveries.append({
+        "source": "active_first_session_research_cycle",
+        "recovered_at": _now_utc().isoformat(),
+        "simulations_before": runner_simulations,
+        "simulations_after": updated_counters["simulations"],
+        "iterations_before": runner_iterations,
+        "iterations_after": updated_counters["iterations"],
+        "candidates_before": runner_candidates,
+        "candidates_after": updated_counters["candidates"],
+    })
+    updated["recovery_events"] = recoveries[-20:]
+    updated["updated_at"] = _now_utc().isoformat()
+    progress = research_cycle_progress(updated)
+    if progress["stop_reason"]:
+        updated["status"] = "COMPLETED" if progress["stop_reason"] in {"target_reached", "budget_exhausted"} else "FAILED"
+        updated["stop_reason"] = progress["stop_reason"]
+        updated["next_action"] = "cycle_complete"
+    return update_research_cycle_sync(cycle_id, account, updated)
+
+
 def research_cycle_snapshot(
     *,
     account: str = "primary",
@@ -591,12 +656,13 @@ def research_cycle_snapshot(
             return {"ok": False, "status": "research_cycle_not_found", "cycle_id": cycle_id}
         cycle_id = str(cycle.get("cycle_id") or cycle_id or "")
     cycle = _recover_stale_cycle_inflight_sync(account, cycle)
+    active_session = _run_coro_sync(get_active_first_session(account))
+    cycle = _reconcile_cycle_from_active_session_sync(account, cycle, active_session)
     policy = dict(_run_coro_sync(get_submission_policy_status(account)))
     memory = load_research_memory_sync(account)
     memory["inventory"] = policy.get("inventory") or {}
     memory["submission"] = policy
     control = build_research_control_tower(memory, policy)
-    active_session = _run_coro_sync(get_active_first_session(account))
     progress = research_cycle_progress(cycle)
     return {
         "ok": True,

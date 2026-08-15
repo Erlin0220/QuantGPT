@@ -130,6 +130,56 @@ def test_recover_stale_batch_inflight_when_runner_owner_is_dead(monkeypatch):
     assert persisted["batch_inflight"] is False
 
 
+def test_reconcile_cycle_recovers_primary_progress_from_matching_active_session(monkeypatch):
+    state = _cycle()
+    state["counters"].update({"simulations": 17, "iterations": 3, "candidates": 0, "total_brain_simulations": 17})
+    state["deadline_at"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    persisted = {}
+
+    def update_cycle(_cycle_id, _account, updated):
+        persisted.update(updated)
+        return {"task_id": "cycle-task", **updated}
+
+    monkeypatch.setattr(runner, "update_research_cycle_sync", update_cycle)
+    active_session = {
+        "research_cycle": {
+            "cycle_id": state["cycle_id"],
+            "simulations": 21,
+            "iterations": 4,
+            "candidates": 1,
+        }
+    }
+
+    recovered = runner._reconcile_cycle_from_active_session_sync("primary", state, active_session)
+
+    assert recovered["counters"]["simulations"] == 21
+    assert recovered["counters"]["iterations"] == 4
+    assert recovered["counters"]["candidates"] == 1
+    assert recovered["counters"]["total_brain_simulations"] == 21
+    assert recovered["stop_reason"] == "budget_exhausted"
+    assert recovered["next_action"] == "cycle_complete"
+    assert recovered["recovery_events"][-1]["simulations_before"] == 17
+    assert recovered["recovery_events"][-1]["simulations_after"] == 21
+    assert persisted["counters"]["simulations"] == 21
+
+
+def test_reconcile_cycle_ignores_other_active_session_cycle(monkeypatch):
+    state = _cycle()
+    monkeypatch.setattr(
+        runner,
+        "update_research_cycle_sync",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not persist unrelated cycle")),
+    )
+
+    recovered = runner._reconcile_cycle_from_active_session_sync(
+        "primary",
+        state,
+        {"research_cycle": {"cycle_id": "other-cycle", "simulations": 99, "iterations": 9}},
+    )
+
+    assert recovered is state
+
+
 def test_live_runner_owner_keeps_batch_inflight(monkeypatch):
     state = runner.set_research_cycle_inflight(_cycle(), True)
     monkeypatch.setattr(runner, "_runner_lock_owner_status", lambda _path: True)
