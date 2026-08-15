@@ -113,7 +113,23 @@ def test_cycle_decision_prioritizes_submission_without_stopping_cycle():
     }
 
     assert runner._cycle_decision(state, policy) == "SUBMISSION_REQUIRED"
+    assert runner._effective_cycle_decision(state, policy) == "SUBMISSION_REQUIRED"
+    assert runner._effective_cycle_decision(state, policy, submission_deferred=True) == "NEEDS_SKILL_BATCH"
     assert runner.research_cycle_progress(state)["should_stop"] is False
+
+
+def test_submission_deferred_does_not_override_cycle_stop_gate():
+    started = datetime(2026, 8, 15, 8, 0, tzinfo=timezone.utc)
+    state = _cycle(started)
+    state["counters"]["simulations"] = 100
+    policy = {
+        "remaining_submission_slots": 2,
+        "submission_candidate_top": [{"alpha_id": "ready"}],
+        "submission_frozen": False,
+        "submission_reconciliation_required": False,
+    }
+
+    assert runner._effective_cycle_decision(state, policy, submission_deferred=True, now=started) == "TARGET_REACHED"
 
 
 def test_runner_contract_requires_economic_hypothesis_skill():
@@ -147,7 +163,7 @@ def test_run_skill_batch_uses_direct_service_and_persists_cycle(monkeypatch):
         return {
             "remaining_active_target": 2,
             "remaining_submission_slots": 2,
-            "submission_candidate_top": [],
+            "submission_candidate_top": [{"alpha_id": "deferred-ready"}],
             "submission_frozen": False,
             "submission_reconciliation_required": False,
             "inventory": {},
@@ -207,6 +223,7 @@ def test_run_skill_batch_uses_direct_service_and_persists_cycle(monkeypatch):
         cycle_id="20260815-1600",
         skill_candidates=[_skill_candidate()],
         max_simulations=8,
+        submission_deferred=True,
     )
 
     assert result["ok"] is True

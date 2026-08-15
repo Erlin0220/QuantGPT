@@ -500,6 +500,19 @@ def _cycle_decision(cycle: dict[str, Any], policy: dict[str, Any], *, now: datet
     return "NEEDS_SKILL_BATCH"
 
 
+def _effective_cycle_decision(
+    cycle: dict[str, Any],
+    policy: dict[str, Any],
+    *,
+    submission_deferred: bool = False,
+    now: datetime | None = None,
+) -> str:
+    decision = _cycle_decision(cycle, policy, now=now)
+    if submission_deferred and decision in {"SUBMISSION_REQUIRED", "RECONCILIATION_REQUIRED"}:
+        return "NEEDS_SKILL_BATCH"
+    return decision
+
+
 def research_cycle_snapshot(
     *,
     account: str = "primary",
@@ -558,6 +571,7 @@ def _run_skill_batch_locked(
     family_count: int = 3,
     min_sharpe: float = 1.25,
     min_fitness: float = 1.0,
+    submission_deferred: bool = False,
 ) -> dict[str, Any]:
     cycle = ensure_research_cycle_sync(
         account,
@@ -566,7 +580,7 @@ def _run_skill_batch_locked(
         budget_minutes=budget_minutes,
     )
     policy = dict(_run_coro_sync(get_submission_policy_status(account)))
-    decision = _cycle_decision(cycle, policy)
+    decision = _effective_cycle_decision(cycle, policy, submission_deferred=submission_deferred)
     if decision != "NEEDS_SKILL_BATCH":
         snapshot = research_cycle_snapshot(account=account, cycle_id=cycle_id)
         snapshot["batch_executed"] = False
@@ -619,6 +633,7 @@ def _run_skill_batch_locked(
         "min_fitness": min_fitness,
         "research_cycle_id": cycle_id,
         "request_id": request_id,
+        "submission_deferred": bool(submission_deferred),
     }
     try:
         if not client.authenticate():
@@ -750,6 +765,7 @@ def run_skill_batch(
     family_count: int = 3,
     min_sharpe: float = 1.25,
     min_fitness: float = 1.0,
+    submission_deferred: bool = False,
 ) -> dict[str, Any]:
     try:
         with _runner_process_lock(account, budget_minutes=budget_minutes):
@@ -799,6 +815,7 @@ def run_skill_batch(
                     family_count=family_count,
                     min_sharpe=min_sharpe,
                     min_fitness=min_fitness,
+                    submission_deferred=submission_deferred,
                 )
             finally:
                 latest = get_research_cycle_sync(account, cycle_id) or inflight_cycle
@@ -853,6 +870,11 @@ def _build_parser() -> argparse.ArgumentParser:
     run_batch.add_argument("--family-count", type=int, default=3)
     run_batch.add_argument("--min-sharpe", type=float, default=1.25)
     run_batch.add_argument("--min-fitness", type=float, default=1.0)
+    run_batch.add_argument(
+        "--submission-deferred",
+        action="store_true",
+        help="Continue research only after the caller explicitly deferred an otherwise-prioritized submission/reconciliation action.",
+    )
     return parser
 
 
@@ -888,6 +910,7 @@ def main(argv: list[str] | None = None) -> int:
             family_count=args.family_count,
             min_sharpe=args.min_sharpe,
             min_fitness=args.min_fitness,
+            submission_deferred=args.submission_deferred,
         )
     print(json.dumps(output, ensure_ascii=False, indent=2, default=str))
     return 0 if output.get("ok") else 1
