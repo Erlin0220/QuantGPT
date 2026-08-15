@@ -1084,8 +1084,20 @@ def test_strict_skill_mode_does_not_run_native_decay_rescue(monkeypatch):
             return {"rank", "close"}
 
     monkeypatch.setattr(autonomous, "run_list_alphas", lambda *_args, **_kwargs: {"ok": True, "alphas": []})
-    monkeypatch.setattr(autonomous, "_live_field_candidates", lambda *_args, **_kwargs: ([], {"available": False}))
-    monkeypatch.setattr(autonomous, "_active_dataset_sibling_fields", lambda *_args, **_kwargs: ([], {"available": False}))
+    monkeypatch.setattr(
+        autonomous,
+        "_live_field_candidates",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("strict Skill-first must not run broad live field discovery")
+        ),
+    )
+    monkeypatch.setattr(
+        autonomous,
+        "_active_dataset_sibling_fields",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("strict Skill-first must not scan ACTIVE sibling fields")
+        ),
+    )
     monkeypatch.setattr(
         autonomous,
         "_run_native_decay_rescue",

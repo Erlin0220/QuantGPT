@@ -2381,27 +2381,45 @@ def run_autonomous_research(
     )
 
     field_probe_budget = max(3, min(first_budget, max(active_motif_budget, math.ceil(first_budget * 0.20))))
-    live_fields, live_catalog = _live_field_candidates(
-        client,
-        memory,
-        region=region,
-        universe=universe,
-        delay=delay,
-        limit=field_probe_budget,
-    )
-    active_sibling_fields, active_sibling_catalog = _active_dataset_sibling_fields(
-        client,
-        active_alphas,
-        region=region,
-        universe=universe,
-        delay=delay,
-        limit=max(field_probe_budget, active_motif_budget * 2),
-    )
-    if active_sibling_fields:
-        sibling_ids = {_live_field_id(item) for item in active_sibling_fields}
-        live_fields = active_sibling_fields + [
-            item for item in live_fields if _live_field_id(item) not in sibling_ids
-        ]
+    if strict_skill_mode:
+        # Skill-first candidates already declare the fields ChatGPT selected from
+        # the live Data Explorer. build_skill_plan re-resolves every non-core
+        # declared field exactly against BRAIN before simulation, so a broad
+        # dataset/sibling scan here adds rate-limit cost without adding candidates.
+        live_fields = []
+        live_catalog = {
+            "available": True,
+            "count": 0,
+            "broad_probe_skipped": True,
+            "validation_mode": "skill_declared_exact_lookup",
+        }
+        active_sibling_catalog = {
+            "available": True,
+            "count": 0,
+            "broad_probe_skipped": True,
+        }
+    else:
+        live_fields, live_catalog = _live_field_candidates(
+            client,
+            memory,
+            region=region,
+            universe=universe,
+            delay=delay,
+            limit=field_probe_budget,
+        )
+        active_sibling_fields, active_sibling_catalog = _active_dataset_sibling_fields(
+            client,
+            active_alphas,
+            region=region,
+            universe=universe,
+            delay=delay,
+            limit=max(field_probe_budget, active_motif_budget * 2),
+        )
+        if active_sibling_fields:
+            sibling_ids = {_live_field_id(item) for item in active_sibling_fields}
+            live_fields = active_sibling_fields + [
+                item for item in live_fields if _live_field_id(item) not in sibling_ids
+            ]
     live_catalog["active_dataset_siblings"] = active_sibling_catalog
     active_motif_plan = build_active_motif_plan(
         client,
