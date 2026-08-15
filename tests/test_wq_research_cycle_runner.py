@@ -177,6 +177,49 @@ def test_reconcile_cycle_recovers_primary_progress_from_matching_active_session(
     assert persisted["counters"]["simulations"] == 21
 
 
+def test_finalize_cycle_persists_budget_expiry_without_active_session_recovery(monkeypatch):
+    started = datetime(2026, 8, 15, 8, 0, tzinfo=timezone.utc)
+    state = _cycle(started)
+    state["deadline_at"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    persisted = {}
+
+    def update_cycle(_cycle_id, _account, updated):
+        persisted.update(updated)
+        return {"task_id": "cycle-task", **updated}
+
+    monkeypatch.setattr(runner, "update_research_cycle_sync", update_cycle)
+
+    finalized = runner._finalize_cycle_if_stopped_sync("primary", state)
+
+    assert finalized["status"] == "COMPLETED"
+    assert finalized["stop_reason"] == "budget_exhausted"
+    assert finalized["next_action"] == "cycle_complete"
+    assert persisted["status"] == "COMPLETED"
+
+
+def test_start_coalesces_existing_running_cycle(monkeypatch):
+    state = _cycle()
+    monkeypatch.setattr(runner, "_runner_process_lock", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(runner, "get_research_cycle_sync", lambda *_args, **_kwargs: state)
+    monkeypatch.setattr(runner, "_recover_stale_cycle_inflight_sync", lambda _account, cycle: cycle)
+    monkeypatch.setattr(runner, "_finalize_cycle_if_stopped_sync", lambda _account, cycle: cycle)
+    monkeypatch.setattr(
+        runner,
+        "research_cycle_snapshot",
+        lambda **kwargs: {
+            "ok": True,
+            "status": "NEEDS_SKILL_BATCH",
+            "cycle_id": kwargs["cycle_id"],
+            "research_cycle": state,
+        },
+    )
+
+    snapshot = runner.start_research_cycle_snapshot(account="primary")
+
+    assert snapshot["cycle_id"] == state["cycle_id"]
+    assert snapshot["coalesced_existing_cycle"] is True
+
+
 def test_reconcile_cycle_ignores_other_active_session_cycle(monkeypatch):
     state = _cycle()
     monkeypatch.setattr(

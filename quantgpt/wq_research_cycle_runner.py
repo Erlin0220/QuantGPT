@@ -260,7 +260,7 @@ async def _get_latest_research_cycle_task(account: str) -> TaskModel | None:
         result = await session.execute(
             select(TaskModel)
             .where(TaskModel.user_id == _DEV_USER_ID, TaskModel.task_type == _TASK_TYPE)
-            .order_by(TaskModel.updated_at.desc())
+            .order_by(TaskModel.created_at.desc())
             .limit(20)
         )
         for task in result.scalars().all():
@@ -648,6 +648,25 @@ def _reconcile_cycle_from_active_session_sync(
     return update_research_cycle_sync(cycle_id, account, updated)
 
 
+def _finalize_cycle_if_stopped_sync(account: str, cycle: dict[str, Any]) -> dict[str, Any]:
+    progress = research_cycle_progress(cycle)
+    stop_reason = progress.get("stop_reason")
+    if not stop_reason or str(cycle.get("status") or "").upper() in {"COMPLETED", "FAILED"}:
+        return cycle
+    updated = json.loads(json.dumps(cycle))
+    updated["status"] = "COMPLETED" if stop_reason in {"target_reached", "budget_exhausted"} else "FAILED"
+    updated["stop_reason"] = stop_reason
+    if not updated.get("completed_at"):
+        updated["completed_at"] = (
+            str(updated.get("deadline_at") or _now_utc().isoformat())
+            if stop_reason == "budget_exhausted"
+            else _now_utc().isoformat()
+        )
+    updated["next_action"] = "cycle_complete"
+    updated["updated_at"] = _now_utc().isoformat()
+    return update_research_cycle_sync(str(updated.get("cycle_id") or ""), account, updated)
+
+
 def research_cycle_snapshot(
     *,
     account: str = "primary",
@@ -672,6 +691,7 @@ def research_cycle_snapshot(
     cycle = _recover_stale_cycle_inflight_sync(account, cycle)
     active_session = _run_coro_sync(get_active_first_session(account))
     cycle = _reconcile_cycle_from_active_session_sync(account, cycle, active_session)
+    cycle = _finalize_cycle_if_stopped_sync(account, cycle)
     policy = dict(_run_coro_sync(get_submission_policy_status(account)))
     memory = load_research_memory_sync(account)
     memory["inventory"] = policy.get("inventory") or {}
@@ -1261,14 +1281,39 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def start_research_cycle_snapshot(
+    *,
+    account: str = "primary",
+    cycle_id: str | None = None,
+    target_simulations: int = _DEFAULT_TARGET_SIMULATIONS,
+    budget_minutes: int = _DEFAULT_BUDGET_MINUTES,
+) -> dict[str, Any]:
+    with _runner_process_lock(account, budget_minutes=budget_minutes):
+        if cycle_id is None:
+            latest = get_research_cycle_sync(account)
+            if latest is not None:
+                latest = _recover_stale_cycle_inflight_sync(account, latest)
+                latest = _finalize_cycle_if_stopped_sync(account, latest)
+                if str(latest.get("status") or "").upper() == "RUNNING":
+                    snapshot = research_cycle_snapshot(account=account, cycle_id=str(latest.get("cycle_id") or ""))
+                    snapshot["coalesced_existing_cycle"] = True
+                    return snapshot
+            cycle_id = generate_research_cycle_id()
+        return research_cycle_snapshot(
+            account=account,
+            cycle_id=cycle_id,
+            create=True,
+            target_simulations=target_simulations,
+            budget_minutes=budget_minutes,
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == "start":
-        cycle_id = args.cycle_id or generate_research_cycle_id()
-        output = research_cycle_snapshot(
+        output = start_research_cycle_snapshot(
             account=args.account,
-            cycle_id=cycle_id,
-            create=True,
+            cycle_id=args.cycle_id,
             target_simulations=args.target_simulations,
             budget_minutes=args.budget_minutes,
         )
