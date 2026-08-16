@@ -254,7 +254,11 @@ def _compact_planner_context(planner_context: dict[str, Any]) -> dict[str, Any]:
         "next_focus": planner_context.get("next_focus"),
         "selected_cells": list(planner_context.get("selected_cells") or [])[:1],
         "failure_counts": planner_context.get("failure_counts") or {},
-        "dominant_bottleneck_stage": planner_context.get("dominant_bottleneck_stage"),
+        "dominant_bottleneck_stage": (
+            "primary_metrics_gate"
+            if planner_context.get("dominant_bottleneck_stage") == "failure_diagnosis"
+            else planner_context.get("dominant_bottleneck_stage")
+        ),
         "avoid_structure_signatures": list(planner_context.get("avoid_structure_signatures") or [])[:12],
         "research_memory_positive": list(planner_context.get("research_memory_positive") or [])[:1],
         "research_memory_negative": list(planner_context.get("research_memory_negative") or [])[:1],

@@ -358,6 +358,18 @@ def test_normalize_diversify_candidate_preserves_diversity_contract():
     assert runner._runner_candidate_contract_error(candidate) is None
 
 
+def test_compact_planner_context_translates_legacy_diagnosis_bottleneck():
+    compact = generator._compact_planner_context(
+        {
+            "dominant_bottleneck_stage": "failure_diagnosis",
+            "failure_counts": {"low_fitness": 98},
+        }
+    )
+
+    assert compact["dominant_bottleneck_stage"] == "primary_metrics_gate"
+    assert compact["failure_counts"]["low_fitness"] == 98
+
+
 def test_adaptive_reasoning_uses_fast_for_new_hypotheses():
     mode = runner._local_llm_reasoning_mode({"current_cycle_trial_evidence": []}, "adaptive")
     assert mode["thinking"] == "disabled"
