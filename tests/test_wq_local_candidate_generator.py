@@ -358,6 +358,24 @@ def test_normalize_diversify_candidate_preserves_diversity_contract():
     assert runner._runner_candidate_contract_error(candidate) is None
 
 
+def test_compact_planner_context_preserves_scheduler_exploration_cell_without_full_payload():
+    compact = generator._compact_planner_context(
+        {
+            "selected_cells": [
+                {"cell_key": "a", "family": "fundamental_a", "dataset": "fundamental6", "rationale": "posterior_exploitation", "recent_failure_reasons": {"low_fitness": 9}},
+                {"cell_key": "b", "family": "fundamental_b", "dataset": "fundamental6", "rationale": "posterior_exploitation"},
+                {"cell_key": "c", "family": "analyst_a", "dataset": "analyst4", "rationale": "posterior_exploitation"},
+                {"cell_key": "d", "family": "model_a", "dataset": "model16", "rationale": "forced_exploration", "last_sampled_at": "ignored"},
+            ]
+        }
+    )
+
+    assert [item["cell_key"] for item in compact["selected_cells"]] == ["a", "b", "c", "d"]
+    assert compact["selected_cells"][-1]["rationale"] == "forced_exploration"
+    assert "last_sampled_at" not in compact["selected_cells"][-1]
+    assert "recent_failure_reasons" not in compact["selected_cells"][0]
+
+
 def test_compact_planner_context_keeps_cross_dataset_examples_when_forced_diversify():
     compact = generator._compact_planner_context(
         {

@@ -244,6 +244,40 @@ def _normalize_candidate(raw: dict[str, Any], planner_context: dict[str, Any] | 
     return candidate
 
 
+def _compact_selected_cell(item: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "cell_key",
+        "family",
+        "dataset",
+        "operator_pattern",
+        "slots",
+        "rationale",
+        "active",
+        "formal_submissions",
+        "terminal_failures",
+        "sc_fail_rate",
+        "effective_allocation_score",
+    )
+    return {key: item.get(key) for key in keys if item.get(key) is not None}
+
+
+def _allocated_context_cells(items: Any, *, force_diversify: bool) -> list[dict[str, Any]]:
+    values = [item for item in (items or []) if isinstance(item, dict)]
+    if not values:
+        return []
+    if force_diversify:
+        chosen = _diverse_context_slice(values, limit=4)
+    else:
+        chosen = list(values[:3])
+        exploration = next(
+            (item for item in values if str(item.get("rationale") or "") == "forced_exploration"),
+            None,
+        )
+        if exploration is not None and exploration not in chosen:
+            chosen.append(exploration)
+    return [_compact_selected_cell(item) for item in chosen]
+
+
 def _diverse_context_slice(items: Any, *, limit: int) -> list[dict[str, Any]]:
     """Keep a tiny cross-dataset/family sample instead of only the top exploitation cell."""
     values = [item for item in (items or []) if isinstance(item, dict)]
@@ -293,10 +327,9 @@ def _diverse_context_slice(items: Any, *, limit: int) -> list[dict[str, Any]]:
 def _compact_planner_context(planner_context: dict[str, Any]) -> dict[str, Any]:
     """Keep only decision-relevant evidence for the next candidate batch."""
     force_diversify = bool(planner_context.get("local_llm_force_diversify"))
-    selected_cells = (
-        _diverse_context_slice(planner_context.get("selected_cells"), limit=4)
-        if force_diversify
-        else list(planner_context.get("selected_cells") or [])[:1]
+    selected_cells = _allocated_context_cells(
+        planner_context.get("selected_cells"),
+        force_diversify=force_diversify,
     )
     positive_memory = (
         _diverse_context_slice(planner_context.get("research_memory_positive"), limit=4)
@@ -395,6 +428,7 @@ Rules:
 - Every expression must differ in mechanism/information source or structure, not just a lookback number.
 - Every expression in exclude_expressions is HARD-FORBIDDEN; never return it again.
 - If force_diversify=true, every candidate MUST use route=DIVERSIFY and diversity_case.changed_dimensions MUST include information_source or economic_mechanism. Prefer a family outside recent_families and change the data source/operator skeleton rather than only a window.
+- selected_cells preserves the scheduler's exploitation/exploration allocation. If any selected cell has rationale=forced_exploration, reserve roughly one candidate in a four-candidate batch for a genuinely different information source/mechanism. If that cell names a dataset but no exact non-core field id is supplied, use an orthogonal core price/volume mechanism instead of inventing a field id.
 - data_fields must list every data field used by the expression and no operators.
 - Use knowledge_card_ids only when an id is literally present in supplied context; otherwise [].
 - Do not invent historical performance, Sharpe, Fitness, correlation, or platform checks.
