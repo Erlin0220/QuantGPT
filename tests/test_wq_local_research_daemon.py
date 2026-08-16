@@ -52,3 +52,4 @@ def test_daemon_runs_restart_safe_cycles_and_never_requests_submission(monkeypat
     assert all(call["reasoning_policy"] == "adaptive" for call in calls)
     assert all(call["target_simulations"] == 100 for call in calls)
     assert all(call["budget_minutes"] == 50 for call in calls)
+    assert all(call["batch_size"] == 4 for call in calls)

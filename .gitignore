@@ -30,6 +30,10 @@ frontend/dist/
 logs/
 .quantgpt.pid
 .quantgpt.server.lock
+.wq-local-research.pid
+.wq-local-research.lock
+*.db-shm
+*.db-wal
 *.bak-*
 
 # MCP config (local paths)

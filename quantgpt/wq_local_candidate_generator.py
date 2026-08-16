@@ -241,6 +241,9 @@ def _compact_planner_context(planner_context: dict[str, Any]) -> dict[str, Any]:
             or []
         )[:30],
         "contract_feedback": list(planner_context.get("local_llm_contract_feedback") or [])[:8],
+        "duplicate_pressure": planner_context.get("local_llm_duplicate_pressure") or {},
+        "force_diversify": bool(planner_context.get("local_llm_force_diversify")),
+        "recent_families": list(planner_context.get("local_llm_recent_families") or [])[:8],
     }
 
 
@@ -300,6 +303,8 @@ Return this shape:
 
 Rules:
 - Every expression must differ in mechanism/information source or structure, not just a lookback number.
+- Every expression in exclude_expressions is HARD-FORBIDDEN; never return it again.
+- If force_diversify=true, every candidate MUST use route=DIVERSIFY and diversity_case.changed_dimensions MUST include information_source or economic_mechanism. Prefer a family outside recent_families and change the data source/operator skeleton rather than only a window.
 - data_fields must list every data field used by the expression and no operators.
 - Use knowledge_card_ids only when an id is literally present in supplied context; otherwise [].
 - Do not invent historical performance, Sharpe, Fitness, correlation, or platform checks.
@@ -400,49 +405,90 @@ def generate_local_skill_batch(
 
     candidates: list[dict[str, Any]] = []
     seen_expressions: set[str] = set()
-    request_count = 0
-    while len(candidates) < size:
-        remaining = size - len(candidates)
-        requested_chunk = min(chunk_size, remaining)
-        chunk_context = dict(planner_context)
-        inherited_exclusions = list(
+    inherited_exclusions = {
+        str(value).strip()
+        for value in (
             planner_context.get("local_llm_exclude_expressions")
             or planner_context.get("local_poc_exclude_expressions")
             or []
         )
-        chunk_context["local_llm_exclude_expressions"] = [*inherited_exclusions, *seen_expressions]
-        messages = _build_messages(chunk_context, batch_size=requested_chunk, skill_context=skill_context)
-        content = _request_candidate_content(
-            base_url=base_url,
-            api_key=api_key,
-            model=resolved_model,
-            messages=messages,
-            timeout_seconds=timeout_seconds,
-            thinking=resolved_thinking,
-            reasoning_effort=resolved_effort,
-        )
-        request_count += 1
-        decoded = _extract_json_payload(content)
-        raw_candidates = _candidate_items_from_payload(decoded)
-        if not raw_candidates:
-            raise LocalCandidateGenerationError("LLM JSON did not contain candidate objects")
+        if str(value).strip()
+    }
+    force_diversify = bool(planner_context.get("local_llm_force_diversify"))
+    request_count = 0
+    chunk_attempt_limit = max(1, min(5, int(os.environ.get("WQ_LOCAL_LLM_CHUNK_ATTEMPTS") or 3)))
+    while len(candidates) < size:
+        remaining = size - len(candidates)
+        requested_chunk = min(chunk_size, remaining)
         added = 0
-        for item in raw_candidates:
-            if not isinstance(item, dict):
+        rejection_feedback: list[dict[str, Any]] = []
+        for _chunk_attempt in range(1, chunk_attempt_limit + 1):
+            chunk_context = dict(planner_context)
+            chunk_context["local_llm_exclude_expressions"] = [*inherited_exclusions, *seen_expressions]
+            if rejection_feedback:
+                chunk_context["local_llm_contract_feedback"] = [
+                    *list(planner_context.get("local_llm_contract_feedback") or []),
+                    *rejection_feedback,
+                ][-8:]
+            messages = _build_messages(chunk_context, batch_size=requested_chunk, skill_context=skill_context)
+            content = _request_candidate_content(
+                base_url=base_url,
+                api_key=api_key,
+                model=resolved_model,
+                messages=messages,
+                timeout_seconds=timeout_seconds,
+                thinking=resolved_thinking,
+                reasoning_effort=resolved_effort,
+            )
+            request_count += 1
+            decoded = _extract_json_payload(content)
+            raw_candidates = _candidate_items_from_payload(decoded)
+            if not raw_candidates:
+                rejection_feedback.append({"error": "LLM JSON did not contain candidate objects"})
                 continue
-            candidate = _normalize_candidate(item, planner_context)
-            expression = candidate["expression"]
-            if not expression or "#" in expression or expression in seen_expressions:
-                continue
-            if not candidate["hypothesis"] or not candidate["family"] or not candidate["data_fields"]:
-                continue
-            seen_expressions.add(expression)
-            candidates.append(candidate)
-            added += 1
-            if len(candidates) >= size:
+            for item in raw_candidates:
+                if not isinstance(item, dict):
+                    continue
+                candidate = _normalize_candidate(item, planner_context)
+                expression = candidate["expression"]
+                if not expression or "#" in expression:
+                    rejection_feedback.append({"expression": expression, "error": "invalid_expression"})
+                    continue
+                if expression in inherited_exclusions:
+                    rejection_feedback.append({"expression": expression, "error": "duplicate_expression_history"})
+                    continue
+                if expression in seen_expressions:
+                    rejection_feedback.append({"expression": expression, "error": "duplicate_expression_batch"})
+                    continue
+                if force_diversify:
+                    changed_dimensions = {
+                        str(value)
+                        for value in ((candidate.get("diversity_case") or {}).get("changed_dimensions") or [])
+                    }
+                    if candidate.get("local_llm_route") != "DIVERSIFY" or not (
+                        {"information_source", "economic_mechanism"} & changed_dimensions
+                    ):
+                        rejection_feedback.append(
+                            {
+                                "expression": expression,
+                                "error": "forced_diversify_requires_new_information_source_or_mechanism",
+                            }
+                        )
+                        continue
+                if not candidate["hypothesis"] or not candidate["family"] or not candidate["data_fields"]:
+                    rejection_feedback.append({"expression": expression, "error": "missing_candidate_metadata"})
+                    continue
+                seen_expressions.add(expression)
+                candidates.append(candidate)
+                added += 1
+                if len(candidates) >= size:
+                    break
+            if added > 0:
                 break
         if added == 0:
-            raise LocalCandidateGenerationError("LLM returned no new structurally usable candidates")
+            raise LocalCandidateGenerationError(
+                "LLM returned no new structurally usable candidates after hard duplicate/diversity filtering"
+            )
 
     return {
         "provider": "opencode-go-compatible",

@@ -1321,6 +1321,47 @@ def _local_llm_reasoning_mode(planner_context: dict[str, Any], policy: str = "ad
     return {"thinking": "disabled", "reasoning_effort": None, "reason": "weak_failure_explore_broadly"}
 
 
+def _local_llm_duplicate_pressure(cycle: dict[str, Any], *, window: int = 4) -> dict[str, Any]:
+    """Detect when recent local-LLM rounds are wasting work on historical duplicates."""
+    rounds = [
+        item
+        for item in ((cycle.get("local_llm") or {}).get("rounds") or [])
+        if isinstance(item, dict)
+    ]
+    recent = rounds[-max(1, int(window)) :]
+    duplicate_rejections = 0
+    zero_sim_rounds = 0
+    consecutive_zero_sim_rounds = 0
+    recent_families: list[str] = []
+    for round_item in recent:
+        simulated = int((round_item.get("summary") or {}).get("simulated") or 0)
+        if str(round_item.get("status") or "").startswith("completed") and simulated <= 0:
+            zero_sim_rounds += 1
+        for rejection in round_item.get("skill_plan_rejections") or []:
+            if isinstance(rejection, dict) and str(rejection.get("reason") or "") == "duplicate_expression_history":
+                duplicate_rejections += 1
+        for candidate in round_item.get("generated_candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            family = str(candidate.get("family") or "").strip()
+            if family and family not in recent_families:
+                recent_families.append(family)
+    for round_item in reversed(recent):
+        simulated = int((round_item.get("summary") or {}).get("simulated") or 0)
+        if not str(round_item.get("status") or "").startswith("completed") or simulated > 0:
+            break
+        consecutive_zero_sim_rounds += 1
+    force_diversify = consecutive_zero_sim_rounds >= 2 or duplicate_rejections >= 3
+    return {
+        "window": len(recent),
+        "duplicate_rejections": duplicate_rejections,
+        "zero_sim_rounds": zero_sim_rounds,
+        "consecutive_zero_sim_rounds": consecutive_zero_sim_rounds,
+        "force_diversify": force_diversify,
+        "recent_families": recent_families[-8:],
+    }
+
+
 def _local_llm_round_expressions(cycle: dict[str, Any]) -> list[str]:
     expressions: list[str] = []
     local_llm = cycle.get("local_llm") or {}
@@ -1392,7 +1433,7 @@ def run_local_llm_research(
     target_simulations: int = _DEFAULT_TARGET_SIMULATIONS,
     budget_minutes: int = _DEFAULT_BUDGET_MINUTES,
     max_batches: int = 50,
-    batch_size: int = 2,
+    batch_size: int = 4,
     max_simulations_per_batch: int = 4,
     model: str | None = None,
     reasoning_policy: str = "adaptive",
@@ -1429,7 +1470,11 @@ def run_local_llm_research(
     completed_rounds: list[dict[str, Any]] = []
     exit_status: str | None = None
     limit = max(1, min(100, int(max_batches)))
-    for _batch_index in range(1, limit + 1):
+    productive_batches = 0
+    generation_attempts = 0
+    attempt_limit = max(limit + 5, min(300, limit * 3))
+    while productive_batches < limit and generation_attempts < attempt_limit:
+        generation_attempts += 1
         snapshot = research_cycle_snapshot(account=account, cycle_id=resolved_cycle_id)
         if not snapshot.get("ok"):
             break
@@ -1450,7 +1495,11 @@ def run_local_llm_research(
         planner_context = dict(snapshot.get("planner_context") or {})
         cycle = dict(snapshot.get("research_cycle") or {})
         pending_round = _pending_local_llm_round(cycle)
+        duplicate_pressure = _local_llm_duplicate_pressure(cycle)
         planner_context["local_llm_exclude_expressions"] = _local_llm_round_expressions(cycle)
+        planner_context["local_llm_duplicate_pressure"] = duplicate_pressure
+        planner_context["local_llm_force_diversify"] = bool(duplicate_pressure.get("force_diversify"))
+        planner_context["local_llm_recent_families"] = list(duplicate_pressure.get("recent_families") or [])
 
         if pending_round:
             round_event = dict(pending_round)
@@ -1558,9 +1607,10 @@ def run_local_llm_research(
         )
         batch_payload = dict(batch_result.get("batch_result") or {})
         executed = bool(batch_result.get("batch_executed"))
+        simulated = int((batch_payload.get("summary") or {}).get("simulated") or 0)
         round_event.update(
             {
-                "status": "completed" if executed else "pending_execution",
+                "status": "completed" if executed and simulated > 0 else "completed_no_simulation" if executed else "pending_execution",
                 "completed_at": _now_utc().isoformat() if executed else None,
                 "run_status": batch_result.get("status"),
                 "source_run_id": batch_result.get("source_run_id"),
@@ -1576,6 +1626,8 @@ def run_local_llm_research(
             snapshot = batch_result
             exit_status = str(batch_result.get("status") or "local_research_execution_blocked")
             break
+        if simulated > 0:
+            productive_batches += 1
         if (batch_result.get("progress") or {}).get("should_stop"):
             snapshot = batch_result
             break
@@ -1590,6 +1642,8 @@ def run_local_llm_research(
         "reasoning_policy": reasoning_policy,
         "submission_deferred": bool(submission_deferred),
         "formal_submission": False,
+        "productive_batches_this_run": productive_batches,
+        "generation_attempts_this_run": generation_attempts,
         "local_llm_rounds_this_run": completed_rounds,
         "local_llm_state": final_cycle.get("local_llm") or {},
         "research_cycle": final_cycle,
@@ -1651,7 +1705,7 @@ def _build_parser() -> argparse.ArgumentParser:
     local_research.add_argument("--target-simulations", type=int, default=_DEFAULT_TARGET_SIMULATIONS)
     local_research.add_argument("--budget-minutes", type=int, default=_DEFAULT_BUDGET_MINUTES)
     local_research.add_argument("--max-batches", type=int, default=50)
-    local_research.add_argument("--batch-size", type=int, default=2)
+    local_research.add_argument("--batch-size", type=int, default=4)
     local_research.add_argument("--max-simulations-per-batch", type=int, default=4)
     local_research.add_argument("--model")
     local_research.add_argument("--reasoning-policy", choices=["adaptive", "fast", "max"], default="adaptive")

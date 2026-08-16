@@ -84,6 +84,71 @@ def test_generate_local_skill_batch_supports_thinking_max(monkeypatch):
     assert result["reasoning_effort"] == "max"
 
 
+def test_generate_local_skill_batch_hard_rejects_history_and_retries(monkeypatch):
+    duplicate = _raw_candidate(1)
+    replacement = _raw_candidate(2)
+    payloads = [duplicate, replacement]
+    calls = 0
+
+    def fake_post(*_args, **_kwargs):
+        nonlocal calls
+        candidate = payloads[calls]
+        calls += 1
+        content = json.dumps({"skill_candidates": [candidate]})
+        return _FakeResponse({"choices": [{"message": {"content": content}}]})
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setenv("WQ_LOCAL_LLM_CHUNK_ATTEMPTS", "2")
+    monkeypatch.setattr(generator, "_load_skill_context", lambda _context: (["wq-alpha-hypothesis"], "skill text"))
+    monkeypatch.setattr(generator.httpx, "post", fake_post)
+
+    result = generator.generate_local_skill_batch(
+        {"local_llm_exclude_expressions": [duplicate["expression"]]},
+        batch_size=1,
+    )
+
+    assert calls == 2
+    assert result["skill_candidates"][0]["expression"] == replacement["expression"]
+
+
+def test_generate_local_skill_batch_enforces_forced_diversify(monkeypatch):
+    first = _raw_candidate(1)
+    replacement = _raw_candidate(2)
+    replacement.update(
+        {
+            "route": "DIVERSIFY",
+            "diversity_case": {
+                "changed_dimensions": ["information_source"],
+                "why_independent": "uses an independent information source",
+            },
+        }
+    )
+    payloads = [first, replacement]
+    calls = 0
+
+    def fake_post(*_args, **_kwargs):
+        nonlocal calls
+        candidate = payloads[calls]
+        calls += 1
+        content = json.dumps({"skill_candidates": [candidate]})
+        return _FakeResponse({"choices": [{"message": {"content": content}}]})
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setenv("WQ_LOCAL_LLM_CHUNK_ATTEMPTS", "2")
+    monkeypatch.setattr(generator, "_load_skill_context", lambda _context: (["wq-alpha-diversify"], "skill text"))
+    monkeypatch.setattr(generator.httpx, "post", fake_post)
+
+    result = generator.generate_local_skill_batch(
+        {"local_llm_force_diversify": True},
+        batch_size=1,
+    )
+
+    assert calls == 2
+    candidate = result["skill_candidates"][0]
+    assert candidate["local_llm_route"] == "DIVERSIFY"
+    assert "information_source" in candidate["diversity_case"]["changed_dimensions"]
+
+
 def test_candidate_payload_accepts_common_key_drift():
     candidate = _raw_candidate(1)
     assert generator._candidate_items_from_payload({"candidates": [candidate]}) == [candidate]
@@ -257,6 +322,78 @@ def test_adaptive_reasoning_uses_max_for_near_miss_repair():
     assert mode["thinking"] == "enabled"
     assert mode["reasoning_effort"] == "max"
     assert mode["parent_expression"] == "rank(close)"
+
+
+def test_duplicate_pressure_forces_diversify_after_repeated_zero_sim_rounds():
+    pressure = runner._local_llm_duplicate_pressure(
+        {
+            "local_llm": {
+                "rounds": [
+                    {
+                        "status": "completed_no_simulation",
+                        "summary": {"simulated": 0},
+                        "skill_plan_rejections": [{"reason": "duplicate_expression_history"}],
+                        "generated_candidates": [{"family": "family_a"}],
+                    },
+                    {
+                        "status": "completed_no_simulation",
+                        "summary": {"simulated": 0},
+                        "skill_plan_rejections": [{"reason": "duplicate_expression_history"}],
+                        "generated_candidates": [{"family": "family_b"}],
+                    },
+                ]
+            }
+        }
+    )
+
+    assert pressure["force_diversify"] is True
+    assert pressure["consecutive_zero_sim_rounds"] == 2
+    assert pressure["recent_families"] == ["family_a", "family_b"]
+
+
+def test_zero_simulation_round_does_not_consume_productive_batch_budget(monkeypatch):
+    candidate = runner_test_candidate()
+    snapshot = {
+        "ok": True,
+        "status": "NEEDS_SKILL_BATCH",
+        "cycle_id": "zero-sim-cycle",
+        "progress": {"should_stop": False, "simulations": 0},
+        "planner_context": {"current_cycle_trial_evidence": []},
+        "research_cycle": {"cycle_id": "zero-sim-cycle", "local_llm": {"rounds": []}},
+    }
+    monkeypatch.setattr(runner, "research_cycle_snapshot", lambda **_kwargs: dict(snapshot))
+    monkeypatch.setattr(
+        runner,
+        "generate_local_skill_batch",
+        lambda *_args, **_kwargs: {"model": "deepseek-v4-flash", "skill_candidates": [candidate]},
+    )
+    monkeypatch.setattr(runner, "_record_local_llm_round_sync", lambda *_args, **_kwargs: None)
+    run_calls = 0
+
+    def fake_run_skill_batch(**_kwargs):
+        nonlocal run_calls
+        run_calls += 1
+        simulated = 0 if run_calls == 1 else 1
+        return {
+            "ok": True,
+            "status": "NEEDS_SKILL_BATCH",
+            "batch_executed": True,
+            "source_run_id": f"run-{run_calls}",
+            "progress": {"should_stop": False, "simulations": simulated},
+            "batch_result": {
+                "summary": {"simulated": simulated},
+                "skill_plan_rejections": [{"reason": "duplicate_expression_history"}] if simulated == 0 else [],
+            },
+        }
+
+    monkeypatch.setattr(runner, "run_skill_batch", fake_run_skill_batch)
+
+    result = runner.run_local_llm_research(cycle_id="zero-sim-cycle", max_batches=1)
+
+    assert run_calls == 2
+    assert result["productive_batches_this_run"] == 1
+    assert result["generation_attempts_this_run"] == 2
+    assert result["local_llm_rounds_this_run"][0]["status"] == "completed_no_simulation"
 
 
 def test_pending_round_is_reused_without_regeneration(monkeypatch):
