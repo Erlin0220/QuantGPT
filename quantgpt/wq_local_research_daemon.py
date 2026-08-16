@@ -30,9 +30,11 @@ def classify_daemon_result(result: dict[str, Any]) -> DaemonDecision:
     if status in {"BATCH_INFLIGHT", "research_singleflight_busy"}:
         return DaemonDecision(15.0, status)
     if status in {"SUBMISSION_REQUIRED", "RECONCILIATION_REQUIRED"}:
-        # The daemon always runs research-only with submission_deferred=True, but
-        # retain a conservative backoff if a future policy still surfaces a gate.
-        return DaemonDecision(60.0, status)
+        # This daemon is explicitly research-only (submission_deferred=True).
+        # A formal-submission gate must not consume the 50-minute Simulation budget.
+        return DaemonDecision(1.0, f"research_only_gate_deferred:{status}")
+    if status == "local_llm_generation_failed":
+        return DaemonDecision(3.0, status)
     if status in {"wq_not_configured", "brain_authentication_failed"}:
         return DaemonDecision(300.0, status)
     if not result.get("ok"):

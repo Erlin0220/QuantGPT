@@ -179,6 +179,36 @@ def test_generate_local_skill_batch_enforces_forced_diversify(monkeypatch):
     assert "information_source" in candidate["diversity_case"]["changed_dimensions"]
 
 
+def test_generate_local_skill_batch_returns_partial_batch_instead_of_failing(monkeypatch):
+    first = _raw_candidate(1)
+    second = _raw_candidate(2)
+    responses = [
+        {"skill_candidates": [first, second]},
+        {"skill_candidates": [first, second]},
+    ]
+    calls = 0
+
+    def fake_post(*_args, **_kwargs):
+        nonlocal calls
+        payload = responses[min(calls, len(responses) - 1)]
+        calls += 1
+        return _FakeResponse({"choices": [{"message": {"content": json.dumps(payload)}}]})
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setattr(generator, "_load_skill_context", lambda _context: (["wq-alpha-hypothesis"], "skill text"))
+    monkeypatch.setattr(generator.httpx, "post", fake_post)
+
+    result = generator.generate_local_skill_batch(
+        {"local_llm_chunk_attempt_limit": 1},
+        batch_size=4,
+    )
+
+    assert result["requested"] == 4
+    assert result["generated"] == 2
+    assert len(result["skill_candidates"]) == 2
+    assert calls == 2
+
+
 def test_candidate_payload_accepts_common_key_drift():
     candidate = _raw_candidate(1)
     assert generator._candidate_items_from_payload({"candidates": [candidate]}) == [candidate]
@@ -344,6 +374,20 @@ def test_adaptive_reasoning_uses_max_to_escape_duplicate_pressure():
     assert mode["reason"] == "duplicate_pressure_escape"
 
 
+def test_generation_recovery_plan_falls_back_from_max_then_shrinks():
+    plan = runner._local_llm_generation_recovery_plan(
+        {"thinking": "enabled", "reasoning_effort": "max", "reason": "high_value_failure_repair"},
+        4,
+    )
+
+    assert [(item["stage"], item["thinking"], item["batch_size"]) for item in plan] == [
+        ("primary", "enabled", 4),
+        ("max_to_nothink", "disabled", 4),
+        ("shrink_to_2", "disabled", 2),
+        ("shrink_to_1", "disabled", 1),
+    ]
+
+
 def test_adaptive_reasoning_uses_max_for_near_miss_repair():
     mode = runner._local_llm_reasoning_mode(
         {
@@ -406,7 +450,7 @@ def test_duplicate_pressure_forces_diversify_after_repeated_zero_sim_rounds():
     assert pressure["recent_families"] == ["family_a", "family_b"]
 
 
-def test_generation_failures_force_diversify_and_max_then_recover(monkeypatch):
+def test_generation_failure_progressively_shrinks_batch_before_giving_up(monkeypatch):
     candidate = runner_test_candidate()
     state = {
         "ok": True,
@@ -426,11 +470,11 @@ def test_generation_failures_force_diversify_and_max_then_recover(monkeypatch):
             },
         }
 
-    generation_calls: list[str] = []
+    generation_calls: list[tuple[str, int]] = []
 
     def fake_generate(_context, *, batch_size, model=None, thinking=None, reasoning_effort=None):
-        del batch_size, model, reasoning_effort
-        generation_calls.append(str(thinking))
+        del model, reasoning_effort
+        generation_calls.append((str(thinking), int(batch_size)))
         if len(generation_calls) <= 2:
             raise generator.LocalCandidateGenerationError("duplicate-only generation")
         return {"model": "deepseek-v4-flash", "skill_candidates": [candidate]}
@@ -462,12 +506,13 @@ def test_generation_failures_force_diversify_and_max_then_recover(monkeypatch):
 
     result = runner.run_local_llm_research(cycle_id="generation-recovery-cycle", max_batches=1)
 
-    assert generation_calls == ["disabled", "disabled", "enabled"]
+    assert generation_calls == [("disabled", 4), ("disabled", 2), ("disabled", 1)]
     assert result["productive_batches_this_run"] == 1
-    assert result["generation_attempts_this_run"] == 3
-    assert result["local_llm_rounds_this_run"][0]["status"] == "generation_failed"
-    assert result["local_llm_rounds_this_run"][1]["status"] == "generation_failed"
-    assert result["local_llm_rounds_this_run"][2]["status"] == "completed"
+    assert result["generation_attempts_this_run"] == 1
+    round_event = result["local_llm_rounds_this_run"][0]
+    assert round_event["status"] == "completed"
+    assert round_event["reasoning_mode"]["recovery_stage"] == "shrink_to_1"
+    assert [item["status"] for item in round_event["generation_recovery"]] == ["failed", "failed", "succeeded"]
 
 
 def test_zero_simulation_round_does_not_consume_productive_batch_budget(monkeypatch):

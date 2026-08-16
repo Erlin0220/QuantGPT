@@ -19,6 +19,22 @@ def test_classify_singleflight_uses_short_backoff():
     assert decision.delay_seconds == 15.0
 
 
+def test_classify_research_only_submission_gate_does_not_stall_cycle():
+    decision = daemon.classify_daemon_result(
+        {"ok": True, "status": "SUBMISSION_REQUIRED", "progress": {"should_stop": False}}
+    )
+    assert decision.completed_cycle is False
+    assert decision.delay_seconds == 1.0
+    assert decision.reason == "research_only_gate_deferred:SUBMISSION_REQUIRED"
+
+
+def test_classify_generation_failure_retries_quickly():
+    decision = daemon.classify_daemon_result(
+        {"ok": True, "status": "local_llm_generation_failed", "progress": {"should_stop": False}}
+    )
+    assert decision.delay_seconds == 3.0
+
+
 def test_classify_auth_failure_uses_long_backoff():
     decision = daemon.classify_daemon_result(
         {"ok": False, "status": "brain_authentication_failed", "progress": {"should_stop": False}}

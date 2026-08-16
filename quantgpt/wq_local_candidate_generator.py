@@ -457,7 +457,17 @@ def generate_local_skill_batch(
     )
     planner_context_text = json.dumps(planner_context, ensure_ascii=False, default=str)
     request_count = 0
-    chunk_attempt_limit = max(1, min(5, int(os.environ.get("WQ_LOCAL_LLM_CHUNK_ATTEMPTS") or 3)))
+    chunk_attempt_limit = max(
+        1,
+        min(
+            5,
+            int(
+                planner_context.get("local_llm_chunk_attempt_limit")
+                or os.environ.get("WQ_LOCAL_LLM_CHUNK_ATTEMPTS")
+                or 3
+            ),
+        ),
+    )
     while len(candidates) < size:
         remaining = size - len(candidates)
         requested_chunk = min(chunk_size, remaining)
@@ -565,6 +575,8 @@ def generate_local_skill_batch(
             if added > 0:
                 break
         if added == 0:
+            if candidates:
+                break
             raise LocalCandidateGenerationError(
                 "LLM returned no new structurally usable candidates after hard duplicate/diversity filtering"
             )

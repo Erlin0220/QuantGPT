@@ -1328,6 +1328,38 @@ def _local_llm_reasoning_mode(planner_context: dict[str, Any], policy: str = "ad
     return {"thinking": "disabled", "reasoning_effort": None, "reason": "weak_failure_explore_broadly"}
 
 
+def _local_llm_generation_recovery_plan(mode: dict[str, Any], batch_size: int) -> list[dict[str, Any]]:
+    """Prefer throughput, then progressively reduce generation complexity before giving up."""
+    requested = max(1, min(20, int(batch_size)))
+    primary_thinking = str(mode.get("thinking") or "disabled")
+    primary_effort = str(mode.get("reasoning_effort") or "max")
+    plan: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+
+    def add(stage: str, thinking: str, size: int) -> None:
+        key = (thinking, size)
+        if key in seen:
+            return
+        seen.add(key)
+        plan.append(
+            {
+                "stage": stage,
+                "thinking": thinking,
+                "reasoning_effort": primary_effort if thinking == "enabled" else None,
+                "batch_size": size,
+            }
+        )
+
+    add("primary", primary_thinking, requested)
+    if primary_thinking == "enabled":
+        add("max_to_nothink", "disabled", requested)
+    if requested > 2:
+        add("shrink_to_2", "disabled", 2)
+    if requested > 1:
+        add("shrink_to_1", "disabled", 1)
+    return plan
+
+
 def _local_llm_duplicate_pressure(cycle: dict[str, Any], *, window: int = 4) -> dict[str, Any]:
     """Detect when recent local-LLM rounds are wasting work on historical duplicates."""
     rounds = [
@@ -1566,28 +1598,38 @@ def run_local_llm_research(
             contract_feedback: list[dict[str, Any]] = []
             generation_error: str | None = None
             selected_candidates: list[dict[str, Any]] = []
+            generation_recovery: list[dict[str, Any]] = []
+            effective_mode = dict(mode)
 
-            for generation_attempt in range(1, 3):
+            for recovery_attempt in _local_llm_generation_recovery_plan(mode, batch_size):
                 working_context = dict(planner_context)
+                working_context["local_llm_recovery_stage"] = recovery_attempt["stage"]
+                # Runner-level recovery already changes thinking mode and batch size;
+                # avoid multiplying that by another 3x semantic retry loop inside one request stage.
+                working_context["local_llm_chunk_attempt_limit"] = 1
                 if contract_feedback:
                     working_context["local_llm_contract_feedback"] = contract_feedback
-                attempt_thinking = str(mode.get("thinking") or "disabled")
-                attempt_effort = str(mode.get("reasoning_effort") or "max")
-                if generation_attempt > 1 and attempt_thinking == "enabled":
-                    attempt_thinking = "disabled"
+                attempt_thinking = str(recovery_attempt["thinking"])
+                attempt_effort = str(recovery_attempt.get("reasoning_effort") or "max")
+                attempt_size = int(recovery_attempt["batch_size"])
+                attempt_record = {
+                    "stage": recovery_attempt["stage"],
+                    "thinking": attempt_thinking,
+                    "reasoning_effort": attempt_effort if attempt_thinking == "enabled" else None,
+                    "batch_size": attempt_size,
+                }
                 try:
                     generation = generate_local_skill_batch(
                         working_context,
-                        batch_size=batch_size,
+                        batch_size=attempt_size,
                         model=model,
                         thinking=attempt_thinking,
                         reasoning_effort=attempt_effort,
                     )
                 except LocalCandidateGenerationError as exc:
                     generation_error = str(exc)
-                    if generation_attempt == 1 and attempt_thinking == "enabled":
-                        continue
-                    break
+                    generation_recovery.append({**attempt_record, "status": "failed", "error": generation_error})
+                    continue
 
                 candidates = [item for item in (generation.get("skill_candidates") or []) if isinstance(item, dict)]
                 contract_feedback = [
@@ -1603,8 +1645,27 @@ def run_local_llm_research(
                     candidate for candidate in candidates if _runner_candidate_contract_error(candidate) is None
                 ]
                 if selected_candidates:
+                    effective_mode = {
+                        "thinking": attempt_thinking,
+                        "reasoning_effort": attempt_effort if attempt_thinking == "enabled" else None,
+                        "reason": mode.get("reason")
+                        if recovery_attempt["stage"] == "primary"
+                        else f"generation_recovery:{recovery_attempt['stage']}",
+                        "decision_reason": mode.get("reason"),
+                        "recovery_stage": recovery_attempt["stage"],
+                    }
+                    generation_recovery.append(
+                        {
+                            **attempt_record,
+                            "status": "succeeded",
+                            "generated": len(selected_candidates),
+                        }
+                    )
                     break
                 generation_error = "all generated candidates failed the Skill/Runner contract"
+                generation_recovery.append(
+                    {**attempt_record, "status": "failed", "error": generation_error}
+                )
 
             generation_meta = {key: value for key, value in (generation or {}).items() if key != "skill_candidates"}
             round_event = {
@@ -1613,9 +1674,10 @@ def run_local_llm_research(
                 "status": "pending_execution" if selected_candidates else "generation_failed",
                 "generated_at": generated_at,
                 "reasoning_policy": reasoning_policy,
-                "reasoning_mode": mode,
+                "reasoning_mode": effective_mode,
                 "model": (generation or {}).get("model") or model or os.environ.get("DEEPSEEK_MODEL") or "deepseek-v4-flash",
                 "generation": generation_meta,
+                "generation_recovery": generation_recovery,
                 "generated_candidates": [
                     {
                         "expression": item.get("expression"),
