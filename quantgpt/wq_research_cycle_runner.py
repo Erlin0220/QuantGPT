@@ -1298,6 +1298,9 @@ def _local_llm_reasoning_mode(planner_context: dict[str, Any], policy: str = "ad
         return {"thinking": "enabled", "reasoning_effort": "max", "reason": "forced_max"}
     if resolved != "adaptive":
         raise ValueError("reasoning_policy must be adaptive, fast, or max")
+    pressure = dict(planner_context.get("local_llm_duplicate_pressure") or {})
+    if pressure.get("provider_failure_pressure"):
+        return {"thinking": "disabled", "reasoning_effort": None, "reason": "provider_recovery_fast"}
     if planner_context.get("local_llm_force_diversify"):
         return {"thinking": "enabled", "reasoning_effort": "max", "reason": "duplicate_pressure_escape"}
 
@@ -1361,6 +1364,21 @@ def _local_llm_generation_recovery_plan(mode: dict[str, Any], batch_size: int) -
     return plan
 
 
+def _local_llm_generation_failed_by_provider(round_item: dict[str, Any]) -> bool:
+    if str(round_item.get("status") or "") != "generation_failed":
+        return False
+    error = str(round_item.get("generation_error") or "")
+    markers = (
+        "ReadTimeout",
+        "ConnectTimeout",
+        "TransportError",
+        "request failed",
+        "no final content was returned",
+        "reasoning_content was present but final content was empty",
+    )
+    return any(marker in error for marker in markers)
+
+
 def _local_llm_duplicate_pressure(cycle: dict[str, Any], *, window: int = 4) -> dict[str, Any]:
     """Detect when recent local-LLM rounds are wasting work on historical duplicates."""
     rounds = [
@@ -1372,8 +1390,10 @@ def _local_llm_duplicate_pressure(cycle: dict[str, Any], *, window: int = 4) -> 
     duplicate_rejections = 0
     zero_sim_rounds = 0
     generation_failed_rounds = 0
+    provider_generation_failed_rounds = 0
     consecutive_zero_sim_rounds = 0
     consecutive_nonproductive_rounds = 0
+    consecutive_provider_failure_rounds = 0
     recent_families: list[str] = []
     for round_item in recent:
         simulated = int((round_item.get("summary") or {}).get("simulated") or 0)
@@ -1382,6 +1402,8 @@ def _local_llm_duplicate_pressure(cycle: dict[str, Any], *, window: int = 4) -> 
             zero_sim_rounds += 1
         if round_status == "generation_failed":
             generation_failed_rounds += 1
+            if _local_llm_generation_failed_by_provider(round_item):
+                provider_generation_failed_rounds += 1
         for rejection in round_item.get("skill_plan_rejections") or []:
             if isinstance(rejection, dict) and str(rejection.get("reason") or "") == "duplicate_expression_history":
                 duplicate_rejections += 1
@@ -1399,6 +1421,9 @@ def _local_llm_duplicate_pressure(cycle: dict[str, Any], *, window: int = 4) -> 
             consecutive_nonproductive_rounds += 1
             continue
         if round_status == "generation_failed":
+            if _local_llm_generation_failed_by_provider(round_item):
+                consecutive_provider_failure_rounds += 1
+                break
             consecutive_nonproductive_rounds += 1
             continue
         break
@@ -1408,7 +1433,10 @@ def _local_llm_duplicate_pressure(cycle: dict[str, Any], *, window: int = 4) -> 
         "duplicate_rejections": duplicate_rejections,
         "zero_sim_rounds": zero_sim_rounds,
         "generation_failed_rounds": generation_failed_rounds,
+        "provider_generation_failed_rounds": provider_generation_failed_rounds,
         "consecutive_zero_sim_rounds": consecutive_zero_sim_rounds,
+        "consecutive_provider_failure_rounds": consecutive_provider_failure_rounds,
+        "provider_failure_pressure": consecutive_provider_failure_rounds > 0,
         "consecutive_nonproductive_rounds": consecutive_nonproductive_rounds,
         "force_diversify": force_diversify,
         "recent_families": recent_families[-8:],
@@ -1601,20 +1629,38 @@ def run_local_llm_research(
             selected_candidates: list[dict[str, Any]] = []
             generation_recovery: list[dict[str, Any]] = []
             effective_mode = dict(mode)
+            generation_started = time.monotonic()
+            cycle_seconds_remaining = max(0.0, float(progress.get("remaining_minutes") or 0.0) * 60.0)
+            generation_budget_seconds = max(10.0, min(90.0, cycle_seconds_remaining or 90.0))
 
             for recovery_attempt in _local_llm_generation_recovery_plan(mode, batch_size):
+                recovery_elapsed = time.monotonic() - generation_started
+                recovery_remaining = generation_budget_seconds - recovery_elapsed
+                if recovery_remaining < 10.0:
+                    generation_error = "local LLM generation recovery budget exhausted"
+                    generation_recovery.append(
+                        {
+                            "stage": "generation_budget",
+                            "status": "failed",
+                            "error": generation_error,
+                            "budget_seconds": generation_budget_seconds,
+                        }
+                    )
+                    break
                 working_context = dict(planner_context)
                 working_context["local_llm_recovery_stage"] = recovery_attempt["stage"]
                 # Runner-level recovery already changes thinking mode and batch size;
                 # keep each stage bounded so one bad provider response cannot consume the cycle budget.
                 working_context["local_llm_chunk_attempt_limit"] = 1
                 working_context["local_llm_request_attempts"] = 1
-                working_context["local_llm_request_timeout_seconds"] = {
-                    "primary": 60 if recovery_attempt["thinking"] == "enabled" else 45,
-                    "max_to_nothink": 45,
-                    "shrink_to_2": 35,
-                    "shrink_to_1": 30,
-                }.get(str(recovery_attempt["stage"]), 45)
+                stage_timeout = {
+                    "primary": 45 if recovery_attempt["thinking"] == "enabled" else 35,
+                    "max_to_nothink": 35,
+                    "shrink_to_2": 20,
+                    "shrink_to_1": 15,
+                }.get(str(recovery_attempt["stage"]), 35)
+                request_timeout = max(10.0, min(float(stage_timeout), recovery_remaining))
+                working_context["local_llm_request_timeout_seconds"] = request_timeout
                 if contract_feedback:
                     working_context["local_llm_contract_feedback"] = contract_feedback
                 attempt_thinking = str(recovery_attempt["thinking"])
@@ -1625,6 +1671,7 @@ def run_local_llm_research(
                     "thinking": attempt_thinking,
                     "reasoning_effort": attempt_effort if attempt_thinking == "enabled" else None,
                     "batch_size": attempt_size,
+                    "timeout_seconds": request_timeout,
                 }
                 try:
                     generation = generate_local_skill_batch(

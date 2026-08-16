@@ -423,6 +423,42 @@ def test_local_llm_exclusions_include_cross_cycle_history():
     assert exclusions == ["rank(close)", "rank(volume)", "rank(ts_mean(returns, 20))"]
 
 
+def test_provider_generation_failures_do_not_trigger_max_diversification():
+    cycle = {
+        "local_llm": {
+            "rounds": [
+                {
+                    "status": "generation_failed",
+                    "generation_error": "local LLM request failed: ReadTimeout: timed out",
+                    "generated_candidates": [],
+                },
+                {
+                    "status": "generation_failed",
+                    "generation_error": "local LLM returned no candidate JSON: no final content was returned",
+                    "generated_candidates": [],
+                },
+            ]
+        }
+    }
+    pressure = runner._local_llm_duplicate_pressure(cycle)
+
+    assert pressure["provider_failure_pressure"] is True
+    assert pressure["force_diversify"] is False
+
+    mode = runner._local_llm_reasoning_mode(
+        {
+            "local_llm_duplicate_pressure": pressure,
+            "local_llm_force_diversify": False,
+            "current_cycle_trial_evidence": [
+                {"expression": "rank(close)", "sharpe": 1.1, "fitness": 0.8, "failure_reasons": []}
+            ],
+        },
+        "adaptive",
+    )
+    assert mode["thinking"] == "disabled"
+    assert mode["reason"] == "provider_recovery_fast"
+
+
 def test_duplicate_pressure_forces_diversify_after_repeated_zero_sim_rounds():
     pressure = runner._local_llm_duplicate_pressure(
         {
