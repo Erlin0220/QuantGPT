@@ -1301,11 +1301,33 @@ def _local_llm_repair_parent_is_worthwhile(item: dict[str, Any]) -> bool:
         if isinstance(reason, dict)
     }
     reasons.add(str(item.get("failure_reason") or ""))
-    metric_near_miss = sharpe >= 1.1 and fitness >= 0.7
+    metric_near_miss = sharpe >= 1.2 and fitness >= 0.85
     robustness_near_miss = bool(
         {"sub_universe_instability", "self_correlation", "correlation_saturation"} & reasons
-    ) and sharpe >= 0.9 and fitness >= 0.6
+    ) and sharpe >= 1.0 and fitness >= 0.75
     return metric_near_miss or robustness_near_miss
+
+
+def _local_llm_low_fitness_pressure(evidence: list[dict[str, Any]], *, window: int = 8) -> dict[str, Any]:
+    """Detect repeated metric misses that deserve a fast cross-mechanism escape."""
+    recent = [item for item in evidence[-max(1, int(window)) :] if isinstance(item, dict)]
+    low_fitness: list[dict[str, Any]] = []
+    for item in recent:
+        reasons = {str(item.get("failure_reason") or "")}
+        for reason in (item.get("failure_reasons") or []):
+            reasons.add(str(reason.get("reason") or "") if isinstance(reason, dict) else str(reason or ""))
+        if "low_fitness" in reasons:
+            low_fitness.append(item)
+    ratio = len(low_fitness) / len(recent) if recent else 0.0
+    best_fitness = max((float(item.get("fitness") or 0.0) for item in low_fitness), default=0.0)
+    active = len(recent) >= 4 and len(low_fitness) >= 4 and ratio >= 0.75 and best_fitness < 1.0
+    return {
+        "active": active,
+        "window": len(recent),
+        "low_fitness": len(low_fitness),
+        "ratio": round(ratio, 4),
+        "best_fitness": round(best_fitness, 4),
+    }
 
 
 def _local_llm_repair_parent_counts(cycle: dict[str, Any]) -> dict[str, int]:
@@ -1370,6 +1392,9 @@ def _local_llm_reasoning_mode(planner_context: dict[str, Any], policy: str = "ad
     pressure = dict(planner_context.get("local_llm_duplicate_pressure") or {})
     if pressure.get("provider_failure_pressure"):
         return {"thinking": "disabled", "reasoning_effort": None, "reason": "provider_recovery_fast"}
+    low_fitness_pressure = dict(planner_context.get("local_llm_low_fitness_pressure") or {})
+    if low_fitness_pressure.get("active"):
+        return {"thinking": "disabled", "reasoning_effort": None, "reason": "low_fitness_escape_fast"}
     if planner_context.get("local_llm_force_diversify"):
         return {"thinking": "enabled", "reasoning_effort": "max", "reason": "duplicate_pressure_escape"}
 
@@ -1659,6 +1684,7 @@ def run_local_llm_research(
         current_evidence = [
             item for item in (planner_context.get("current_cycle_trial_evidence") or []) if isinstance(item, dict)
         ]
+        low_fitness_pressure = _local_llm_low_fitness_pressure(current_evidence)
         recent_families = list(duplicate_pressure.get("recent_families") or [])
         recent_dataset_ids: list[str] = []
         for evidence_item in current_evidence:
@@ -1670,7 +1696,10 @@ def run_local_llm_research(
                 recent_dataset_ids.append(dataset_id)
         planner_context["local_llm_exclude_expressions"] = _local_llm_exclusion_expressions(planner_context, cycle)
         planner_context["local_llm_duplicate_pressure"] = duplicate_pressure
-        planner_context["local_llm_force_diversify"] = bool(duplicate_pressure.get("force_diversify"))
+        planner_context["local_llm_low_fitness_pressure"] = low_fitness_pressure
+        planner_context["local_llm_force_diversify"] = bool(
+            duplicate_pressure.get("force_diversify") or low_fitness_pressure.get("active")
+        )
         planner_context["local_llm_recent_families"] = recent_families[-8:]
         planner_context["local_llm_recent_dataset_ids"] = recent_dataset_ids[-8:]
         planner_context["local_llm_repair_parent_counts"] = _local_llm_repair_parent_counts(cycle)
@@ -1721,6 +1750,36 @@ def run_local_llm_research(
                     break
                 working_context = dict(planner_context)
                 working_context["local_llm_recovery_stage"] = recovery_attempt["stage"]
+                selected_expressions = [
+                    str(candidate.get("expression") or "").strip()
+                    for candidate in selected_candidates
+                    if str(candidate.get("expression") or "").strip()
+                ]
+                working_context["local_llm_exclude_expressions"] = list(
+                    dict.fromkeys([
+                        *(working_context.get("local_llm_exclude_expressions") or []),
+                        *selected_expressions,
+                    ])
+                )
+                if any(
+                    str(candidate.get("local_llm_route") or "").upper() == "REPAIR"
+                    for candidate in selected_candidates
+                ):
+                    working_context["local_llm_max_repairs_per_batch"] = 0
+                selected_has_exploration = any(
+                    str(candidate.get("local_llm_route") or "").upper() == "DIVERSIFY"
+                    and bool(
+                        {"information_source", "economic_mechanism"}
+                        & {
+                            str(value)
+                            for value in ((candidate.get("diversity_case") or {}).get("changed_dimensions") or [])
+                        }
+                    )
+                    for candidate in selected_candidates
+                )
+                working_context["local_llm_require_exploration_slot"] = bool(
+                    batch_size >= 4 and not selected_has_exploration
+                )
                 # Runner-level recovery already changes thinking mode and batch size;
                 # keep each stage bounded so one bad provider response cannot consume the cycle budget.
                 working_context["local_llm_chunk_attempt_limit"] = 1
@@ -1737,7 +1796,10 @@ def run_local_llm_research(
                     working_context["local_llm_contract_feedback"] = contract_feedback
                 attempt_thinking = str(recovery_attempt["thinking"])
                 attempt_effort = str(recovery_attempt.get("reasoning_effort") or "max")
-                attempt_size = int(recovery_attempt["batch_size"])
+                attempt_size = min(
+                    int(recovery_attempt["batch_size"]),
+                    max(1, int(batch_size) - len(selected_candidates)),
+                )
                 attempt_record = {
                     "stage": recovery_attempt["stage"],
                     "thinking": attempt_thinking,
@@ -1768,10 +1830,21 @@ def run_local_llm_research(
                     for candidate in candidates
                     if (error := _runner_candidate_contract_error(candidate))
                 ]
-                selected_candidates = [
+                accepted_candidates = [
                     candidate for candidate in candidates if _runner_candidate_contract_error(candidate) is None
                 ]
-                if selected_candidates:
+                existing_expressions = {
+                    str(candidate.get("expression") or "").strip() for candidate in selected_candidates
+                }
+                for candidate in accepted_candidates:
+                    expression = str(candidate.get("expression") or "").strip()
+                    if not expression or expression in existing_expressions:
+                        continue
+                    selected_candidates.append(candidate)
+                    existing_expressions.add(expression)
+                    if len(selected_candidates) >= batch_size:
+                        break
+                if accepted_candidates:
                     effective_mode = {
                         "thinking": attempt_thinking,
                         "reasoning_effort": attempt_effort if attempt_thinking == "enabled" else None,
@@ -1785,15 +1858,20 @@ def run_local_llm_research(
                         {
                             **attempt_record,
                             "status": "succeeded",
-                            "generated": len(selected_candidates),
+                            "generated": len(accepted_candidates),
+                            "accumulated": len(selected_candidates),
                         }
                     )
-                    break
+                    if len(selected_candidates) >= batch_size:
+                        break
+                    continue
                 generation_error = "all generated candidates failed the Skill/Runner contract"
                 generation_recovery.append(
                     {**attempt_record, "status": "failed", "error": generation_error}
                 )
 
+            if selected_candidates:
+                generation_error = None
             generation_meta = {key: value for key, value in (generation or {}).items() if key != "skill_candidates"}
             round_event = {
                 "round_id": round_id,

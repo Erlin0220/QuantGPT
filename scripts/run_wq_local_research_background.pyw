@@ -94,8 +94,8 @@ def main() -> None:
                     account=os.environ.get("WQ_LOCAL_RESEARCH_ACCOUNT", "primary"),
                     target_simulations=int(os.environ.get("WQ_LOCAL_RESEARCH_TARGET_SIMULATIONS", "100")),
                     budget_minutes=int(os.environ.get("WQ_LOCAL_RESEARCH_BUDGET_MINUTES", "50")),
-                    batch_size=int(os.environ.get("WQ_LOCAL_RESEARCH_BATCH_SIZE", "4")),
-                    max_simulations_per_batch=int(os.environ.get("WQ_LOCAL_RESEARCH_SIMULATIONS_PER_BATCH", "4")),
+                    batch_size=int(os.environ.get("WQ_LOCAL_RESEARCH_BATCH_SIZE", "8")),
+                    max_simulations_per_batch=int(os.environ.get("WQ_LOCAL_RESEARCH_SIMULATIONS_PER_BATCH", "8")),
                     reasoning_policy=os.environ.get("WQ_LOCAL_RESEARCH_REASONING_POLICY", "adaptive"),
                 )
             finally:

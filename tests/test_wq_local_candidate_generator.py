@@ -345,7 +345,8 @@ def test_local_llm_poc_runs_bounded_research_only_loop(monkeypatch):
     assert result["ok"] is True
     assert result["formal_submission"] is False
     assert len(result["poc_batches"]) == 2
-    assert len(generation_calls) == 2
+    assert len(generation_calls) == 6
+    assert [call["batch_size"] for call in generation_calls] == [3, 2, 1, 3, 2, 1]
     assert len(run_calls) == 2
     assert all(call["submission_deferred"] is True for call in run_calls)
     assert all(call["thinking"] == "disabled" for call in generation_calls)
@@ -515,7 +516,7 @@ def test_adaptive_reasoning_uses_max_for_near_miss_repair():
                 {
                     "expression": "rank(close)",
                     "sharpe": 1.2,
-                    "fitness": 0.8,
+                    "fitness": 0.9,
                     "failure_reason": "low_fitness",
                     "failure_reasons": [],
                 }
@@ -577,8 +578,8 @@ def test_repair_parent_policy_caps_repeated_parent_across_rounds():
     }
     context = {
         "current_cycle_trial_evidence": [
-            {"expression": strong_parent, "sharpe": 1.3, "fitness": 0.8, "failure_reason": "low_fitness"},
-            {"expression": alternate_parent, "sharpe": 1.2, "fitness": 0.75, "failure_reason": "low_fitness"},
+            {"expression": strong_parent, "sharpe": 1.3, "fitness": 0.9, "failure_reason": "low_fitness"},
+            {"expression": alternate_parent, "sharpe": 1.25, "fitness": 0.9, "failure_reason": "low_fitness"},
             {"expression": "rank(returns)", "sharpe": 0.95, "fitness": 0.4, "failure_reason": "low_fitness"},
         ]
     }
@@ -644,6 +645,77 @@ def test_generate_local_skill_batch_limits_repairs_and_refills_with_new_hypothes
     assert calls == 2
     assert [item["local_llm_route"] for item in result["skill_candidates"]] == ["REPAIR", "NEW_HYPOTHESIS"]
 
+
+def test_generate_local_skill_batch_respects_zero_repair_budget(monkeypatch):
+    parent = "rank(ts_mean(close, 20))"
+    repair = _raw_candidate(1)
+    repair.update(
+        {
+            "route": "REPAIR",
+            "parent_expression": parent,
+            "mutation_type": "structure_repair",
+            "mutation_reason": "should be rejected when repair budget is zero",
+            "failure_signature": {
+                "observed_symptoms": ["low_fitness"],
+                "plausible_causes": [{"cause": "weak_signal", "confidence": "medium"}],
+            },
+        }
+    )
+    replacement = _raw_candidate(2)
+    payloads = [
+        {"skill_candidates": [repair]},
+        {"skill_candidates": [replacement]},
+    ]
+    calls = 0
+
+    def fake_post(*_args, **_kwargs):
+        nonlocal calls
+        payload = payloads[min(calls, len(payloads) - 1)]
+        calls += 1
+        return _FakeResponse({"choices": [{"message": {"content": json.dumps(payload)}}]})
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setenv("WQ_LOCAL_LLM_CHUNK_ATTEMPTS", "2")
+    monkeypatch.setattr(generator, "_load_skill_context", lambda _context: (["wq-alpha-repair"], "skill text"))
+    monkeypatch.setattr(generator.httpx, "post", fake_post)
+
+    result = generator.generate_local_skill_batch(
+        {
+            "current_cycle_trial_evidence": [{"expression": parent, "sharpe": 1.3, "fitness": 0.9}],
+            "local_llm_repair_parent_expressions": [parent],
+            "local_llm_max_repairs_per_batch": 0,
+        },
+        batch_size=1,
+    )
+
+    assert calls == 2
+    assert result["skill_candidates"][0]["local_llm_route"] == "NEW_HYPOTHESIS"
+
+
+def test_low_fitness_pressure_forces_fast_cross_mechanism_escape():
+    evidence = [
+        {
+            "expression": f"rank(ts_mean(returns, {window}))",
+            "fitness": fitness,
+            "sharpe": 1.1,
+            "failure_reason": "low_fitness",
+        }
+        for window, fitness in ((5, 0.45), (10, 0.55), (20, 0.62), (40, 0.73))
+    ]
+    pressure = runner._local_llm_low_fitness_pressure(evidence)
+    assert pressure["active"] is True
+    assert pressure["low_fitness"] == 4
+
+    mode = runner._local_llm_reasoning_mode(
+        {
+            "current_cycle_trial_evidence": evidence,
+            "local_llm_low_fitness_pressure": pressure,
+            "local_llm_force_diversify": True,
+        },
+        "adaptive",
+    )
+    assert mode["thinking"] == "disabled"
+    assert mode["reason"] == "low_fitness_escape_fast"
 
 def test_local_llm_exclusions_include_cross_cycle_history():
     exclusions = runner._local_llm_exclusion_expressions(
@@ -787,6 +859,59 @@ def test_generation_failure_progressively_shrinks_batch_before_giving_up(monkeyp
     assert round_event["reasoning_mode"]["recovery_stage"] == "shrink_to_1"
     assert [item["status"] for item in round_event["generation_recovery"]] == ["failed", "failed", "succeeded"]
 
+
+def test_generation_recovery_accumulates_partial_batches_before_simulation(monkeypatch):
+    state = {
+        "ok": True,
+        "status": "NEEDS_SKILL_BATCH",
+        "cycle_id": "accumulate-cycle",
+        "progress": {"should_stop": False, "simulations": 0, "remaining_minutes": 20},
+        "planner_context": {"current_cycle_trial_evidence": []},
+        "research_cycle": {"cycle_id": "accumulate-cycle", "local_llm": {"rounds": []}},
+    }
+
+    monkeypatch.setattr(runner, "research_cycle_snapshot", lambda **_kwargs: dict(state))
+    generated_calls: list[tuple[int, list[str]]] = []
+    call_index = 0
+
+    def candidate(index: int) -> dict:
+        item = runner_test_candidate()
+        item["expression"] = f"rank(ts_mean(returns, {index + 4}))"
+        item["family"] = f"momentum_{index}"
+        return item
+
+    def fake_generate(context, *, batch_size, model=None, thinking=None, reasoning_effort=None):
+        nonlocal call_index
+        del model, thinking, reasoning_effort
+        generated_calls.append((batch_size, list(context.get("local_llm_exclude_expressions") or [])))
+        payloads = [[candidate(1)], [candidate(2), candidate(3)], [candidate(4)]]
+        payload = payloads[min(call_index, len(payloads) - 1)]
+        call_index += 1
+        return {"model": "deepseek-v4-flash", "skill_candidates": payload}
+
+    captured: dict = {}
+
+    def fake_run_skill_batch(**kwargs):
+        captured.update(kwargs)
+        return {
+            "ok": True,
+            "status": "NEEDS_SKILL_BATCH",
+            "batch_executed": True,
+            "source_run_id": "accumulated-run",
+            "progress": {"should_stop": False, "simulations": 4},
+            "batch_result": {"summary": {"simulated": 4}},
+        }
+
+    monkeypatch.setattr(runner, "generate_local_skill_batch", fake_generate)
+    monkeypatch.setattr(runner, "run_skill_batch", fake_run_skill_batch)
+    monkeypatch.setattr(runner, "_record_local_llm_round_sync", lambda *_args, **_kwargs: None)
+
+    result = runner.run_local_llm_research(cycle_id="accumulate-cycle", max_batches=1, batch_size=4)
+
+    assert [item[0] for item in generated_calls] == [4, 2, 1]
+    assert candidate(1)["expression"] in generated_calls[1][1]
+    assert len(captured["skill_candidates"]) == 4
+    assert result["local_llm_rounds_this_run"][0]["generation_recovery"][-1]["accumulated"] == 4
 
 def test_zero_simulation_round_does_not_consume_productive_batch_budget(monkeypatch):
     candidate = runner_test_candidate()

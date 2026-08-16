@@ -625,7 +625,12 @@ def generate_local_skill_batch(
     }
     force_diversify = bool(planner_context.get("local_llm_force_diversify"))
     forced_exploration_cells = _forced_exploration_cells(planner_context.get("selected_cells"))
-    exploration_slots_required = 1 if size >= 4 and forced_exploration_cells else 0
+    exploration_slots_required = (
+        1
+        if forced_exploration_cells
+        and (size >= 4 or bool(planner_context.get("local_llm_require_exploration_slot")))
+        else 0
+    )
     accepted_exploration_slots = 0
     recent_families = {
         str(value).strip()
@@ -648,7 +653,8 @@ def generate_local_skill_batch(
         if str(value).strip()
     }
     enforce_repair_parent_whitelist = "local_llm_repair_parent_expressions" in planner_context
-    max_repairs_per_batch = max(0, int(planner_context.get("local_llm_max_repairs_per_batch") or 1))
+    configured_max_repairs = planner_context.get("local_llm_max_repairs_per_batch")
+    max_repairs_per_batch = max(0, int(1 if configured_max_repairs is None else configured_max_repairs))
     accepted_repairs = 0
     planner_context_text = json.dumps(planner_context, ensure_ascii=False, default=str)
     request_count = 0

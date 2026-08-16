@@ -84,8 +84,8 @@ def run_local_research_daemon(
     account: str = "primary",
     target_simulations: int = 100,
     budget_minutes: int = 50,
-    batch_size: int = 4,
-    max_simulations_per_batch: int = 4,
+    batch_size: int = 8,
+    max_simulations_per_batch: int = 8,
     reasoning_policy: str = "adaptive",
     max_cycles: int = 0,
 ) -> None:
