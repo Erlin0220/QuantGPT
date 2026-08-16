@@ -302,6 +302,16 @@ def test_adaptive_reasoning_uses_fast_for_new_hypotheses():
     assert mode["reason"] == "new_hypothesis_throughput"
 
 
+def test_adaptive_reasoning_uses_max_to_escape_duplicate_pressure():
+    mode = runner._local_llm_reasoning_mode(
+        {"current_cycle_trial_evidence": [], "local_llm_force_diversify": True},
+        "adaptive",
+    )
+    assert mode["thinking"] == "enabled"
+    assert mode["reasoning_effort"] == "max"
+    assert mode["reason"] == "duplicate_pressure_escape"
+
+
 def test_adaptive_reasoning_uses_max_for_near_miss_repair():
     mode = runner._local_llm_reasoning_mode(
         {
@@ -347,6 +357,70 @@ def test_duplicate_pressure_forces_diversify_after_repeated_zero_sim_rounds():
     assert pressure["force_diversify"] is True
     assert pressure["consecutive_zero_sim_rounds"] == 2
     assert pressure["recent_families"] == ["family_a", "family_b"]
+
+
+def test_generation_failures_force_diversify_and_max_then_recover(monkeypatch):
+    candidate = runner_test_candidate()
+    state = {
+        "ok": True,
+        "status": "NEEDS_SKILL_BATCH",
+        "cycle_id": "generation-recovery-cycle",
+        "progress": {"should_stop": False, "simulations": 0},
+        "planner_context": {"current_cycle_trial_evidence": []},
+        "research_cycle": {"cycle_id": "generation-recovery-cycle", "local_llm": {"rounds": []}},
+    }
+
+    def fake_snapshot(**_kwargs):
+        return {
+            **state,
+            "research_cycle": {
+                **state["research_cycle"],
+                "local_llm": {"rounds": [dict(item) for item in state["research_cycle"]["local_llm"]["rounds"]]},
+            },
+        }
+
+    generation_calls: list[str] = []
+
+    def fake_generate(_context, *, batch_size, model=None, thinking=None, reasoning_effort=None):
+        del batch_size, model, reasoning_effort
+        generation_calls.append(str(thinking))
+        if len(generation_calls) <= 2:
+            raise generator.LocalCandidateGenerationError("duplicate-only generation")
+        return {"model": "deepseek-v4-flash", "skill_candidates": [candidate]}
+
+    def fake_record(_account, _cycle_id, event):
+        rounds = state["research_cycle"]["local_llm"]["rounds"]
+        for index, existing in enumerate(rounds):
+            if existing.get("round_id") == event.get("round_id"):
+                rounds[index] = {**existing, **event}
+                return state["research_cycle"]
+        rounds.append(dict(event))
+        return state["research_cycle"]
+
+    monkeypatch.setattr(runner, "research_cycle_snapshot", fake_snapshot)
+    monkeypatch.setattr(runner, "generate_local_skill_batch", fake_generate)
+    monkeypatch.setattr(runner, "_record_local_llm_round_sync", fake_record)
+    monkeypatch.setattr(
+        runner,
+        "run_skill_batch",
+        lambda **_kwargs: {
+            "ok": True,
+            "status": "NEEDS_SKILL_BATCH",
+            "batch_executed": True,
+            "source_run_id": "recovered-run",
+            "progress": {"should_stop": False, "simulations": 1},
+            "batch_result": {"summary": {"simulated": 1}},
+        },
+    )
+
+    result = runner.run_local_llm_research(cycle_id="generation-recovery-cycle", max_batches=1)
+
+    assert generation_calls == ["disabled", "disabled", "enabled"]
+    assert result["productive_batches_this_run"] == 1
+    assert result["generation_attempts_this_run"] == 3
+    assert result["local_llm_rounds_this_run"][0]["status"] == "generation_failed"
+    assert result["local_llm_rounds_this_run"][1]["status"] == "generation_failed"
+    assert result["local_llm_rounds_this_run"][2]["status"] == "completed"
 
 
 def test_zero_simulation_round_does_not_consume_productive_batch_budget(monkeypatch):

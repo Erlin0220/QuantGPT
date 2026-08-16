@@ -1293,6 +1293,8 @@ def _local_llm_reasoning_mode(planner_context: dict[str, Any], policy: str = "ad
         return {"thinking": "enabled", "reasoning_effort": "max", "reason": "forced_max"}
     if resolved != "adaptive":
         raise ValueError("reasoning_policy must be adaptive, fast, or max")
+    if planner_context.get("local_llm_force_diversify"):
+        return {"thinking": "enabled", "reasoning_effort": "max", "reason": "duplicate_pressure_escape"}
 
     evidence = [item for item in (planner_context.get("current_cycle_trial_evidence") or []) if isinstance(item, dict)]
     if not evidence:
@@ -1331,12 +1333,17 @@ def _local_llm_duplicate_pressure(cycle: dict[str, Any], *, window: int = 4) -> 
     recent = rounds[-max(1, int(window)) :]
     duplicate_rejections = 0
     zero_sim_rounds = 0
+    generation_failed_rounds = 0
     consecutive_zero_sim_rounds = 0
+    consecutive_nonproductive_rounds = 0
     recent_families: list[str] = []
     for round_item in recent:
         simulated = int((round_item.get("summary") or {}).get("simulated") or 0)
-        if str(round_item.get("status") or "").startswith("completed") and simulated <= 0:
+        round_status = str(round_item.get("status") or "")
+        if round_status.startswith("completed") and simulated <= 0:
             zero_sim_rounds += 1
+        if round_status == "generation_failed":
+            generation_failed_rounds += 1
         for rejection in round_item.get("skill_plan_rejections") or []:
             if isinstance(rejection, dict) and str(rejection.get("reason") or "") == "duplicate_expression_history":
                 duplicate_rejections += 1
@@ -1348,15 +1355,23 @@ def _local_llm_duplicate_pressure(cycle: dict[str, Any], *, window: int = 4) -> 
                 recent_families.append(family)
     for round_item in reversed(recent):
         simulated = int((round_item.get("summary") or {}).get("simulated") or 0)
-        if not str(round_item.get("status") or "").startswith("completed") or simulated > 0:
-            break
-        consecutive_zero_sim_rounds += 1
-    force_diversify = consecutive_zero_sim_rounds >= 2 or duplicate_rejections >= 3
+        round_status = str(round_item.get("status") or "")
+        if round_status.startswith("completed") and simulated <= 0:
+            consecutive_zero_sim_rounds += 1
+            consecutive_nonproductive_rounds += 1
+            continue
+        if round_status == "generation_failed":
+            consecutive_nonproductive_rounds += 1
+            continue
+        break
+    force_diversify = consecutive_nonproductive_rounds >= 2 or duplicate_rejections >= 3
     return {
         "window": len(recent),
         "duplicate_rejections": duplicate_rejections,
         "zero_sim_rounds": zero_sim_rounds,
+        "generation_failed_rounds": generation_failed_rounds,
         "consecutive_zero_sim_rounds": consecutive_zero_sim_rounds,
+        "consecutive_nonproductive_rounds": consecutive_nonproductive_rounds,
         "force_diversify": force_diversify,
         "recent_families": recent_families[-8:],
     }
@@ -1600,14 +1615,9 @@ def run_local_llm_research(
             }
             _record_local_llm_round_sync(account, resolved_cycle_id, round_event)
             if not selected_candidates:
-                return {
-                    "ok": False,
-                    "status": "local_llm_generation_failed",
-                    "cycle_id": resolved_cycle_id,
-                    "error": generation_error,
-                    "local_llm_round": round_event,
-                    "progress": progress,
-                }
+                completed_rounds.append(round_event)
+                exit_status = "local_llm_generation_failed"
+                continue
 
         batch_result = run_skill_batch(
             account=account,
