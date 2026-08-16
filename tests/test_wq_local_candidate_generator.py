@@ -440,6 +440,18 @@ def test_adaptive_reasoning_does_not_max_think_for_weak_single_metric_failure():
     assert mode["reason"] == "weak_failure_explore_broadly"
 
 
+def test_repair_parent_policy_excludes_submission_campaign_sc_fail_structure():
+    parent = "ts_decay_linear(rank(close), 20)"
+    context = {
+        "avoid_structure_signatures": [runner._structure_signature(parent)],
+        "current_cycle_trial_evidence": [
+            {"expression": parent, "sharpe": 1.4, "fitness": 1.0, "failure_reason": "low_fitness"},
+        ],
+    }
+
+    assert runner._local_llm_repair_parent_expressions(context, {"local_llm": {"rounds": []}}) == []
+
+
 def test_repair_parent_policy_caps_repeated_parent_across_rounds():
     strong_parent = "rank(ts_mean(close, 20))"
     alternate_parent = "rank(ts_mean(volume, 20))"

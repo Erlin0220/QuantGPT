@@ -43,6 +43,7 @@ from .wq_local_candidate_generator import LocalCandidateGenerationError, generat
 from .wq_research_memory import load_research_memory_sync, normalize_wq_expression, record_research_trials_sync
 from .wq_submission_policy import (
     _run_coro_sync,
+    _structure_signature,
     get_submission_policy_status,
     record_research_candidates_sync,
 )
@@ -1329,10 +1330,17 @@ def _local_llm_repair_parent_expressions(
     limit: int = 2,
 ) -> list[str]:
     counts = _local_llm_repair_parent_counts(cycle)
+    avoided_structures = {
+        str(value).strip()
+        for value in (planner_context.get("avoid_structure_signatures") or [])
+        if str(value).strip()
+    }
     evidence = [
         item
         for item in (planner_context.get("current_cycle_trial_evidence") or [])
-        if isinstance(item, dict) and _local_llm_repair_parent_is_worthwhile(item)
+        if isinstance(item, dict)
+        and _local_llm_repair_parent_is_worthwhile(item)
+        and _structure_signature(str(item.get("expression") or "")) not in avoided_structures
     ]
     evidence.sort(
         key=lambda item: (float(item.get("fitness") or 0.0), float(item.get("sharpe") or 0.0)),
