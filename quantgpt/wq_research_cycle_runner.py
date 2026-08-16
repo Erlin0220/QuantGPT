@@ -1285,6 +1285,319 @@ def _load_skill_candidates(path: str) -> list[dict[str, Any]]:
     return [item for item in payload if isinstance(item, dict)]
 
 
+def _local_llm_reasoning_mode(planner_context: dict[str, Any], policy: str = "adaptive") -> dict[str, Any]:
+    resolved = str(policy or "adaptive").strip().lower()
+    if resolved == "fast":
+        return {"thinking": "disabled", "reasoning_effort": None, "reason": "forced_fast"}
+    if resolved == "max":
+        return {"thinking": "enabled", "reasoning_effort": "max", "reason": "forced_max"}
+    if resolved != "adaptive":
+        raise ValueError("reasoning_policy must be adaptive, fast, or max")
+
+    evidence = [item for item in (planner_context.get("current_cycle_trial_evidence") or []) if isinstance(item, dict)]
+    if not evidence:
+        return {"thinking": "disabled", "reasoning_effort": None, "reason": "new_hypothesis_throughput"}
+
+    for item in evidence:
+        sharpe = float(item.get("sharpe") or 0.0)
+        fitness = float(item.get("fitness") or 0.0)
+        reasons = {
+            str(reason.get("reason") or "")
+            for reason in (item.get("failure_reasons") or [])
+            if isinstance(reason, dict)
+        }
+        reasons.add(str(item.get("failure_reason") or ""))
+        near_miss = sharpe >= 0.9 or fitness >= 0.65
+        robustness_case = bool(
+            {"sub_universe_instability", "self_correlation", "correlation_saturation"} & reasons
+        ) and (sharpe >= 0.7 or fitness >= 0.45)
+        if near_miss or robustness_case:
+            return {
+                "thinking": "enabled",
+                "reasoning_effort": "max",
+                "reason": "high_value_failure_repair",
+                "parent_expression": item.get("expression"),
+            }
+    return {"thinking": "disabled", "reasoning_effort": None, "reason": "weak_failure_explore_broadly"}
+
+
+def _local_llm_round_expressions(cycle: dict[str, Any]) -> list[str]:
+    expressions: list[str] = []
+    local_llm = cycle.get("local_llm") or {}
+    for round_item in local_llm.get("rounds") or []:
+        if not isinstance(round_item, dict):
+            continue
+        for candidate in round_item.get("generated_candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            expression = str(candidate.get("expression") or "").strip()
+            if expression and expression not in expressions:
+                expressions.append(expression)
+    return expressions[-40:]
+
+
+def _pending_local_llm_round(cycle: dict[str, Any]) -> dict[str, Any] | None:
+    local_llm = cycle.get("local_llm") or {}
+    for round_item in reversed(local_llm.get("rounds") or []):
+        if not isinstance(round_item, dict):
+            continue
+        if str(round_item.get("status") or "") not in {"pending_execution", "generated"}:
+            continue
+        payloads = [item for item in (round_item.get("candidate_payloads") or []) if isinstance(item, dict)]
+        if payloads:
+            return dict(round_item)
+    return None
+
+
+def _record_local_llm_round_sync(
+    account: str,
+    cycle_id: str,
+    round_event: dict[str, Any],
+) -> dict[str, Any] | None:
+    cycle = get_research_cycle_sync(account, cycle_id)
+    if cycle is None:
+        return None
+    updated = json.loads(json.dumps(cycle))
+    local_llm = dict(updated.get("local_llm") or {})
+    rounds = [dict(item) for item in (local_llm.get("rounds") or []) if isinstance(item, dict)]
+    round_id = str(round_event.get("round_id") or "").strip()
+    merged = False
+    if round_id:
+        for index, existing in enumerate(rounds):
+            if str(existing.get("round_id") or "") != round_id:
+                continue
+            rounds[index] = {**existing, **round_event}
+            merged = True
+            break
+    if not merged:
+        rounds.append(dict(round_event))
+    local_llm.update(
+        {
+            "version": 1,
+            "provider": "opencode-go-compatible",
+            "model": round_event.get("model") or local_llm.get("model"),
+            "last_round_id": round_id or local_llm.get("last_round_id"),
+            "rounds": rounds[-30:],
+        }
+    )
+    updated["local_llm"] = local_llm
+    updated["updated_at"] = _now_utc().isoformat()
+    return update_research_cycle_sync(cycle_id, account, updated)
+
+
+def run_local_llm_research(
+    *,
+    account: str = "primary",
+    cycle_id: str | None = None,
+    target_simulations: int = _DEFAULT_TARGET_SIMULATIONS,
+    budget_minutes: int = _DEFAULT_BUDGET_MINUTES,
+    max_batches: int = 50,
+    batch_size: int = 2,
+    max_simulations_per_batch: int = 4,
+    model: str | None = None,
+    reasoning_policy: str = "adaptive",
+    submission_deferred: bool = False,
+    goal: str = "maximize robust low-correlation WorldQuant candidates",
+) -> dict[str, Any]:
+    """Run the production local-LLM research loop without formal submission.
+
+    New hypotheses default to fast generation.  High-value failures automatically
+    receive max reasoning in ``adaptive`` mode.  Existing Submission/Reconciliation
+    gates stop the loop unless the caller explicitly defers them for research-only
+    continuation.  The cycle itself remains the restart-safe source of truth.
+    """
+    if cycle_id:
+        snapshot = research_cycle_snapshot(
+            account=account,
+            cycle_id=cycle_id,
+            create=True,
+            target_simulations=target_simulations,
+            budget_minutes=budget_minutes,
+        )
+    else:
+        snapshot = start_research_cycle_snapshot(
+            account=account,
+            target_simulations=target_simulations,
+            budget_minutes=budget_minutes,
+        )
+    if not snapshot.get("ok"):
+        return snapshot
+    resolved_cycle_id = str(snapshot.get("cycle_id") or cycle_id or "")
+    if not resolved_cycle_id:
+        return {"ok": False, "status": "research_cycle_not_found"}
+
+    completed_rounds: list[dict[str, Any]] = []
+    exit_status: str | None = None
+    limit = max(1, min(100, int(max_batches)))
+    for _batch_index in range(1, limit + 1):
+        snapshot = research_cycle_snapshot(account=account, cycle_id=resolved_cycle_id)
+        if not snapshot.get("ok"):
+            break
+        progress = dict(snapshot.get("progress") or {})
+        status = str(snapshot.get("status") or "")
+        if progress.get("should_stop"):
+            break
+        if status == "BATCH_INFLIGHT":
+            exit_status = "BATCH_INFLIGHT"
+            break
+        if status in {"SUBMISSION_REQUIRED", "RECONCILIATION_REQUIRED"}:
+            if not submission_deferred:
+                break
+            status = "NEEDS_SKILL_BATCH"
+        if status != "NEEDS_SKILL_BATCH":
+            break
+
+        planner_context = dict(snapshot.get("planner_context") or {})
+        cycle = dict(snapshot.get("research_cycle") or {})
+        pending_round = _pending_local_llm_round(cycle)
+        planner_context["local_llm_exclude_expressions"] = _local_llm_round_expressions(cycle)
+
+        if pending_round:
+            round_event = dict(pending_round)
+            selected_candidates = [
+                item for item in (pending_round.get("candidate_payloads") or []) if isinstance(item, dict)
+            ]
+            mode = dict(round_event.get("reasoning_mode") or {})
+        else:
+            mode = _local_llm_reasoning_mode(planner_context, reasoning_policy)
+            existing_rounds = [
+                item
+                for item in ((cycle.get("local_llm") or {}).get("rounds") or [])
+                if isinstance(item, dict)
+            ]
+            round_id = f"llm-{uuid.uuid4().hex[:12]}"
+            generated_at = _now_utc().isoformat()
+            generation: dict[str, Any] | None = None
+            contract_feedback: list[dict[str, Any]] = []
+            generation_error: str | None = None
+            selected_candidates: list[dict[str, Any]] = []
+
+            for generation_attempt in range(1, 3):
+                working_context = dict(planner_context)
+                if contract_feedback:
+                    working_context["local_llm_contract_feedback"] = contract_feedback
+                attempt_thinking = str(mode.get("thinking") or "disabled")
+                attempt_effort = str(mode.get("reasoning_effort") or "max")
+                if generation_attempt > 1 and attempt_thinking == "enabled":
+                    attempt_thinking = "disabled"
+                try:
+                    generation = generate_local_skill_batch(
+                        working_context,
+                        batch_size=batch_size,
+                        model=model,
+                        thinking=attempt_thinking,
+                        reasoning_effort=attempt_effort,
+                    )
+                except LocalCandidateGenerationError as exc:
+                    generation_error = str(exc)
+                    if generation_attempt == 1 and attempt_thinking == "enabled":
+                        continue
+                    break
+
+                candidates = [item for item in (generation.get("skill_candidates") or []) if isinstance(item, dict)]
+                contract_feedback = [
+                    {
+                        "expression": candidate.get("expression"),
+                        "route": candidate.get("local_llm_route"),
+                        "error": error,
+                    }
+                    for candidate in candidates
+                    if (error := _runner_candidate_contract_error(candidate))
+                ]
+                selected_candidates = [
+                    candidate for candidate in candidates if _runner_candidate_contract_error(candidate) is None
+                ]
+                if selected_candidates:
+                    break
+                generation_error = "all generated candidates failed the Skill/Runner contract"
+
+            generation_meta = {key: value for key, value in (generation or {}).items() if key != "skill_candidates"}
+            round_event = {
+                "round_id": round_id,
+                "batch_index": len(existing_rounds) + 1,
+                "status": "pending_execution" if selected_candidates else "generation_failed",
+                "generated_at": generated_at,
+                "reasoning_policy": reasoning_policy,
+                "reasoning_mode": mode,
+                "model": (generation or {}).get("model") or model or os.environ.get("DEEPSEEK_MODEL") or "deepseek-v4-flash",
+                "generation": generation_meta,
+                "generated_candidates": [
+                    {
+                        "expression": item.get("expression"),
+                        "family": item.get("family"),
+                        "route": item.get("local_llm_route"),
+                        "parent_expression": item.get("parent_expression"),
+                    }
+                    for item in selected_candidates
+                ],
+                "candidate_payloads": selected_candidates,
+                "contract_feedback": contract_feedback,
+                "generation_error": generation_error,
+            }
+            _record_local_llm_round_sync(account, resolved_cycle_id, round_event)
+            if not selected_candidates:
+                return {
+                    "ok": False,
+                    "status": "local_llm_generation_failed",
+                    "cycle_id": resolved_cycle_id,
+                    "error": generation_error,
+                    "local_llm_round": round_event,
+                    "progress": progress,
+                }
+
+        batch_result = run_skill_batch(
+            account=account,
+            cycle_id=resolved_cycle_id,
+            skill_candidates=selected_candidates,
+            target_simulations=target_simulations,
+            budget_minutes=budget_minutes,
+            goal=goal,
+            max_simulations=max(4, min(20, int(max_simulations_per_batch))),
+            family_count=3,
+            submission_deferred=submission_deferred,
+        )
+        batch_payload = dict(batch_result.get("batch_result") or {})
+        executed = bool(batch_result.get("batch_executed"))
+        round_event.update(
+            {
+                "status": "completed" if executed else "pending_execution",
+                "completed_at": _now_utc().isoformat() if executed else None,
+                "run_status": batch_result.get("status"),
+                "source_run_id": batch_result.get("source_run_id"),
+                "summary": batch_payload.get("summary") or {},
+                "skill_plan_rejections": list(batch_payload.get("skill_plan_rejections") or [])[:20],
+                "progress": batch_result.get("progress") or {},
+                "candidate_payloads": [] if executed else selected_candidates,
+            }
+        )
+        _record_local_llm_round_sync(account, resolved_cycle_id, round_event)
+        completed_rounds.append(round_event)
+        if not batch_result.get("ok") or not executed:
+            snapshot = batch_result
+            exit_status = str(batch_result.get("status") or "local_research_execution_blocked")
+            break
+        if (batch_result.get("progress") or {}).get("should_stop"):
+            snapshot = batch_result
+            break
+
+    final_snapshot = research_cycle_snapshot(account=account, cycle_id=resolved_cycle_id)
+    final_cycle = dict(final_snapshot.get("research_cycle") or {})
+    return {
+        "ok": bool(final_snapshot.get("ok")),
+        "status": exit_status or final_snapshot.get("status"),
+        "cycle_id": resolved_cycle_id,
+        "model": model or os.environ.get("DEEPSEEK_MODEL") or "deepseek-v4-flash",
+        "reasoning_policy": reasoning_policy,
+        "submission_deferred": bool(submission_deferred),
+        "formal_submission": False,
+        "local_llm_rounds_this_run": completed_rounds,
+        "local_llm_state": final_cycle.get("local_llm") or {},
+        "research_cycle": final_cycle,
+        "progress": final_snapshot.get("progress"),
+        "planner_context": final_snapshot.get("planner_context"),
+    }
+
+
 def run_local_llm_poc(
     *,
     account: str = "primary",
@@ -1299,114 +1612,25 @@ def run_local_llm_poc(
     reasoning_effort: str = "max",
     goal: str = "maximize robust low-correlation WorldQuant candidates",
 ) -> dict[str, Any]:
-    """Run a bounded research-only loop with local LLM candidate generation.
-
-    This deliberately never performs formal submission.  Submission/reconciliation
-    priority is deferred only for this PoC so candidate generation → BRAIN
-    Simulation → failure evidence can be exercised end to end.
-    """
-    resolved_cycle_id = cycle_id or generate_research_cycle_id()
-    snapshot = research_cycle_snapshot(
+    """Compatibility wrapper around the production runner for bounded PoC tests."""
+    policy = "max" if thinking == "enabled" and reasoning_effort == "max" else "fast"
+    result = run_local_llm_research(
         account=account,
-        cycle_id=resolved_cycle_id,
-        create=True,
+        cycle_id=cycle_id,
         target_simulations=target_simulations,
         budget_minutes=budget_minutes,
+        max_batches=max_batches,
+        batch_size=batch_size,
+        max_simulations_per_batch=max_simulations_per_batch,
+        model=model,
+        reasoning_policy=policy,
+        submission_deferred=True,
+        goal=goal,
     )
-    if not snapshot.get("ok"):
-        return snapshot
-
-    poc_batches: list[dict[str, Any]] = []
-    limit = max(1, min(5, int(max_batches)))
-    for batch_index in range(1, limit + 1):
-        snapshot = research_cycle_snapshot(account=account, cycle_id=resolved_cycle_id)
-        if not snapshot.get("ok"):
-            break
-        progress = dict(snapshot.get("progress") or {})
-        if progress.get("should_stop") or snapshot.get("status") == "BATCH_INFLIGHT":
-            break
-
-        planner_context = dict(snapshot.get("planner_context") or {})
-        try:
-            generation = generate_local_skill_batch(
-                planner_context,
-                batch_size=batch_size,
-                model=model,
-                thinking=thinking,
-                reasoning_effort=reasoning_effort,
-            )
-        except LocalCandidateGenerationError as exc:
-            return {
-                "ok": False,
-                "status": "local_llm_generation_failed",
-                "cycle_id": resolved_cycle_id,
-                "error": str(exc),
-                "poc_batches": poc_batches,
-                "research_cycle": snapshot.get("research_cycle"),
-                "progress": progress,
-            }
-
-        candidates = list(generation.get("skill_candidates") or [])
-        contract_errors = [
-            {"index": index, "error": error}
-            for index, candidate in enumerate(candidates)
-            if (error := _runner_candidate_contract_error(candidate))
-        ]
-        if contract_errors:
-            return {
-                "ok": False,
-                "status": "local_llm_candidate_contract_invalid",
-                "cycle_id": resolved_cycle_id,
-                "details": contract_errors,
-                "generation": {key: value for key, value in generation.items() if key != "skill_candidates"},
-                "poc_batches": poc_batches,
-            }
-
-        batch_result = run_skill_batch(
-            account=account,
-            cycle_id=resolved_cycle_id,
-            skill_candidates=candidates,
-            target_simulations=target_simulations,
-            budget_minutes=budget_minutes,
-            goal=goal,
-            max_simulations=max(4, min(20, int(max_simulations_per_batch))),
-            family_count=3,
-            submission_deferred=True,
-        )
-        poc_batches.append(
-            {
-                "batch_index": batch_index,
-                "generation": {key: value for key, value in generation.items() if key != "skill_candidates"},
-                "generated_candidates": [
-                    {"expression": item.get("expression"), "family": item.get("family")}
-                    for item in candidates
-                ],
-                "run_status": batch_result.get("status"),
-                "source_run_id": batch_result.get("source_run_id"),
-                "summary": (batch_result.get("batch_result") or {}).get("summary") or {},
-                "progress": batch_result.get("progress") or {},
-            }
-        )
-        snapshot = batch_result
-        if not batch_result.get("ok") or not batch_result.get("batch_executed"):
-            break
-        if (batch_result.get("progress") or {}).get("should_stop"):
-            break
-
-    final_snapshot = research_cycle_snapshot(account=account, cycle_id=resolved_cycle_id)
-    return {
-        "ok": bool(final_snapshot.get("ok")),
-        "status": final_snapshot.get("status"),
-        "cycle_id": resolved_cycle_id,
-        "model": model or os.environ.get("DEEPSEEK_MODEL") or "deepseek-v4-flash",
-        "thinking": thinking,
-        "reasoning_effort": reasoning_effort if thinking == "enabled" else None,
-        "formal_submission": False,
-        "poc_batches": poc_batches,
-        "research_cycle": final_snapshot.get("research_cycle"),
-        "progress": final_snapshot.get("progress"),
-        "planner_context": final_snapshot.get("planner_context"),
-    }
+    result["thinking"] = thinking
+    result["reasoning_effort"] = reasoning_effort if thinking == "enabled" else None
+    result["poc_batches"] = result.get("local_llm_rounds_this_run") or []
+    return result
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1421,6 +1645,22 @@ def _build_parser() -> argparse.ArgumentParser:
 
     status = subparsers.add_parser("status")
     status.add_argument("--cycle-id")
+
+    local_research = subparsers.add_parser("local-research")
+    local_research.add_argument("--cycle-id")
+    local_research.add_argument("--target-simulations", type=int, default=_DEFAULT_TARGET_SIMULATIONS)
+    local_research.add_argument("--budget-minutes", type=int, default=_DEFAULT_BUDGET_MINUTES)
+    local_research.add_argument("--max-batches", type=int, default=50)
+    local_research.add_argument("--batch-size", type=int, default=2)
+    local_research.add_argument("--max-simulations-per-batch", type=int, default=4)
+    local_research.add_argument("--model")
+    local_research.add_argument("--reasoning-policy", choices=["adaptive", "fast", "max"], default="adaptive")
+    local_research.add_argument(
+        "--defer-submission",
+        action="store_true",
+        help="Explicitly continue research past Submission/Reconciliation priority without formally submitting.",
+    )
+    local_research.add_argument("--goal", default="maximize robust low-correlation WorldQuant candidates")
 
     local_poc = subparsers.add_parser("local-llm-poc")
     local_poc.add_argument("--cycle-id")
@@ -1500,6 +1740,20 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif args.command == "status":
         output = research_cycle_snapshot(account=args.account, cycle_id=args.cycle_id)
+    elif args.command == "local-research":
+        output = run_local_llm_research(
+            account=args.account,
+            cycle_id=args.cycle_id,
+            target_simulations=args.target_simulations,
+            budget_minutes=args.budget_minutes,
+            max_batches=args.max_batches,
+            batch_size=args.batch_size,
+            max_simulations_per_batch=args.max_simulations_per_batch,
+            model=args.model,
+            reasoning_policy=args.reasoning_policy,
+            submission_deferred=args.defer_submission,
+            goal=args.goal,
+        )
     elif args.command == "local-llm-poc":
         output = run_local_llm_poc(
             account=args.account,

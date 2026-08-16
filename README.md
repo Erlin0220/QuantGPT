@@ -444,7 +444,26 @@ python -m quantgpt --transport http
 
 **Zero config by default**: SQLite database, baostock + akshare free data. See [full Quick Start guide](docs/QUICKSTART.md) for details.
 
-**AI reasoning is client-side:** use the connected ChatGPT client to generate, repair, interpret, and distill Alpha research ideas. QuantGPT itself remains a deterministic data/backtest/BRAIN execution service and requires no LLM API key.
+**AI reasoning is optional:** the HTTP/MCP server remains a deterministic data/backtest/BRAIN execution service and requires no LLM API key. Interactive research can still be driven by a connected ChatGPT client; alternatively, the repo-local WQ research runner can use OpenCode Go / DeepSeek without changing the server process.
+
+<details>
+<summary><b>Optional: local OpenCode Go WQ research daemon</b></summary>
+
+Configure `.env` with `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL=https://opencode.ai/zen/go/v1`, `DEEPSEEK_MODEL=deepseek-v4-flash`, plus WQ BRAIN credentials. The formal local runner is research-only: it generates Skill-constrained candidates, runs real BRAIN Simulations, persists failure evidence, resumes pending batches after interruption, and never performs formal submission.
+
+```powershell
+# One bounded 100-Simulation / 50-minute research cycle.
+.venv\Scripts\python.exe -m quantgpt.wq_research_cycle_runner --account primary local-research --target-simulations 100 --budget-minutes 50 --reasoning-policy adaptive --defer-submission
+
+# Continuous background research. New hypotheses use fast generation; valuable near-miss repairs auto-upgrade to max reasoning.
+.venv\Scripts\python.exe scripts\manage_wq_local_research.py start
+.venv\Scripts\python.exe scripts\manage_wq_local_research.py status
+.venv\Scripts\python.exe scripts\manage_wq_local_research.py stop
+```
+
+The daemon has its own PID/log files and is independent from the QuantGPT HTTP/MCP server. Restarting it resumes the latest RUNNING cycle or persisted `pending_execution` batch from the database; no `state.json` is used. Formal submission continues to use the existing Submission Gate.
+
+</details>
 
 <details>
 <summary><b>Optional: PostgreSQL (for production)</b></summary>

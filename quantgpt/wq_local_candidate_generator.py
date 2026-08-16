@@ -1,4 +1,4 @@
-"""Local OpenCode Go / DeepSeek candidate generation for bounded WQ research PoCs."""
+"""Local OpenCode Go / DeepSeek candidate generation for WorldQuant research."""
 
 from __future__ import annotations
 
@@ -156,11 +156,37 @@ def _candidate_items_from_payload(decoded: Any) -> list[Any]:
     return []
 
 
-def _normalize_candidate(raw: dict[str, Any]) -> dict[str, Any]:
+def _normalize_candidate(raw: dict[str, Any], planner_context: dict[str, Any] | None = None) -> dict[str, Any]:
     robustness = raw.get("robustness_plan") if isinstance(raw.get("robustness_plan"), dict) else {}
     checks = robustness.get("checks") if isinstance(robustness, dict) else None
     if not isinstance(checks, list) or not 1 <= len(checks) <= 4:
         checks = [{"universe": "TOP1000", "purpose": "test universe sensitivity"}]
+
+    base_chain = [
+        "wq-economic-hypothesis",
+        "wq-alpha-hypothesis",
+        "wq-alpha-review",
+        "wq-robustness-validation",
+        "wq-candidate-evidence",
+    ]
+    requested_chain = _string_list(raw.get("skill_chain"))
+    route = str(raw.get("route") or "").strip().upper()
+    evidence_expressions = {
+        str(item.get("expression") or "").strip()
+        for item in ((planner_context or {}).get("current_cycle_trial_evidence") or [])
+        if isinstance(item, dict) and str(item.get("expression") or "").strip()
+    }
+    requested_parent = str(raw.get("parent_expression") or "").strip()
+    repair_requested = "wq-alpha-repair" in requested_chain or route == "REPAIR"
+    if repair_requested and requested_parent in evidence_expressions:
+        skill_chain = [*base_chain, "wq-failure-diagnosis", "wq-experiment-allocation", "wq-alpha-repair"]
+        route = "REPAIR"
+    elif "wq-alpha-diversify" in requested_chain or route == "DIVERSIFY":
+        skill_chain = [*base_chain, "wq-alpha-diversify"]
+        route = "DIVERSIFY"
+    else:
+        skill_chain = base_chain
+        route = "NEW_HYPOTHESIS"
 
     candidate = {
         "expression": str(raw.get("expression") or "").strip(),
@@ -168,18 +194,29 @@ def _normalize_candidate(raw: dict[str, Any]) -> dict[str, Any]:
         "family": str(raw.get("family") or "").strip(),
         "data_fields": _string_list(raw.get("data_fields")),
         "knowledge_card_ids": _string_list(raw.get("knowledge_card_ids")),
-        "skill_chain": [
-            "wq-economic-hypothesis",
-            "wq-alpha-hypothesis",
-            "wq-alpha-review",
-            "wq-robustness-validation",
-            "wq-candidate-evidence",
-        ],
+        "skill_chain": skill_chain,
         "review_decision": "RUN",
-        "review_notes": str(raw.get("review_notes") or "local OpenCode Go / DSV4 PoC review").strip(),
+        "review_notes": str(raw.get("review_notes") or "local OpenCode Go / DSV4 review").strip(),
         "robustness_plan": {"mode": "skill_defined", "checks": checks[:4]},
         "candidate_evidence_policy": {"mode": "calibrated_evidence_hierarchy"},
+        "local_llm_route": route,
     }
+    for key in ("dataset_id", "dataset_category"):
+        value = raw.get(key)
+        if value not in (None, ""):
+            candidate[key] = value
+    if route == "REPAIR":
+        candidate["parent_expression"] = requested_parent
+        for key in ("mutation_type", "mutation_reason"):
+            value = raw.get(key)
+            if value not in (None, ""):
+                candidate[key] = value
+        if isinstance(raw.get("failure_signature"), dict):
+            candidate["failure_signature"] = dict(raw["failure_signature"])
+    if route == "DIVERSIFY" and isinstance(raw.get("diversity_case"), dict):
+        candidate["diversity_case"] = dict(raw["diversity_case"])
+    if isinstance(raw.get("settings_delta"), dict):
+        candidate["settings_delta"] = dict(raw["settings_delta"])
     return candidate
 
 
@@ -198,7 +235,12 @@ def _compact_planner_context(planner_context: dict[str, Any]) -> dict[str, Any]:
         "research_memory_positive": list(planner_context.get("research_memory_positive") or [])[:1],
         "research_memory_negative": list(planner_context.get("research_memory_negative") or [])[:1],
         "current_cycle_trial_evidence": list(planner_context.get("current_cycle_trial_evidence") or [])[:6],
-        "exclude_expressions": list(planner_context.get("local_poc_exclude_expressions") or [])[:20],
+        "exclude_expressions": list(
+            planner_context.get("local_llm_exclude_expressions")
+            or planner_context.get("local_poc_exclude_expressions")
+            or []
+        )[:30],
+        "contract_feedback": list(planner_context.get("local_llm_contract_feedback") or [])[:8],
     }
 
 
@@ -214,8 +256,9 @@ def _build_messages(
 Follow the supplied local WQ Skill documents as authoritative workflow instructions.
 This is research-only: never formally submit an Alpha and never claim an unobserved BRAIN result.
 Use the provided planner/failure evidence to generate a semantically diverse next batch.
-For this PoC, prefer conservative core fields (open, high, low, close, volume, vwap, returns, cap, adv20/adv60/adv120) unless the planner context explicitly supplies another exact field id.
+Prefer conservative core fields (open, high, low, close, volume, vwap, returns, cap, adv20/adv60/adv120) unless the planner context explicitly supplies another exact field id.
 Prefer simple live-style FASTEXPR and avoid cosmetic window-only siblings.
+When repairing an observed trial, preserve the exact parent expression and distinguish observed symptoms from plausible causes.
 Return JSON only, with no markdown or prose outside the JSON object.
 """
     user = f"""Generate exactly {batch_size} research candidates for the next bounded BRAIN Simulation batch.
@@ -230,6 +273,7 @@ Return this shape:
 {{
   "skill_candidates": [
     {{
+      "route": "NEW_HYPOTHESIS | REPAIR | DIVERSIFY",
       "expression": "...",
       "hypothesis": "mechanism-first and falsifiable",
       "family": "short_family_name",
@@ -238,6 +282,17 @@ Return this shape:
       "review_notes": "why this is worth one bounded test",
       "robustness_plan": {{
         "checks": [{{"universe": "TOP1000", "purpose": "what this check distinguishes"}}]
+      }},
+      "parent_expression": "required for REPAIR; exact expression from current_cycle_trial_evidence",
+      "failure_signature": {{
+        "observed_symptoms": ["required for REPAIR; facts only"],
+        "plausible_causes": [{{"cause": "one plausible cause", "confidence": "low|medium|high"}}]
+      }},
+      "mutation_type": "required for REPAIR",
+      "mutation_reason": "what one causal dimension is being tested",
+      "diversity_case": {{
+        "changed_dimensions": ["information_source"],
+        "why_independent": "required for DIVERSIFY"
       }}
     }}
   ]
@@ -248,7 +303,12 @@ Rules:
 - data_fields must list every data field used by the expression and no operators.
 - Use knowledge_card_ids only when an id is literally present in supplied context; otherwise [].
 - Do not invent historical performance, Sharpe, Fitness, correlation, or platform checks.
-- If current_cycle_trial_evidence exists, react to the observed symptoms while keeping cause vs symptom distinct.
+- If current_cycle_trial_evidence exists, choose REPAIR only for a worthwhile parent and use its exact expression; otherwise choose DIVERSIFY or NEW_HYPOTHESIS.
+- REPAIR must include parent_expression, failure_signature.observed_symptoms, failure_signature.plausible_causes, mutation_type and mutation_reason. Change one causal dimension unless the supplied Skill explicitly justifies broader screening.
+- DIVERSIFY must include diversity_case.changed_dimensions using only information_source, economic_mechanism, horizon_delay, structure, factor_exposure; include why_independent.
+- NEW_HYPOTHESIS must not pretend to be a repair of a prior result.
+- A structure_signature containing # is a pattern only. Never copy # into an executable expression or parent_expression.
+- REPAIR is forbidden when current_cycle_trial_evidence is empty; parent_expression must exactly match one expression in that list.
 - Keep robustness_plan to 1-4 targeted checks.
 """
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -345,7 +405,12 @@ def generate_local_skill_batch(
         remaining = size - len(candidates)
         requested_chunk = min(chunk_size, remaining)
         chunk_context = dict(planner_context)
-        chunk_context["local_poc_exclude_expressions"] = list(seen_expressions)
+        inherited_exclusions = list(
+            planner_context.get("local_llm_exclude_expressions")
+            or planner_context.get("local_poc_exclude_expressions")
+            or []
+        )
+        chunk_context["local_llm_exclude_expressions"] = [*inherited_exclusions, *seen_expressions]
         messages = _build_messages(chunk_context, batch_size=requested_chunk, skill_context=skill_context)
         content = _request_candidate_content(
             base_url=base_url,
@@ -365,9 +430,9 @@ def generate_local_skill_batch(
         for item in raw_candidates:
             if not isinstance(item, dict):
                 continue
-            candidate = _normalize_candidate(item)
+            candidate = _normalize_candidate(item, planner_context)
             expression = candidate["expression"]
-            if not expression or expression in seen_expressions:
+            if not expression or "#" in expression or expression in seen_expressions:
                 continue
             if not candidate["hypothesis"] or not candidate["family"] or not candidate["data_fields"]:
                 continue

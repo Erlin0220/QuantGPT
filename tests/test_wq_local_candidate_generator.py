@@ -152,6 +152,7 @@ def test_local_llm_poc_runs_bounded_research_only_loop(monkeypatch):
 
     monkeypatch.setattr(runner, "generate_local_skill_batch", fake_generate)
     monkeypatch.setattr(runner, "run_skill_batch", fake_run_skill_batch)
+    monkeypatch.setattr(runner, "_record_local_llm_round_sync", lambda *_args, **_kwargs: None)
 
     result = runner.run_local_llm_poc(
         cycle_id="poc-cycle",
@@ -169,6 +170,227 @@ def test_local_llm_poc_runs_bounded_research_only_loop(monkeypatch):
     assert all(call["thinking"] == "disabled" for call in generation_calls)
     assert all(call["reasoning_effort"] == "max" for call in generation_calls)
     assert all(call["max_simulations"] == 4 for call in run_calls)
+
+
+def test_normalize_repair_candidate_preserves_failure_contract():
+    raw = _raw_candidate(1)
+    raw.update({
+        "route": "REPAIR",
+        "parent_expression": "rank(ts_delta(close, 5))",
+        "mutation_type": "horizon_repair",
+        "mutation_reason": "test whether slower response improves weak robustness",
+        "failure_signature": {
+            "observed_symptoms": ["low_fitness", "sub_universe_instability"],
+            "plausible_causes": [{"cause": "horizon_mismatch", "confidence": "medium"}],
+        },
+    })
+
+    candidate = generator._normalize_candidate(
+        raw,
+        {"current_cycle_trial_evidence": [{"expression": "rank(ts_delta(close, 5))"}]},
+    )
+
+    assert candidate["local_llm_route"] == "REPAIR"
+    assert "wq-failure-diagnosis" in candidate["skill_chain"]
+    assert "wq-experiment-allocation" in candidate["skill_chain"]
+    assert "wq-alpha-repair" in candidate["skill_chain"]
+    assert candidate["parent_expression"] == "rank(ts_delta(close, 5))"
+    assert runner._runner_candidate_contract_error(candidate) is None
+
+
+def test_repair_without_current_cycle_parent_is_downgraded_to_new_hypothesis():
+    raw = _raw_candidate(1)
+    raw.update({
+        "route": "REPAIR",
+        "parent_expression": "rank(ts_delta(close, 5))",
+        "failure_signature": {
+            "observed_symptoms": ["low_fitness"],
+            "plausible_causes": [{"cause": "weak_signal", "confidence": "medium"}],
+        },
+    })
+
+    candidate = generator._normalize_candidate(raw, {"current_cycle_trial_evidence": []})
+
+    assert candidate["local_llm_route"] == "NEW_HYPOTHESIS"
+    assert "wq-alpha-repair" not in candidate["skill_chain"]
+    assert "parent_expression" not in candidate
+
+
+def test_normalize_diversify_candidate_preserves_diversity_contract():
+    raw = _raw_candidate(1)
+    raw.update({
+        "route": "DIVERSIFY",
+        "diversity_case": {
+            "changed_dimensions": ["information_source", "economic_mechanism"],
+            "why_independent": "switches from price-volume to a distinct information source",
+        },
+    })
+
+    candidate = generator._normalize_candidate(raw)
+
+    assert candidate["local_llm_route"] == "DIVERSIFY"
+    assert "wq-alpha-diversify" in candidate["skill_chain"]
+    assert runner._runner_candidate_contract_error(candidate) is None
+
+
+def test_adaptive_reasoning_uses_fast_for_new_hypotheses():
+    mode = runner._local_llm_reasoning_mode({"current_cycle_trial_evidence": []}, "adaptive")
+    assert mode["thinking"] == "disabled"
+    assert mode["reason"] == "new_hypothesis_throughput"
+
+
+def test_adaptive_reasoning_uses_max_for_near_miss_repair():
+    mode = runner._local_llm_reasoning_mode(
+        {
+            "current_cycle_trial_evidence": [
+                {
+                    "expression": "rank(close)",
+                    "sharpe": 1.05,
+                    "fitness": 0.72,
+                    "failure_reason": "low_fitness",
+                    "failure_reasons": [],
+                }
+            ]
+        },
+        "adaptive",
+    )
+    assert mode["thinking"] == "enabled"
+    assert mode["reasoning_effort"] == "max"
+    assert mode["parent_expression"] == "rank(close)"
+
+
+def test_pending_round_is_reused_without_regeneration(monkeypatch):
+    candidate = runner_test_candidate()
+    snapshot = {
+        "ok": True,
+        "status": "NEEDS_SKILL_BATCH",
+        "cycle_id": "resume-cycle",
+        "progress": {"should_stop": False, "simulations": 0},
+        "planner_context": {"current_cycle_trial_evidence": []},
+        "research_cycle": {
+            "cycle_id": "resume-cycle",
+            "local_llm": {
+                "rounds": [
+                    {
+                        "round_id": "llm-pending",
+                        "batch_index": 1,
+                        "status": "pending_execution",
+                        "candidate_payloads": [candidate],
+                        "generated_candidates": [{"expression": candidate["expression"]}],
+                        "reasoning_mode": {"thinking": "disabled"},
+                    }
+                ]
+            },
+        },
+    }
+    monkeypatch.setattr(runner, "research_cycle_snapshot", lambda **_kwargs: dict(snapshot))
+    monkeypatch.setattr(runner, "generate_local_skill_batch", lambda *_args, **_kwargs: pytest.fail("must reuse pending"))
+    monkeypatch.setattr(runner, "_record_local_llm_round_sync", lambda *_args, **_kwargs: None)
+    run_calls: list[dict] = []
+
+    def fake_run_skill_batch(**kwargs):
+        run_calls.append(kwargs)
+        return {
+            "ok": True,
+            "status": "NEEDS_SKILL_BATCH",
+            "batch_executed": True,
+            "source_run_id": "resume-run",
+            "progress": {"should_stop": False, "simulations": 1},
+            "batch_result": {"summary": {"simulated": 1}},
+        }
+
+    monkeypatch.setattr(runner, "run_skill_batch", fake_run_skill_batch)
+
+    result = runner.run_local_llm_research(cycle_id="resume-cycle", max_batches=1)
+
+    assert result["ok"] is True
+    assert len(run_calls) == 1
+    assert run_calls[0]["skill_candidates"] == [candidate]
+    assert result["local_llm_rounds_this_run"][0]["round_id"] == "llm-pending"
+
+
+def test_local_research_can_explicitly_defer_submission_and_continue(monkeypatch):
+    candidate = runner_test_candidate()
+    snapshots = [
+        {
+            "ok": True,
+            "status": "SUBMISSION_REQUIRED",
+            "cycle_id": "defer-cycle",
+            "progress": {"should_stop": False, "simulations": 1},
+            "planner_context": {"current_cycle_trial_evidence": []},
+            "research_cycle": {"cycle_id": "defer-cycle"},
+        },
+        {
+            "ok": True,
+            "status": "SUBMISSION_REQUIRED",
+            "cycle_id": "defer-cycle",
+            "progress": {"should_stop": False, "simulations": 1},
+            "planner_context": {"current_cycle_trial_evidence": []},
+            "research_cycle": {"cycle_id": "defer-cycle"},
+        },
+        {
+            "ok": True,
+            "status": "TARGET_REACHED",
+            "cycle_id": "defer-cycle",
+            "progress": {"should_stop": True, "simulations": 4, "stop_reason": "target_reached"},
+            "planner_context": {},
+            "research_cycle": {"cycle_id": "defer-cycle"},
+        },
+    ]
+
+    def fake_snapshot(**_kwargs):
+        return dict(snapshots.pop(0) if len(snapshots) > 1 else snapshots[0])
+
+    monkeypatch.setattr(runner, "research_cycle_snapshot", fake_snapshot)
+    monkeypatch.setattr(
+        runner,
+        "generate_local_skill_batch",
+        lambda *_args, **_kwargs: {
+            "model": "deepseek-v4-flash",
+            "skill_candidates": [candidate],
+        },
+    )
+    monkeypatch.setattr(runner, "_record_local_llm_round_sync", lambda *_args, **_kwargs: None)
+    run_calls: list[dict] = []
+
+    def fake_run_skill_batch(**kwargs):
+        run_calls.append(kwargs)
+        return {
+            "ok": True,
+            "status": "TARGET_REACHED",
+            "batch_executed": True,
+            "source_run_id": "defer-run",
+            "progress": {"should_stop": True, "simulations": 4, "stop_reason": "target_reached"},
+            "batch_result": {"summary": {"simulated": 3}},
+        }
+
+    monkeypatch.setattr(runner, "run_skill_batch", fake_run_skill_batch)
+
+    result = runner.run_local_llm_research(cycle_id="defer-cycle", max_batches=1, submission_deferred=True)
+
+    assert result["ok"] is True
+    assert len(run_calls) == 1
+    assert run_calls[0]["submission_deferred"] is True
+
+
+def test_local_research_stops_at_submission_gate_without_generation(monkeypatch):
+    snapshot = {
+        "ok": True,
+        "status": "SUBMISSION_REQUIRED",
+        "cycle_id": "formal-cycle",
+        "progress": {"should_stop": False, "simulations": 3},
+        "planner_context": {},
+        "research_cycle": {"cycle_id": "formal-cycle"},
+    }
+    monkeypatch.setattr(runner, "research_cycle_snapshot", lambda **_kwargs: dict(snapshot))
+    monkeypatch.setattr(runner, "generate_local_skill_batch", lambda *_args, **_kwargs: pytest.fail("must not generate"))
+
+    result = runner.run_local_llm_research(cycle_id="formal-cycle", max_batches=2)
+
+    assert result["ok"] is True
+    assert result["status"] == "SUBMISSION_REQUIRED"
+    assert result["formal_submission"] is False
+    assert result["local_llm_rounds_this_run"] == []
 
 
 def runner_test_candidate() -> dict:
