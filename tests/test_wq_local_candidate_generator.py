@@ -114,15 +114,9 @@ def test_generate_local_skill_batch_hard_rejects_history_and_retries(monkeypatch
 def test_generate_local_skill_batch_enforces_forced_diversify(monkeypatch):
     first = _raw_candidate(1)
     replacement = _raw_candidate(2)
-    replacement.update(
-        {
-            "route": "DIVERSIFY",
-            "diversity_case": {
-                "changed_dimensions": ["information_source"],
-                "why_independent": "uses an independent information source",
-            },
-        }
-    )
+    replacement["family"] = "independent_fundamental_quality"
+    replacement["data_fields"] = ["returns"]
+    replacement["expression"] = "rank(ts_mean(returns, 20))"
     payloads = [first, replacement]
     calls = 0
 
@@ -139,7 +133,11 @@ def test_generate_local_skill_batch_enforces_forced_diversify(monkeypatch):
     monkeypatch.setattr(generator.httpx, "post", fake_post)
 
     result = generator.generate_local_skill_batch(
-        {"local_llm_force_diversify": True},
+        {
+            "local_llm_force_diversify": True,
+            "local_llm_recent_families": [first["family"]],
+            "current_cycle_trial_evidence": [{"expression": first["expression"], "family": first["family"]}],
+        },
         batch_size=1,
     )
 

@@ -1496,10 +1496,23 @@ def run_local_llm_research(
         cycle = dict(snapshot.get("research_cycle") or {})
         pending_round = _pending_local_llm_round(cycle)
         duplicate_pressure = _local_llm_duplicate_pressure(cycle)
+        current_evidence = [
+            item for item in (planner_context.get("current_cycle_trial_evidence") or []) if isinstance(item, dict)
+        ]
+        recent_families = list(duplicate_pressure.get("recent_families") or [])
+        recent_dataset_ids: list[str] = []
+        for evidence_item in current_evidence:
+            family = str(evidence_item.get("family") or "").strip()
+            if family and family not in recent_families:
+                recent_families.append(family)
+            dataset_id = str(evidence_item.get("dataset_id") or "").strip()
+            if dataset_id and dataset_id not in recent_dataset_ids:
+                recent_dataset_ids.append(dataset_id)
         planner_context["local_llm_exclude_expressions"] = _local_llm_round_expressions(cycle)
         planner_context["local_llm_duplicate_pressure"] = duplicate_pressure
         planner_context["local_llm_force_diversify"] = bool(duplicate_pressure.get("force_diversify"))
-        planner_context["local_llm_recent_families"] = list(duplicate_pressure.get("recent_families") or [])
+        planner_context["local_llm_recent_families"] = recent_families[-8:]
+        planner_context["local_llm_recent_dataset_ids"] = recent_dataset_ids[-8:]
 
         if pending_round:
             round_event = dict(pending_round)
@@ -1575,6 +1588,8 @@ def run_local_llm_research(
                         "expression": item.get("expression"),
                         "family": item.get("family"),
                         "route": item.get("local_llm_route"),
+                        "dataset_id": item.get("dataset_id"),
+                        "data_fields": list(item.get("data_fields") or []),
                         "parent_expression": item.get("parent_expression"),
                     }
                     for item in selected_candidates

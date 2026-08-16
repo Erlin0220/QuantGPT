@@ -244,6 +244,7 @@ def _compact_planner_context(planner_context: dict[str, Any]) -> dict[str, Any]:
         "duplicate_pressure": planner_context.get("local_llm_duplicate_pressure") or {},
         "force_diversify": bool(planner_context.get("local_llm_force_diversify")),
         "recent_families": list(planner_context.get("local_llm_recent_families") or [])[:8],
+        "recent_dataset_ids": list(planner_context.get("local_llm_recent_dataset_ids") or [])[:8],
     }
 
 
@@ -415,6 +416,21 @@ def generate_local_skill_batch(
         if str(value).strip()
     }
     force_diversify = bool(planner_context.get("local_llm_force_diversify"))
+    recent_families = {
+        str(value).strip()
+        for value in (planner_context.get("local_llm_recent_families") or [])
+        if str(value).strip()
+    }
+    recent_dataset_ids = {
+        str(value).strip()
+        for value in (planner_context.get("local_llm_recent_dataset_ids") or [])
+        if str(value).strip()
+    }
+    recent_expression_blob = "\n".join(
+        str(item.get("expression") or "")
+        for item in (planner_context.get("current_cycle_trial_evidence") or [])
+        if isinstance(item, dict)
+    )
     request_count = 0
     chunk_attempt_limit = max(1, min(5, int(os.environ.get("WQ_LOCAL_LLM_CHUNK_ATTEMPTS") or 3)))
     while len(candidates) < size:
@@ -449,7 +465,31 @@ def generate_local_skill_batch(
             for item in raw_candidates:
                 if not isinstance(item, dict):
                     continue
-                candidate = _normalize_candidate(item, planner_context)
+                normalized_item = dict(item)
+                if force_diversify:
+                    changed_dimensions = {
+                        str(value)
+                        for value in ((normalized_item.get("diversity_case") or {}).get("changed_dimensions") or [])
+                    }
+                    family = str(normalized_item.get("family") or "").strip()
+                    dataset_id = str(normalized_item.get("dataset_id") or "").strip()
+                    data_fields = [str(value).strip() for value in (normalized_item.get("data_fields") or []) if str(value).strip()]
+                    if family and recent_families and family not in recent_families:
+                        changed_dimensions.add("economic_mechanism")
+                    if dataset_id and recent_dataset_ids and dataset_id not in recent_dataset_ids:
+                        changed_dimensions.add("information_source")
+                    if data_fields and recent_expression_blob and all(field not in recent_expression_blob for field in data_fields):
+                        changed_dimensions.add("information_source")
+                    if {"information_source", "economic_mechanism"} & changed_dimensions:
+                        normalized_item["route"] = "DIVERSIFY"
+                        diversity_case = dict(normalized_item.get("diversity_case") or {})
+                        diversity_case["changed_dimensions"] = sorted(changed_dimensions)
+                        diversity_case.setdefault(
+                            "why_independent",
+                            "forced diversification after repeated duplicate/zero-simulation rounds",
+                        )
+                        normalized_item["diversity_case"] = diversity_case
+                candidate = _normalize_candidate(normalized_item, planner_context)
                 expression = candidate["expression"]
                 if not expression or "#" in expression:
                     rejection_feedback.append({"expression": expression, "error": "invalid_expression"})
