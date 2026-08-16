@@ -244,15 +244,72 @@ def _normalize_candidate(raw: dict[str, Any], planner_context: dict[str, Any] | 
     return candidate
 
 
+def _diverse_context_slice(items: Any, *, limit: int) -> list[dict[str, Any]]:
+    """Keep a tiny cross-dataset/family sample instead of only the top exploitation cell."""
+    values = [item for item in (items or []) if isinstance(item, dict)]
+    if not values:
+        return []
+    chosen: list[dict[str, Any]] = []
+    chosen_ids: set[int] = set()
+    seen_datasets: set[str] = set()
+    seen_families: set[str] = set()
+
+    for index, item in enumerate(values):
+        dataset = str(item.get("dataset") or item.get("dataset_id") or "").strip()
+        family = str(item.get("family") or "").strip()
+        if dataset and dataset in seen_datasets:
+            continue
+        chosen.append(item)
+        chosen_ids.add(index)
+        if dataset:
+            seen_datasets.add(dataset)
+        if family:
+            seen_families.add(family)
+        if len(chosen) >= limit:
+            return chosen
+
+    for index, item in enumerate(values):
+        if index in chosen_ids:
+            continue
+        family = str(item.get("family") or "").strip()
+        if family and family in seen_families:
+            continue
+        chosen.append(item)
+        chosen_ids.add(index)
+        if family:
+            seen_families.add(family)
+        if len(chosen) >= limit:
+            return chosen
+
+    for index, item in enumerate(values):
+        if index in chosen_ids:
+            continue
+        chosen.append(item)
+        if len(chosen) >= limit:
+            break
+    return chosen
+
+
 def _compact_planner_context(planner_context: dict[str, Any]) -> dict[str, Any]:
     """Keep only decision-relevant evidence for the next candidate batch."""
+    force_diversify = bool(planner_context.get("local_llm_force_diversify"))
+    selected_cells = (
+        _diverse_context_slice(planner_context.get("selected_cells"), limit=4)
+        if force_diversify
+        else list(planner_context.get("selected_cells") or [])[:1]
+    )
+    positive_memory = (
+        _diverse_context_slice(planner_context.get("research_memory_positive"), limit=4)
+        if force_diversify
+        else list(planner_context.get("research_memory_positive") or [])[:1]
+    )
     return {
         "research_strategy": planner_context.get("research_strategy"),
         "remaining_active_target": planner_context.get("remaining_active_target"),
         "remaining_submission_slots": planner_context.get("remaining_submission_slots"),
         "inventory": planner_context.get("inventory") or {},
         "next_focus": planner_context.get("next_focus"),
-        "selected_cells": list(planner_context.get("selected_cells") or [])[:1],
+        "selected_cells": selected_cells,
         "failure_counts": planner_context.get("failure_counts") or {},
         "dominant_bottleneck_stage": (
             "primary_metrics_gate"
@@ -260,7 +317,7 @@ def _compact_planner_context(planner_context: dict[str, Any]) -> dict[str, Any]:
             else planner_context.get("dominant_bottleneck_stage")
         ),
         "avoid_structure_signatures": list(planner_context.get("avoid_structure_signatures") or [])[:12],
-        "research_memory_positive": list(planner_context.get("research_memory_positive") or [])[:1],
+        "research_memory_positive": positive_memory,
         "research_memory_negative": list(planner_context.get("research_memory_negative") or [])[:1],
         "current_cycle_trial_evidence": list(planner_context.get("current_cycle_trial_evidence") or [])[:6],
         "exclude_expressions": list(

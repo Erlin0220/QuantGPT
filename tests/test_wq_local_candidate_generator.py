@@ -358,6 +358,40 @@ def test_normalize_diversify_candidate_preserves_diversity_contract():
     assert runner._runner_candidate_contract_error(candidate) is None
 
 
+def test_compact_planner_context_keeps_cross_dataset_examples_when_forced_diversify():
+    compact = generator._compact_planner_context(
+        {
+            "local_llm_force_diversify": True,
+            "selected_cells": [
+                {"family": "fundamental_a", "dataset": "fundamental6"},
+                {"family": "fundamental_b", "dataset": "fundamental6"},
+                {"family": "analyst_revision", "dataset": "analyst4"},
+                {"family": "fundamental_c", "dataset": "fundamental2"},
+                {"family": "model_revision", "dataset": "model16"},
+            ],
+            "research_memory_positive": [
+                {"family": "fundamental_a", "dataset_id": "fundamental6", "structure_signature": "fundamental"},
+                {"family": "fundamental_b", "dataset_id": "fundamental6", "structure_signature": "fundamental_2"},
+                {"family": "options_skew", "dataset_id": "option8", "structure_signature": "options"},
+                {"family": "analyst_revision", "dataset_id": "analyst4", "structure_signature": "analyst"},
+            ],
+        }
+    )
+
+    assert [item["dataset"] for item in compact["selected_cells"]] == [
+        "fundamental6",
+        "analyst4",
+        "fundamental2",
+        "model16",
+    ]
+    assert [item["dataset_id"] for item in compact["research_memory_positive"]] == [
+        "fundamental6",
+        "option8",
+        "analyst4",
+        "fundamental6",
+    ]
+
+
 def test_compact_planner_context_translates_legacy_diagnosis_bottleneck():
     compact = generator._compact_planner_context(
         {
