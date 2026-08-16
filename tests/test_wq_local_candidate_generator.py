@@ -381,7 +381,7 @@ def test_generation_recovery_plan_falls_back_from_max_then_shrinks():
     )
 
     assert [(item["stage"], item["thinking"], item["batch_size"]) for item in plan] == [
-        ("primary", "enabled", 4),
+        ("primary", "enabled", 2),
         ("max_to_nothink", "disabled", 4),
         ("shrink_to_2", "disabled", 2),
         ("shrink_to_1", "disabled", 1),

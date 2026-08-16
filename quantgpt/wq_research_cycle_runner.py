@@ -1350,7 +1350,8 @@ def _local_llm_generation_recovery_plan(mode: dict[str, Any], batch_size: int) -
             }
         )
 
-    add("primary", primary_thinking, requested)
+    primary_size = min(requested, 2) if primary_thinking == "enabled" else requested
+    add("primary", primary_thinking, primary_size)
     if primary_thinking == "enabled":
         add("max_to_nothink", "disabled", requested)
     if requested > 2:
@@ -1605,8 +1606,15 @@ def run_local_llm_research(
                 working_context = dict(planner_context)
                 working_context["local_llm_recovery_stage"] = recovery_attempt["stage"]
                 # Runner-level recovery already changes thinking mode and batch size;
-                # avoid multiplying that by another 3x semantic retry loop inside one request stage.
+                # keep each stage bounded so one bad provider response cannot consume the cycle budget.
                 working_context["local_llm_chunk_attempt_limit"] = 1
+                working_context["local_llm_request_attempts"] = 1
+                working_context["local_llm_request_timeout_seconds"] = {
+                    "primary": 60 if recovery_attempt["thinking"] == "enabled" else 45,
+                    "max_to_nothink": 45,
+                    "shrink_to_2": 35,
+                    "shrink_to_1": 30,
+                }.get(str(recovery_attempt["stage"]), 45)
                 if contract_feedback:
                     working_context["local_llm_contract_feedback"] = contract_feedback
                 attempt_thinking = str(recovery_attempt["thinking"])

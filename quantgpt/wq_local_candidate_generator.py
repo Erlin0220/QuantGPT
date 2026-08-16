@@ -353,8 +353,16 @@ def _request_candidate_content(
     timeout_seconds: float,
     thinking: str,
     reasoning_effort: str,
+    request_attempts: int | None = None,
 ) -> str:
-    retries = max(1, min(3, int(os.environ.get("WQ_LOCAL_LLM_REQUEST_ATTEMPTS") or 2)))
+    default_attempts = 1 if thinking == "enabled" else 2
+    retries = max(
+        1,
+        min(
+            3,
+            int(request_attempts or os.environ.get("WQ_LOCAL_LLM_REQUEST_ATTEMPTS") or default_attempts),
+        ),
+    )
     default_max_tokens = 16384 if thinking == "enabled" else 2048
     max_tokens = max(1024, int(os.environ.get("WQ_LOCAL_LLM_MAX_TOKENS") or default_max_tokens))
     last_error: Exception | None = None
@@ -426,6 +434,24 @@ def generate_local_skill_batch(
         raise LocalCandidateGenerationError("reasoning_effort must be high or max")
     size = max(1, min(20, int(batch_size)))
     chunk_size = max(1, min(4, int(os.environ.get("WQ_LOCAL_LLM_CHUNK_SIZE") or 2)))
+    effective_timeout = max(
+        10.0,
+        min(
+            120.0,
+            float(planner_context.get("local_llm_request_timeout_seconds") or timeout_seconds),
+        ),
+    )
+    request_attempts = max(
+        1,
+        min(
+            3,
+            int(
+                planner_context.get("local_llm_request_attempts")
+                or os.environ.get("WQ_LOCAL_LLM_REQUEST_ATTEMPTS")
+                or (1 if resolved_thinking == "enabled" else 2)
+            ),
+        ),
+    )
     skill_names, skill_context = _load_skill_context(planner_context)
 
     candidates: list[dict[str, Any]] = []
@@ -487,9 +513,10 @@ def generate_local_skill_batch(
                 api_key=api_key,
                 model=resolved_model,
                 messages=messages,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=effective_timeout,
                 thinking=resolved_thinking,
                 reasoning_effort=resolved_effort,
+                request_attempts=request_attempts,
             )
             request_count += 1
             decoded = _extract_json_payload(content)
