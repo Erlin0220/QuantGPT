@@ -332,6 +332,21 @@ def test_adaptive_reasoning_uses_max_for_near_miss_repair():
     assert mode["parent_expression"] == "rank(close)"
 
 
+def test_local_llm_exclusions_include_cross_cycle_history():
+    exclusions = runner._local_llm_exclusion_expressions(
+        {"recent_trial_expressions": ["rank(close)", "rank(volume)"]},
+        {
+            "local_llm": {
+                "rounds": [
+                    {"generated_candidates": [{"expression": "rank(ts_mean(returns, 20))"}]},
+                ]
+            }
+        },
+    )
+
+    assert exclusions == ["rank(close)", "rank(volume)", "rank(ts_mean(returns, 20))"]
+
+
 def test_duplicate_pressure_forces_diversify_after_repeated_zero_sim_rounds():
     pressure = runner._local_llm_duplicate_pressure(
         {

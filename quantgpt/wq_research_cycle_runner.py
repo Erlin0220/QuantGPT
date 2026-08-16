@@ -590,6 +590,11 @@ def _planner_context(
         "research_memory_positive": list((control.get("research_memory") or {}).get("positive") or [])[:12],
         "research_memory_negative": list((control.get("research_memory") or {}).get("negative") or [])[:12],
         "recent_round_audits": list(control.get("round_audits") or [])[:5],
+        "recent_trial_expressions": [
+            str(trial.get("expression") or "").strip()
+            for trial in (memory.get("recent_trials") or [])[:200]
+            if str(trial.get("expression") or "").strip()
+        ],
         "current_cycle_trial_evidence": _current_cycle_trial_evidence(memory, cycle),
         "learning_maturity": memory.get("learning_maturity") or {},
     }
@@ -1392,6 +1397,19 @@ def _local_llm_round_expressions(cycle: dict[str, Any]) -> list[str]:
     return expressions[-40:]
 
 
+def _local_llm_exclusion_expressions(planner_context: dict[str, Any], cycle: dict[str, Any]) -> list[str]:
+    """Combine cross-cycle trial history with the current cycle's generated expressions."""
+    expressions: list[str] = []
+    for value in [
+        *(planner_context.get("recent_trial_expressions") or []),
+        *_local_llm_round_expressions(cycle),
+    ]:
+        expression = str(value or "").strip()
+        if expression and expression not in expressions:
+            expressions.append(expression)
+    return expressions[-200:]
+
+
 def _pending_local_llm_round(cycle: dict[str, Any]) -> dict[str, Any] | None:
     local_llm = cycle.get("local_llm") or {}
     for round_item in reversed(local_llm.get("rounds") or []):
@@ -1523,7 +1541,7 @@ def run_local_llm_research(
             dataset_id = str(evidence_item.get("dataset_id") or "").strip()
             if dataset_id and dataset_id not in recent_dataset_ids:
                 recent_dataset_ids.append(dataset_id)
-        planner_context["local_llm_exclude_expressions"] = _local_llm_round_expressions(cycle)
+        planner_context["local_llm_exclude_expressions"] = _local_llm_exclusion_expressions(planner_context, cycle)
         planner_context["local_llm_duplicate_pressure"] = duplicate_pressure
         planner_context["local_llm_force_diversify"] = bool(duplicate_pressure.get("force_diversify"))
         planner_context["local_llm_recent_families"] = recent_families[-8:]
