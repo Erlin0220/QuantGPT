@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -26,10 +27,33 @@ _FAILURE_SKILLS = [
 _DIVERSIFY_SKILLS = ["wq-alpha-diversify"]
 _DEFAULT_BASE_URL = "https://opencode.ai/zen/go/v1"
 _DEFAULT_MODEL = "deepseek-v4-flash"
+_CORE_DATA_FIELDS = {
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "vwap",
+    "returns",
+    "cap",
+    "adv20",
+    "adv60",
+    "adv120",
+}
 
 
 class LocalCandidateGenerationError(RuntimeError):
     """Raised when the local-model candidate generator cannot produce a usable batch."""
+
+
+def _data_field_is_grounded(field: str, planner_context_text: str) -> bool:
+    """Accept core fields or exact field ids already grounded in planner evidence."""
+    resolved = str(field or "").strip()
+    if not resolved:
+        return False
+    if resolved in _CORE_DATA_FIELDS:
+        return True
+    return re.search(rf"(?<![A-Za-z0-9_]){re.escape(resolved)}(?![A-Za-z0-9_])", planner_context_text) is not None
 
 
 def _skill_names_for_context(planner_context: dict[str, Any]) -> list[str]:
@@ -431,6 +455,7 @@ def generate_local_skill_batch(
         for item in (planner_context.get("current_cycle_trial_evidence") or [])
         if isinstance(item, dict)
     )
+    planner_context_text = json.dumps(planner_context, ensure_ascii=False, default=str)
     request_count = 0
     chunk_attempt_limit = max(1, min(5, int(os.environ.get("WQ_LOCAL_LLM_CHUNK_ATTEMPTS") or 3)))
     while len(candidates) < size:
@@ -517,6 +542,20 @@ def generate_local_skill_batch(
                         continue
                 if not candidate["hypothesis"] or not candidate["family"] or not candidate["data_fields"]:
                     rejection_feedback.append({"expression": expression, "error": "missing_candidate_metadata"})
+                    continue
+                unresolved_fields = [
+                    field
+                    for field in candidate["data_fields"]
+                    if not _data_field_is_grounded(str(field), planner_context_text)
+                ]
+                if unresolved_fields:
+                    rejection_feedback.append(
+                        {
+                            "expression": expression,
+                            "error": "unresolved_data_fields",
+                            "fields": unresolved_fields,
+                        }
+                    )
                     continue
                 seen_expressions.add(expression)
                 candidates.append(candidate)

@@ -111,6 +111,38 @@ def test_generate_local_skill_batch_hard_rejects_history_and_retries(monkeypatch
     assert result["skill_candidates"][0]["expression"] == replacement["expression"]
 
 
+def test_generate_local_skill_batch_retries_unresolved_data_fields(monkeypatch):
+    invalid = _raw_candidate(1)
+    invalid["expression"] = "rank(ts_mean(return_invested_capital, 20))"
+    invalid["data_fields"] = ["return_invested_capital"]
+    replacement = _raw_candidate(2)
+    payloads = [invalid, replacement]
+    calls = 0
+
+    def fake_post(*_args, **_kwargs):
+        nonlocal calls
+        candidate = payloads[calls]
+        calls += 1
+        content = json.dumps({"skill_candidates": [candidate]})
+        return _FakeResponse({"choices": [{"message": {"content": content}}]})
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setenv("WQ_LOCAL_LLM_CHUNK_ATTEMPTS", "2")
+    monkeypatch.setattr(generator, "_load_skill_context", lambda _context: (["wq-alpha-hypothesis"], "skill text"))
+    monkeypatch.setattr(generator.httpx, "post", fake_post)
+
+    result = generator.generate_local_skill_batch({}, batch_size=1)
+
+    assert calls == 2
+    assert result["skill_candidates"][0]["expression"] == replacement["expression"]
+
+
+def test_noncore_data_field_is_allowed_when_grounded_in_planner_context():
+    context_text = json.dumps({"current_cycle_trial_evidence": [{"expression": "rank(return_assets)"}]})
+    assert generator._data_field_is_grounded("return_assets", context_text) is True
+    assert generator._data_field_is_grounded("return_invested_capital", context_text) is False
+
+
 def test_generate_local_skill_batch_enforces_forced_diversify(monkeypatch):
     first = _raw_candidate(1)
     replacement = _raw_candidate(2)
