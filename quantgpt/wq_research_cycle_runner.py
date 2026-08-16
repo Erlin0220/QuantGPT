@@ -574,6 +574,31 @@ def _planner_context(
 ) -> dict[str, Any]:
     scheduler = dict(control.get("scheduler") or {})
     campaign = dict(policy.get("active_campaign") or {})
+    selected_cells = list(scheduler.get("selected_cells") or [])[:8]
+    forced_datasets = [
+        str(cell.get("dataset") or cell.get("dataset_id") or "").strip()
+        for cell in selected_cells
+        if isinstance(cell, dict)
+        and str(cell.get("rationale") or "") == "forced_exploration"
+        and str(cell.get("dataset") or cell.get("dataset_id") or "").strip()
+    ]
+    field_registry = memory.get("field_registry") or {}
+    forced_exploration_fields: list[dict[str, str]] = []
+    if isinstance(field_registry, dict):
+        for dataset_id in dict.fromkeys(forced_datasets):
+            for field_id in sorted(field_registry):
+                metadata = field_registry.get(field_id)
+                if not isinstance(metadata, dict):
+                    continue
+                if str(metadata.get("dataset_id") or "").strip() != dataset_id:
+                    continue
+                forced_exploration_fields.append(
+                    {"field_id": str(field_id), "dataset_id": dataset_id}
+                )
+                if len(forced_exploration_fields) >= 24:
+                    break
+            if len(forced_exploration_fields) >= 24:
+                break
     return {
         "required_skill_chain": ["wq-economic-hypothesis", *REQUIRED_WQ_SKILL_CHAIN],
         "research_strategy": policy.get("research_strategy"),
@@ -584,7 +609,8 @@ def _planner_context(
         "submission_candidates": list(policy.get("submission_candidate_top") or [])[:5],
         "inventory": policy.get("inventory") or {},
         "next_focus": scheduler.get("next_focus"),
-        "selected_cells": list(scheduler.get("selected_cells") or [])[:8],
+        "selected_cells": selected_cells,
+        "forced_exploration_fields": forced_exploration_fields,
         "failure_counts": (control.get("failures") or {}).get("reason_counts") or {},
         "dominant_bottleneck_stage": (control.get("failures") or {}).get("dominant_bottleneck_stage"),
         "avoid_structure_signatures": list(campaign.get("avoid_structure_signatures") or [])[:20],

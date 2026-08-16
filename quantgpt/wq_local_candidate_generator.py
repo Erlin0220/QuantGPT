@@ -257,6 +257,7 @@ def _candidate_fills_exploration_slot(
     *,
     recent_expression_blob: str,
     forced_exploration_cells: list[dict[str, Any]],
+    forced_exploration_fields: list[dict[str, Any]] | None = None,
 ) -> bool:
     if candidate.get("local_llm_route") != "DIVERSIFY":
         return False
@@ -267,6 +268,15 @@ def _candidate_fills_exploration_slot(
     if not ({"information_source", "economic_mechanism"} & changed_dimensions):
         return False
 
+    fields = {str(value).strip() for value in (candidate.get("data_fields") or []) if str(value).strip()}
+    target_field_ids = {
+        str(item.get("field_id") or item.get("id") or "").strip()
+        for item in (forced_exploration_fields or [])
+        if isinstance(item, dict) and str(item.get("field_id") or item.get("id") or "").strip()
+    }
+    if target_field_ids:
+        return bool(fields & target_field_ids)
+
     dataset_id = str(candidate.get("dataset_id") or "").strip()
     exploration_datasets = {
         str(item.get("dataset") or item.get("dataset_id") or "").strip()
@@ -276,7 +286,6 @@ def _candidate_fills_exploration_slot(
     if dataset_id and dataset_id in exploration_datasets:
         return True
 
-    fields = {str(value).strip() for value in (candidate.get("data_fields") or []) if str(value).strip()}
     orthogonal_core_fields = {
         "open",
         "high",
@@ -400,6 +409,7 @@ def _compact_planner_context(planner_context: dict[str, Any]) -> dict[str, Any]:
         "inventory": planner_context.get("inventory") or {},
         "next_focus": planner_context.get("next_focus"),
         "selected_cells": selected_cells,
+        "forced_exploration_fields": list(planner_context.get("forced_exploration_fields") or [])[:24],
         "failure_counts": planner_context.get("failure_counts") or {},
         "dominant_bottleneck_stage": (
             "primary_metrics_gate"
@@ -422,7 +432,11 @@ def _compact_planner_context(planner_context: dict[str, Any]) -> dict[str, Any]:
         "recent_dataset_ids": list(planner_context.get("local_llm_recent_dataset_ids") or [])[:8],
         "repair_parent_expressions": list(planner_context.get("local_llm_repair_parent_expressions") or [])[:4],
         "repair_parent_counts": dict(planner_context.get("local_llm_repair_parent_counts") or {}),
-        "max_repairs_per_batch": int(planner_context.get("local_llm_max_repairs_per_batch") or 1),
+        "max_repairs_per_batch": int(
+            1
+            if planner_context.get("local_llm_max_repairs_per_batch") is None
+            else planner_context.get("local_llm_max_repairs_per_batch")
+        ),
         "repair_slots_remaining": int(planner_context.get("local_llm_repair_slots_remaining") or 0),
         "exploration_slots_remaining": int(planner_context.get("local_llm_exploration_slots_remaining") or 0),
     }
@@ -486,7 +500,7 @@ Rules:
 - Every expression must differ in mechanism/information source or structure, not just a lookback number.
 - Every expression in exclude_expressions is HARD-FORBIDDEN; never return it again.
 - If force_diversify=true, every candidate MUST use route=DIVERSIFY and diversity_case.changed_dimensions MUST include information_source or economic_mechanism. Prefer a family outside recent_families and change the data source/operator skeleton rather than only a window.
-- selected_cells preserves the scheduler's exploitation/exploration allocation. If exploration_slots_remaining > 0, at least that many candidates MUST use route=DIVERSIFY and be genuinely different in information source/economic mechanism. Prefer a supplied forced_exploration dataset/family when exact fields are grounded; otherwise use an orthogonal core price/volume mechanism instead of inventing a field id.
+- selected_cells preserves the scheduler's exploitation/exploration allocation. If exploration_slots_remaining > 0, at least that many candidates MUST use route=DIVERSIFY and be genuinely different in information source/economic mechanism. If forced_exploration_fields is non-empty, an exploration candidate MUST use at least one exact field_id from that list; do not claim an exploration dataset without using one of its grounded fields. Only when forced_exploration_fields is empty may you fall back to an orthogonal core price/volume mechanism.
 - data_fields must list every data field used by the expression and no operators.
 - Use knowledge_card_ids only when an id is literally present in supplied context; otherwise [].
 - Do not invent historical performance, Sharpe, Fitness, correlation, or platform checks.
@@ -784,6 +798,7 @@ def generate_local_skill_batch(
                     candidate,
                     recent_expression_blob=recent_expression_blob,
                     forced_exploration_cells=forced_exploration_cells,
+                    forced_exploration_fields=list(planner_context.get("forced_exploration_fields") or []),
                 )
                 remaining_capacity = size - len(candidates)
                 remaining_exploration_slots = max(0, exploration_slots_required - accepted_exploration_slots)
