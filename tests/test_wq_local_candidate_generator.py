@@ -179,6 +179,62 @@ def test_generate_local_skill_batch_enforces_forced_diversify(monkeypatch):
     assert "information_source" in candidate["diversity_case"]["changed_dimensions"]
 
 
+def test_generate_local_skill_batch_reserves_one_scheduler_exploration_slot(monkeypatch):
+    first = _raw_candidate(1)
+    second = _raw_candidate(2)
+    third = _raw_candidate(3)
+    fourth_nonexplore = _raw_candidate(4)
+    exploration = _raw_candidate(5)
+    exploration.update(
+        {
+            "route": "DIVERSIFY",
+            "diversity_case": {
+                "changed_dimensions": ["information_source"],
+                "why_independent": "switch from fundamental accounting signals to price-volume behavior",
+            },
+        }
+    )
+    responses = [
+        {"skill_candidates": [first, second]},
+        {"skill_candidates": [third, fourth_nonexplore]},
+        {"skill_candidates": [exploration]},
+    ]
+    calls = 0
+
+    def fake_post(*_args, **_kwargs):
+        nonlocal calls
+        payload = responses[min(calls, len(responses) - 1)]
+        calls += 1
+        return _FakeResponse({"choices": [{"message": {"content": json.dumps(payload)}}]})
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setattr(generator, "_load_skill_context", lambda _context: (["wq-alpha-diversify"], "skill text"))
+    monkeypatch.setattr(generator.httpx, "post", fake_post)
+
+    result = generator.generate_local_skill_batch(
+        {
+            "selected_cells": [
+                {"family": "fundamental_quality", "dataset": "fundamental6", "rationale": "posterior_exploitation"},
+                {"family": "analyst_revision", "dataset": "model16", "rationale": "forced_exploration"},
+            ],
+            "current_cycle_trial_evidence": [
+                {
+                    "expression": "rank(ts_mean(cashflow_op, 20))",
+                    "family": "fundamental_quality",
+                    "data_fields": ["cashflow_op"],
+                }
+            ],
+        },
+        batch_size=4,
+    )
+
+    assert calls == 3
+    assert result["generated"] == 4
+    assert result["skill_candidates"][-1]["local_llm_route"] == "DIVERSIFY"
+    assert "information_source" in result["skill_candidates"][-1]["diversity_case"]["changed_dimensions"]
+    assert fourth_nonexplore["expression"] not in {item["expression"] for item in result["skill_candidates"]}
+
+
 def test_generate_local_skill_batch_returns_partial_batch_instead_of_failing(monkeypatch):
     first = _raw_candidate(1)
     second = _raw_candidate(2)

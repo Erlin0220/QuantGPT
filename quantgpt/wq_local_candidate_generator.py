@@ -244,6 +244,63 @@ def _normalize_candidate(raw: dict[str, Any], planner_context: dict[str, Any] | 
     return candidate
 
 
+def _forced_exploration_cells(items: Any) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in (items or [])
+        if isinstance(item, dict) and str(item.get("rationale") or "") == "forced_exploration"
+    ]
+
+
+def _candidate_fills_exploration_slot(
+    candidate: dict[str, Any],
+    *,
+    recent_expression_blob: str,
+    forced_exploration_cells: list[dict[str, Any]],
+) -> bool:
+    if candidate.get("local_llm_route") != "DIVERSIFY":
+        return False
+    changed_dimensions = {
+        str(value)
+        for value in ((candidate.get("diversity_case") or {}).get("changed_dimensions") or [])
+    }
+    if not ({"information_source", "economic_mechanism"} & changed_dimensions):
+        return False
+
+    dataset_id = str(candidate.get("dataset_id") or "").strip()
+    exploration_datasets = {
+        str(item.get("dataset") or item.get("dataset_id") or "").strip()
+        for item in forced_exploration_cells
+        if str(item.get("dataset") or item.get("dataset_id") or "").strip()
+    }
+    if dataset_id and dataset_id in exploration_datasets:
+        return True
+
+    fields = {str(value).strip() for value in (candidate.get("data_fields") or []) if str(value).strip()}
+    orthogonal_core_fields = {
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "vwap",
+        "returns",
+        "adv20",
+        "adv60",
+        "adv120",
+    }
+    if fields & orthogonal_core_fields and all(field not in recent_expression_blob for field in fields):
+        return True
+
+    family = str(candidate.get("family") or "").strip()
+    exploration_families = {
+        str(item.get("family") or "").strip()
+        for item in forced_exploration_cells
+        if str(item.get("family") or "").strip()
+    }
+    return bool(family and family in exploration_families and "economic_mechanism" in changed_dimensions)
+
+
 def _compact_selected_cell(item: dict[str, Any]) -> dict[str, Any]:
     keys = (
         "cell_key",
@@ -367,6 +424,7 @@ def _compact_planner_context(planner_context: dict[str, Any]) -> dict[str, Any]:
         "repair_parent_counts": dict(planner_context.get("local_llm_repair_parent_counts") or {}),
         "max_repairs_per_batch": int(planner_context.get("local_llm_max_repairs_per_batch") or 1),
         "repair_slots_remaining": int(planner_context.get("local_llm_repair_slots_remaining") or 0),
+        "exploration_slots_remaining": int(planner_context.get("local_llm_exploration_slots_remaining") or 0),
     }
 
 
@@ -428,7 +486,7 @@ Rules:
 - Every expression must differ in mechanism/information source or structure, not just a lookback number.
 - Every expression in exclude_expressions is HARD-FORBIDDEN; never return it again.
 - If force_diversify=true, every candidate MUST use route=DIVERSIFY and diversity_case.changed_dimensions MUST include information_source or economic_mechanism. Prefer a family outside recent_families and change the data source/operator skeleton rather than only a window.
-- selected_cells preserves the scheduler's exploitation/exploration allocation. If any selected cell has rationale=forced_exploration, reserve roughly one candidate in a four-candidate batch for a genuinely different information source/mechanism. If that cell names a dataset but no exact non-core field id is supplied, use an orthogonal core price/volume mechanism instead of inventing a field id.
+- selected_cells preserves the scheduler's exploitation/exploration allocation. If exploration_slots_remaining > 0, at least that many candidates MUST use route=DIVERSIFY and be genuinely different in information source/economic mechanism. Prefer a supplied forced_exploration dataset/family when exact fields are grounded; otherwise use an orthogonal core price/volume mechanism instead of inventing a field id.
 - data_fields must list every data field used by the expression and no operators.
 - Use knowledge_card_ids only when an id is literally present in supplied context; otherwise [].
 - Do not invent historical performance, Sharpe, Fitness, correlation, or platform checks.
@@ -566,6 +624,9 @@ def generate_local_skill_batch(
         if str(value).strip()
     }
     force_diversify = bool(planner_context.get("local_llm_force_diversify"))
+    forced_exploration_cells = _forced_exploration_cells(planner_context.get("selected_cells"))
+    exploration_slots_required = 1 if size >= 4 and forced_exploration_cells else 0
+    accepted_exploration_slots = 0
     recent_families = {
         str(value).strip()
         for value in (planner_context.get("local_llm_recent_families") or [])
@@ -611,6 +672,10 @@ def generate_local_skill_batch(
             chunk_context = dict(planner_context)
             chunk_context["local_llm_exclude_expressions"] = [*inherited_exclusions, *seen_expressions]
             chunk_context["local_llm_repair_slots_remaining"] = max(0, max_repairs_per_batch - accepted_repairs)
+            chunk_context["local_llm_exploration_slots_remaining"] = max(
+                0,
+                exploration_slots_required - accepted_exploration_slots,
+            )
             if rejection_feedback:
                 chunk_context["local_llm_contract_feedback"] = [
                     *list(planner_context.get("local_llm_contract_feedback") or []),
@@ -709,6 +774,24 @@ def generate_local_skill_batch(
                 if not candidate["hypothesis"] or not candidate["family"] or not candidate["data_fields"]:
                     rejection_feedback.append({"expression": expression, "error": "missing_candidate_metadata"})
                     continue
+                fills_exploration_slot = _candidate_fills_exploration_slot(
+                    candidate,
+                    recent_expression_blob=recent_expression_blob,
+                    forced_exploration_cells=forced_exploration_cells,
+                )
+                remaining_capacity = size - len(candidates)
+                remaining_exploration_slots = max(0, exploration_slots_required - accepted_exploration_slots)
+                if remaining_exploration_slots >= remaining_capacity and not fills_exploration_slot:
+                    rejection_feedback.append(
+                        {
+                            "expression": expression,
+                            "error": "scheduler_exploration_slot_reserved",
+                            "forced_exploration_cells": [
+                                _compact_selected_cell(item) for item in forced_exploration_cells[:2]
+                            ],
+                        }
+                    )
+                    continue
                 unresolved_fields = [
                     field
                     for field in candidate["data_fields"]
@@ -727,6 +810,8 @@ def generate_local_skill_batch(
                 candidates.append(candidate)
                 if candidate.get("local_llm_route") == "REPAIR":
                     accepted_repairs += 1
+                if fills_exploration_slot:
+                    accepted_exploration_slots += 1
                 added += 1
                 if len(candidates) >= size:
                     break
