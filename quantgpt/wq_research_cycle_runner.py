@@ -40,7 +40,7 @@ from .wq_autonomous_research import (
 from .wq_brain_client import get_client, is_configured
 from .wq_control_tower import build_research_control_tower
 from .wq_local_candidate_generator import LocalCandidateGenerationError, generate_local_skill_batch
-from .wq_research_memory import load_research_memory_sync, record_research_trials_sync
+from .wq_research_memory import load_research_memory_sync, normalize_wq_expression, record_research_trials_sync
 from .wq_submission_policy import (
     _run_coro_sync,
     get_submission_policy_status,
@@ -1290,6 +1290,67 @@ def _load_skill_candidates(path: str) -> list[dict[str, Any]]:
     return [item for item in payload if isinstance(item, dict)]
 
 
+def _local_llm_repair_parent_is_worthwhile(item: dict[str, Any]) -> bool:
+    """Reserve expensive repair reasoning for genuinely near-threshold failures."""
+    sharpe = float(item.get("sharpe") or 0.0)
+    fitness = float(item.get("fitness") or 0.0)
+    reasons = {
+        str(reason.get("reason") or "")
+        for reason in (item.get("failure_reasons") or [])
+        if isinstance(reason, dict)
+    }
+    reasons.add(str(item.get("failure_reason") or ""))
+    metric_near_miss = sharpe >= 1.1 and fitness >= 0.7
+    robustness_near_miss = bool(
+        {"sub_universe_instability", "self_correlation", "correlation_saturation"} & reasons
+    ) and sharpe >= 0.9 and fitness >= 0.6
+    return metric_near_miss or robustness_near_miss
+
+
+def _local_llm_repair_parent_counts(cycle: dict[str, Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for round_item in ((cycle.get("local_llm") or {}).get("rounds") or []):
+        if not isinstance(round_item, dict):
+            continue
+        for candidate in round_item.get("generated_candidates") or []:
+            if not isinstance(candidate, dict) or str(candidate.get("route") or "").upper() != "REPAIR":
+                continue
+            parent = normalize_wq_expression(str(candidate.get("parent_expression") or ""))
+            if parent:
+                counts[parent] = counts.get(parent, 0) + 1
+    return counts
+
+
+def _local_llm_repair_parent_expressions(
+    planner_context: dict[str, Any],
+    cycle: dict[str, Any],
+    *,
+    max_repairs_per_parent: int = 2,
+    limit: int = 2,
+) -> list[str]:
+    counts = _local_llm_repair_parent_counts(cycle)
+    evidence = [
+        item
+        for item in (planner_context.get("current_cycle_trial_evidence") or [])
+        if isinstance(item, dict) and _local_llm_repair_parent_is_worthwhile(item)
+    ]
+    evidence.sort(
+        key=lambda item: (float(item.get("fitness") or 0.0), float(item.get("sharpe") or 0.0)),
+        reverse=True,
+    )
+    parents: list[str] = []
+    for item in evidence:
+        expression = str(item.get("expression") or "").strip()
+        normalized_expression = normalize_wq_expression(expression)
+        if not expression or counts.get(normalized_expression, 0) >= max(1, int(max_repairs_per_parent)):
+            continue
+        if expression not in parents:
+            parents.append(expression)
+        if len(parents) >= max(1, int(limit)):
+            break
+    return parents
+
+
 def _local_llm_reasoning_mode(planner_context: dict[str, Any], policy: str = "adaptive") -> dict[str, Any]:
     resolved = str(policy or "adaptive").strip().lower()
     if resolved == "fast":
@@ -1308,25 +1369,22 @@ def _local_llm_reasoning_mode(planner_context: dict[str, Any], policy: str = "ad
     if not evidence:
         return {"thinking": "disabled", "reasoning_effort": None, "reason": "new_hypothesis_throughput"}
 
+    repair_parent_policy_present = "local_llm_repair_parent_expressions" in planner_context
+    allowed_parents = {
+        str(value).strip()
+        for value in (planner_context.get("local_llm_repair_parent_expressions") or [])
+        if str(value).strip()
+    }
     for item in evidence:
-        sharpe = float(item.get("sharpe") or 0.0)
-        fitness = float(item.get("fitness") or 0.0)
-        reasons = {
-            str(reason.get("reason") or "")
-            for reason in (item.get("failure_reasons") or [])
-            if isinstance(reason, dict)
-        }
-        reasons.add(str(item.get("failure_reason") or ""))
-        near_miss = sharpe >= 0.9 or fitness >= 0.65
-        robustness_case = bool(
-            {"sub_universe_instability", "self_correlation", "correlation_saturation"} & reasons
-        ) and (sharpe >= 0.7 or fitness >= 0.45)
-        if near_miss or robustness_case:
+        expression = str(item.get("expression") or "").strip()
+        if repair_parent_policy_present and expression not in allowed_parents:
+            continue
+        if _local_llm_repair_parent_is_worthwhile(item):
             return {
                 "thinking": "enabled",
                 "reasoning_effort": "max",
                 "reason": "high_value_failure_repair",
-                "parent_expression": item.get("expression"),
+                "parent_expression": expression,
             }
     return {"thinking": "disabled", "reasoning_effort": None, "reason": "weak_failure_explore_broadly"}
 
@@ -1607,6 +1665,12 @@ def run_local_llm_research(
         planner_context["local_llm_force_diversify"] = bool(duplicate_pressure.get("force_diversify"))
         planner_context["local_llm_recent_families"] = recent_families[-8:]
         planner_context["local_llm_recent_dataset_ids"] = recent_dataset_ids[-8:]
+        planner_context["local_llm_repair_parent_counts"] = _local_llm_repair_parent_counts(cycle)
+        planner_context["local_llm_repair_parent_expressions"] = _local_llm_repair_parent_expressions(
+            planner_context,
+            cycle,
+        )
+        planner_context["local_llm_max_repairs_per_batch"] = 1
 
         if pending_round:
             round_event = dict(pending_round)

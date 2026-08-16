@@ -394,8 +394,8 @@ def test_adaptive_reasoning_uses_max_for_near_miss_repair():
             "current_cycle_trial_evidence": [
                 {
                     "expression": "rank(close)",
-                    "sharpe": 1.05,
-                    "fitness": 0.72,
+                    "sharpe": 1.2,
+                    "fitness": 0.8,
                     "failure_reason": "low_fitness",
                     "failure_reasons": [],
                 }
@@ -406,6 +406,111 @@ def test_adaptive_reasoning_uses_max_for_near_miss_repair():
     assert mode["thinking"] == "enabled"
     assert mode["reasoning_effort"] == "max"
     assert mode["parent_expression"] == "rank(close)"
+
+
+def test_adaptive_reasoning_does_not_max_think_for_weak_single_metric_failure():
+    mode = runner._local_llm_reasoning_mode(
+        {
+            "current_cycle_trial_evidence": [
+                {
+                    "expression": "rank(close)",
+                    "sharpe": 0.91,
+                    "fitness": 0.44,
+                    "failure_reason": "low_fitness",
+                    "failure_reasons": [],
+                }
+            ]
+        },
+        "adaptive",
+    )
+
+    assert mode["thinking"] == "disabled"
+    assert mode["reason"] == "weak_failure_explore_broadly"
+
+
+def test_repair_parent_policy_caps_repeated_parent_across_rounds():
+    strong_parent = "rank(ts_mean(close, 20))"
+    alternate_parent = "rank(ts_mean(volume, 20))"
+    cycle = {
+        "local_llm": {
+            "rounds": [
+                {
+                    "generated_candidates": [
+                        {"route": "REPAIR", "parent_expression": strong_parent},
+                        {"route": "REPAIR", "parent_expression": strong_parent},
+                    ]
+                }
+            ]
+        }
+    }
+    context = {
+        "current_cycle_trial_evidence": [
+            {"expression": strong_parent, "sharpe": 1.3, "fitness": 0.8, "failure_reason": "low_fitness"},
+            {"expression": alternate_parent, "sharpe": 1.2, "fitness": 0.75, "failure_reason": "low_fitness"},
+            {"expression": "rank(returns)", "sharpe": 0.95, "fitness": 0.4, "failure_reason": "low_fitness"},
+        ]
+    }
+
+    assert runner._local_llm_repair_parent_counts(cycle)[runner.normalize_wq_expression(strong_parent)] == 2
+    assert runner._local_llm_repair_parent_expressions(context, cycle) == [alternate_parent]
+
+
+def test_generate_local_skill_batch_limits_repairs_and_refills_with_new_hypothesis(monkeypatch):
+    parent = "rank(ts_mean(close, 20))"
+    repair_one = _raw_candidate(1)
+    repair_one.update(
+        {
+            "route": "REPAIR",
+            "parent_expression": parent,
+            "mutation_type": "structure_repair",
+            "mutation_reason": "test one causal structure change",
+            "failure_signature": {
+                "observed_symptoms": ["low_fitness"],
+                "plausible_causes": [{"cause": "weak_signal", "confidence": "medium"}],
+            },
+        }
+    )
+    repair_two = _raw_candidate(2)
+    repair_two.update(
+        {
+            "route": "REPAIR",
+            "parent_expression": parent,
+            "mutation_type": "horizon_repair",
+            "mutation_reason": "test a second repair",
+            "failure_signature": {
+                "observed_symptoms": ["low_fitness"],
+                "plausible_causes": [{"cause": "horizon_mismatch", "confidence": "medium"}],
+            },
+        }
+    )
+    replacement = _raw_candidate(3)
+    payloads = [
+        {"skill_candidates": [repair_one, repair_two]},
+        {"skill_candidates": [replacement]},
+    ]
+    calls = 0
+
+    def fake_post(*_args, **_kwargs):
+        nonlocal calls
+        payload = payloads[min(calls, len(payloads) - 1)]
+        calls += 1
+        return _FakeResponse({"choices": [{"message": {"content": json.dumps(payload)}}]})
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setattr(generator, "_load_skill_context", lambda _context: (["wq-alpha-repair"], "skill text"))
+    monkeypatch.setattr(generator.httpx, "post", fake_post)
+
+    result = generator.generate_local_skill_batch(
+        {
+            "current_cycle_trial_evidence": [{"expression": parent, "sharpe": 1.2, "fitness": 0.8}],
+            "local_llm_repair_parent_expressions": [parent],
+            "local_llm_max_repairs_per_batch": 1,
+        },
+        batch_size=2,
+    )
+
+    assert calls == 2
+    assert [item["local_llm_route"] for item in result["skill_candidates"]] == ["REPAIR", "NEW_HYPOTHESIS"]
 
 
 def test_local_llm_exclusions_include_cross_cycle_history():

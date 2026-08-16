@@ -269,6 +269,10 @@ def _compact_planner_context(planner_context: dict[str, Any]) -> dict[str, Any]:
         "force_diversify": bool(planner_context.get("local_llm_force_diversify")),
         "recent_families": list(planner_context.get("local_llm_recent_families") or [])[:8],
         "recent_dataset_ids": list(planner_context.get("local_llm_recent_dataset_ids") or [])[:8],
+        "repair_parent_expressions": list(planner_context.get("local_llm_repair_parent_expressions") or [])[:4],
+        "repair_parent_counts": dict(planner_context.get("local_llm_repair_parent_counts") or {}),
+        "max_repairs_per_batch": int(planner_context.get("local_llm_max_repairs_per_batch") or 1),
+        "repair_slots_remaining": int(planner_context.get("local_llm_repair_slots_remaining") or 0),
     }
 
 
@@ -334,6 +338,7 @@ Rules:
 - Use knowledge_card_ids only when an id is literally present in supplied context; otherwise [].
 - Do not invent historical performance, Sharpe, Fitness, correlation, or platform checks.
 - If current_cycle_trial_evidence exists, choose REPAIR only for a worthwhile parent and use its exact expression; otherwise choose DIVERSIFY or NEW_HYPOTHESIS.
+- REPAIR is allowed only when parent_expression is listed in repair_parent_expressions and repair_slots_remaining > 0. Once repair slots are exhausted, use NEW_HYPOTHESIS or DIVERSIFY instead of another near-relative repair.
 - REPAIR must include parent_expression, failure_signature.observed_symptoms, failure_signature.plausible_causes, mutation_type and mutation_reason. Change one causal dimension unless the supplied Skill explicitly justifies broader screening.
 - DIVERSIFY must include diversity_case.changed_dimensions using only information_source, economic_mechanism, horizon_delay, structure, factor_exposure; include why_independent.
 - NEW_HYPOTHESIS must not pretend to be a repair of a prior result.
@@ -481,6 +486,14 @@ def generate_local_skill_batch(
         for item in (planner_context.get("current_cycle_trial_evidence") or [])
         if isinstance(item, dict)
     )
+    repair_parent_expressions = {
+        str(value).strip()
+        for value in (planner_context.get("local_llm_repair_parent_expressions") or [])
+        if str(value).strip()
+    }
+    enforce_repair_parent_whitelist = "local_llm_repair_parent_expressions" in planner_context
+    max_repairs_per_batch = max(0, int(planner_context.get("local_llm_max_repairs_per_batch") or 1))
+    accepted_repairs = 0
     planner_context_text = json.dumps(planner_context, ensure_ascii=False, default=str)
     request_count = 0
     chunk_attempt_limit = max(
@@ -502,6 +515,7 @@ def generate_local_skill_batch(
         for _chunk_attempt in range(1, chunk_attempt_limit + 1):
             chunk_context = dict(planner_context)
             chunk_context["local_llm_exclude_expressions"] = [*inherited_exclusions, *seen_expressions]
+            chunk_context["local_llm_repair_slots_remaining"] = max(0, max_repairs_per_batch - accepted_repairs)
             if rejection_feedback:
                 chunk_context["local_llm_contract_feedback"] = [
                     *list(planner_context.get("local_llm_contract_feedback") or []),
@@ -553,6 +567,26 @@ def generate_local_skill_batch(
                         normalized_item["diversity_case"] = diversity_case
                 candidate = _normalize_candidate(normalized_item, planner_context)
                 expression = candidate["expression"]
+                if candidate.get("local_llm_route") == "REPAIR":
+                    parent_expression = str(candidate.get("parent_expression") or "").strip()
+                    if enforce_repair_parent_whitelist and parent_expression not in repair_parent_expressions:
+                        rejection_feedback.append(
+                            {
+                                "expression": expression,
+                                "error": "repair_parent_not_eligible",
+                                "parent_expression": parent_expression,
+                            }
+                        )
+                        continue
+                    if accepted_repairs >= max_repairs_per_batch:
+                        rejection_feedback.append(
+                            {
+                                "expression": expression,
+                                "error": "repair_batch_cap_reached",
+                                "max_repairs_per_batch": max_repairs_per_batch,
+                            }
+                        )
+                        continue
                 if not expression or "#" in expression:
                     rejection_feedback.append({"expression": expression, "error": "invalid_expression"})
                     continue
@@ -596,6 +630,8 @@ def generate_local_skill_batch(
                     continue
                 seen_expressions.add(expression)
                 candidates.append(candidate)
+                if candidate.get("local_llm_route") == "REPAIR":
+                    accepted_repairs += 1
                 added += 1
                 if len(candidates) >= size:
                     break
