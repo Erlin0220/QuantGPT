@@ -3,7 +3,7 @@
 The runner owns lifecycle control and persistence for one outer research cycle.
 Production flows still expect callers to supply Skill-reviewed candidates.  The
 explicit ``local-llm-poc`` command is a bounded adapter test that lets the local
-OpenCode Go / DeepSeek model generate the next Skill-reviewed batch.
+Pi Agent / DeepSeek model generate the next Skill-reviewed batch.
 """
 
 from __future__ import annotations
@@ -1490,8 +1490,11 @@ def _local_llm_generation_failed_by_provider(round_item: dict[str, Any]) -> bool
         "ConnectTimeout",
         "TransportError",
         "request failed",
+        "PiAgentError",
+        "Pi Agent request failed",
+        "Pi Agent RPC timed out",
+        "Pi Agent RPC exited",
         "no final content was returned",
-        "reasoning_content was present but final content was empty",
     )
     return any(marker in error for marker in markers)
 
@@ -1626,7 +1629,7 @@ def _record_local_llm_round_sync(
     local_llm.update(
         {
             "version": 1,
-            "provider": "opencode-go-compatible",
+            "provider": "pi-agent-rpc",
             "model": round_event.get("model") or local_llm.get("model"),
             "last_round_id": round_id or local_llm.get("last_round_id"),
             "rounds": rounds[-30:],
@@ -1647,14 +1650,14 @@ def run_local_llm_research(
     batch_size: int = 4,
     max_simulations_per_batch: int = 4,
     model: str | None = None,
-    reasoning_policy: str = "adaptive",
+    reasoning_policy: str = "max",
     submission_deferred: bool = False,
     goal: str = "maximize robust low-correlation WorldQuant candidates",
 ) -> dict[str, Any]:
     """Run the production local-LLM research loop without formal submission.
 
-    New hypotheses default to fast generation.  High-value failures automatically
-    receive max reasoning in ``adaptive`` mode.  Existing Submission/Reconciliation
+    Pi Agent generation defaults to max reasoning.  ``adaptive`` and ``fast`` remain
+    available for explicit callers.  Existing Submission/Reconciliation
     gates stop the loop unless the caller explicitly defers them for research-only
     continuation.  The cycle itself remains the restart-safe source of truth.
     """
@@ -1758,7 +1761,7 @@ def run_local_llm_research(
             effective_mode = dict(mode)
             generation_started = time.monotonic()
             cycle_seconds_remaining = max(0.0, float(progress.get("remaining_minutes") or 0.0) * 60.0)
-            generation_budget_seconds = max(10.0, min(90.0, cycle_seconds_remaining or 90.0))
+            generation_budget_seconds = max(10.0, min(150.0, cycle_seconds_remaining or 150.0))
 
             for recovery_attempt in _local_llm_generation_recovery_plan(mode, batch_size):
                 recovery_elapsed = time.monotonic() - generation_started
@@ -1810,12 +1813,16 @@ def run_local_llm_research(
                 # keep each stage bounded so one bad provider response cannot consume the cycle budget.
                 working_context["local_llm_chunk_attempt_limit"] = 1
                 working_context["local_llm_request_attempts"] = 1
-                stage_timeout = {
-                    "primary": 45 if recovery_attempt["thinking"] == "enabled" else 35,
-                    "max_to_nothink": 35,
-                    "shrink_to_2": 20,
-                    "shrink_to_1": 15,
-                }.get(str(recovery_attempt["stage"]), 35)
+                stage_timeout = (
+                    120
+                    if recovery_attempt["thinking"] == "enabled"
+                    else {
+                        "primary": 60,
+                        "max_to_nothink": 60,
+                        "shrink_to_2": 45,
+                        "shrink_to_1": 30,
+                    }.get(str(recovery_attempt["stage"]), 60)
+                )
                 request_timeout = max(10.0, min(float(stage_timeout), recovery_remaining))
                 working_context["local_llm_request_timeout_seconds"] = request_timeout
                 if contract_feedback:
@@ -1906,7 +1913,7 @@ def run_local_llm_research(
                 "generated_at": generated_at,
                 "reasoning_policy": reasoning_policy,
                 "reasoning_mode": effective_mode,
-                "model": (generation or {}).get("model") or model or os.environ.get("DEEPSEEK_MODEL") or "deepseek-v4-flash",
+                "model": (generation or {}).get("model") or model or os.environ.get("WQ_PI_MODEL") or "opencode-go/deepseek-v4-flash",
                 "generation": generation_meta,
                 "generation_recovery": generation_recovery,
                 "generated_candidates": [
@@ -1974,7 +1981,7 @@ def run_local_llm_research(
         "ok": bool(final_snapshot.get("ok")),
         "status": exit_status or final_snapshot.get("status"),
         "cycle_id": resolved_cycle_id,
-        "model": model or os.environ.get("DEEPSEEK_MODEL") or "deepseek-v4-flash",
+        "model": model or os.environ.get("WQ_PI_MODEL") or "opencode-go/deepseek-v4-flash",
         "reasoning_policy": reasoning_policy,
         "submission_deferred": bool(submission_deferred),
         "formal_submission": False,
@@ -2044,7 +2051,7 @@ def _build_parser() -> argparse.ArgumentParser:
     local_research.add_argument("--batch-size", type=int, default=4)
     local_research.add_argument("--max-simulations-per-batch", type=int, default=4)
     local_research.add_argument("--model")
-    local_research.add_argument("--reasoning-policy", choices=["adaptive", "fast", "max"], default="adaptive")
+    local_research.add_argument("--reasoning-policy", choices=["adaptive", "fast", "max"], default="max")
     local_research.add_argument(
         "--defer-submission",
         action="store_true",

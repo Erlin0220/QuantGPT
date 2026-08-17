@@ -22,65 +22,43 @@ def _raw_candidate(index: int = 1) -> dict:
     }
 
 
-class _FakeResponse:
-    def __init__(self, payload: dict):
-        self._payload = payload
-
-    def raise_for_status(self) -> None:
-        return None
-
-    def json(self) -> dict:
-        return self._payload
-
-
 def test_generate_local_skill_batch_normalizes_to_runner_contract(monkeypatch):
     seen: dict = {}
 
-    def fake_post(url, *, headers, json, timeout):
-        seen.update({"url": url, "headers": headers, "json": json, "timeout": timeout})
-        content = json_module.dumps({"skill_candidates": [_raw_candidate(1), _raw_candidate(2)]})
-        return _FakeResponse({"choices": [{"message": {"content": content}}]})
+    def fake_request(**kwargs):
+        seen.update(kwargs)
+        return json.dumps({"skill_candidates": [_raw_candidate(1), _raw_candidate(2)]})
 
-    json_module = json
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
-    monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://example.test/v1")
-    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+    monkeypatch.setenv("WQ_PI_MODEL", "opencode-go/deepseek-v4-flash")
     monkeypatch.setattr(generator, "_load_skill_context", lambda _context: (["wq-alpha-hypothesis"], "skill text"))
-    monkeypatch.setattr(generator.httpx, "post", fake_post)
+    monkeypatch.setattr(generator, "_request_candidate_content", fake_request)
 
     result = generator.generate_local_skill_batch({"current_cycle_trial_evidence": []}, batch_size=2)
 
-    assert result["model"] == "deepseek-v4-flash"
+    assert result["provider"] == "pi-agent-rpc"
+    assert result["model"] == "opencode-go/deepseek-v4-flash"
     assert result["generated"] == 2
-    assert seen["url"] == "https://example.test/v1/chat/completions"
-    assert seen["headers"]["Authorization"] == "Bearer test-key"
-    assert seen["json"]["max_tokens"] >= 1024
-    assert seen["json"]["thinking"] == {"type": "disabled"}
-    assert seen["json"]["response_format"] == {"type": "json_object"}
-    assert result["thinking"] == "disabled"
+    assert seen["model"] == "opencode-go/deepseek-v4-flash"
+    assert seen["thinking"] == "max"
+    assert result["thinking"] == "max"
     assert all(runner._runner_candidate_contract_error(item) is None for item in result["skill_candidates"])
 
 
 def test_generate_local_skill_batch_supports_thinking_max(monkeypatch):
     seen: dict = {}
 
-    def fake_post(url, *, headers, json, timeout):
-        seen.update({"url": url, "headers": headers, "json": json, "timeout": timeout})
-        content = json_module.dumps({"skill_candidates": [_raw_candidate(1)]})
-        return _FakeResponse({"choices": [{"message": {"content": content, "reasoning_content": "reasoning"}}]})
+    def fake_request(**kwargs):
+        seen.update(kwargs)
+        return json.dumps({"skill_candidates": [_raw_candidate(1)]})
 
-    json_module = json
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
-    monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://example.test/v1")
     monkeypatch.setattr(generator, "_load_skill_context", lambda _context: (["wq-alpha-hypothesis"], "skill text"))
-    monkeypatch.setattr(generator.httpx, "post", fake_post)
+    monkeypatch.setattr(generator, "_request_candidate_content", fake_request)
 
     result = generator.generate_local_skill_batch({}, batch_size=1, thinking="enabled", reasoning_effort="max")
 
-    assert seen["json"]["thinking"] == {"type": "enabled"}
-    assert seen["json"]["reasoning_effort"] == "max"
-    assert "temperature" not in seen["json"]
-    assert result["thinking"] == "enabled"
+    assert seen["thinking"] == "enabled"
+    assert seen["reasoning_effort"] == "max"
+    assert result["thinking"] == "max"
     assert result["reasoning_effort"] == "max"
 
 
@@ -90,17 +68,15 @@ def test_generate_local_skill_batch_hard_rejects_history_and_retries(monkeypatch
     payloads = [duplicate, replacement]
     calls = 0
 
-    def fake_post(*_args, **_kwargs):
+    def fake_request(**_kwargs):
         nonlocal calls
         candidate = payloads[calls]
         calls += 1
-        content = json.dumps({"skill_candidates": [candidate]})
-        return _FakeResponse({"choices": [{"message": {"content": content}}]})
+        return json.dumps({"skill_candidates": [candidate]})
 
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setenv("WQ_LOCAL_LLM_CHUNK_ATTEMPTS", "2")
     monkeypatch.setattr(generator, "_load_skill_context", lambda _context: (["wq-alpha-hypothesis"], "skill text"))
-    monkeypatch.setattr(generator.httpx, "post", fake_post)
+    monkeypatch.setattr(generator, "_request_candidate_content", fake_request)
 
     result = generator.generate_local_skill_batch(
         {"local_llm_exclude_expressions": [duplicate["expression"]]},
@@ -119,17 +95,15 @@ def test_generate_local_skill_batch_retries_unresolved_data_fields(monkeypatch):
     payloads = [invalid, replacement]
     calls = 0
 
-    def fake_post(*_args, **_kwargs):
+    def fake_request(**_kwargs):
         nonlocal calls
         candidate = payloads[calls]
         calls += 1
-        content = json.dumps({"skill_candidates": [candidate]})
-        return _FakeResponse({"choices": [{"message": {"content": content}}]})
+        return json.dumps({"skill_candidates": [candidate]})
 
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setenv("WQ_LOCAL_LLM_CHUNK_ATTEMPTS", "2")
     monkeypatch.setattr(generator, "_load_skill_context", lambda _context: (["wq-alpha-hypothesis"], "skill text"))
-    monkeypatch.setattr(generator.httpx, "post", fake_post)
+    monkeypatch.setattr(generator, "_request_candidate_content", fake_request)
 
     result = generator.generate_local_skill_batch({}, batch_size=1)
 
@@ -152,17 +126,15 @@ def test_generate_local_skill_batch_enforces_forced_diversify(monkeypatch):
     payloads = [first, replacement]
     calls = 0
 
-    def fake_post(*_args, **_kwargs):
+    def fake_request(**_kwargs):
         nonlocal calls
         candidate = payloads[calls]
         calls += 1
-        content = json.dumps({"skill_candidates": [candidate]})
-        return _FakeResponse({"choices": [{"message": {"content": content}}]})
+        return json.dumps({"skill_candidates": [candidate]})
 
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setenv("WQ_LOCAL_LLM_CHUNK_ATTEMPTS", "2")
     monkeypatch.setattr(generator, "_load_skill_context", lambda _context: (["wq-alpha-diversify"], "skill text"))
-    monkeypatch.setattr(generator.httpx, "post", fake_post)
+    monkeypatch.setattr(generator, "_request_candidate_content", fake_request)
 
     result = generator.generate_local_skill_batch(
         {
@@ -201,15 +173,14 @@ def test_generate_local_skill_batch_reserves_one_scheduler_exploration_slot(monk
     ]
     calls = 0
 
-    def fake_post(*_args, **_kwargs):
+    def fake_request(**_kwargs):
         nonlocal calls
         payload = responses[min(calls, len(responses) - 1)]
         calls += 1
-        return _FakeResponse({"choices": [{"message": {"content": json.dumps(payload)}}]})
+        return json.dumps(payload)
 
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setattr(generator, "_load_skill_context", lambda _context: (["wq-alpha-diversify"], "skill text"))
-    monkeypatch.setattr(generator.httpx, "post", fake_post)
+    monkeypatch.setattr(generator, "_request_candidate_content", fake_request)
 
     result = generator.generate_local_skill_batch(
         {
@@ -244,15 +215,14 @@ def test_generate_local_skill_batch_returns_partial_batch_instead_of_failing(mon
     ]
     calls = 0
 
-    def fake_post(*_args, **_kwargs):
+    def fake_request(**_kwargs):
         nonlocal calls
         payload = responses[min(calls, len(responses) - 1)]
         calls += 1
-        return _FakeResponse({"choices": [{"message": {"content": json.dumps(payload)}}]})
+        return json.dumps(payload)
 
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setattr(generator, "_load_skill_context", lambda _context: (["wq-alpha-hypothesis"], "skill text"))
-    monkeypatch.setattr(generator.httpx, "post", fake_post)
+    monkeypatch.setattr(generator, "_request_candidate_content", fake_request)
 
     result = generator.generate_local_skill_batch(
         {"local_llm_chunk_attempt_limit": 1},
@@ -272,18 +242,11 @@ def test_candidate_payload_accepts_common_key_drift():
     assert generator._candidate_items_from_payload(candidate) == [candidate]
 
 
-def test_generate_local_skill_batch_rejects_reasoning_only_response(monkeypatch):
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+def test_generate_local_skill_batch_rejects_empty_pi_response(monkeypatch):
     monkeypatch.setattr(generator, "_load_skill_context", lambda _context: (["wq-alpha-hypothesis"], "skill text"))
-    monkeypatch.setattr(
-        generator.httpx,
-        "post",
-        lambda *args, **kwargs: _FakeResponse(
-            {"choices": [{"message": {"content": "", "reasoning_content": "thinking"}}]}
-        ),
-    )
+    monkeypatch.setattr(generator, "_request_candidate_content", lambda **_kwargs: "")
 
-    with pytest.raises(generator.LocalCandidateGenerationError, match="reasoning_content"):
+    with pytest.raises(generator.LocalCandidateGenerationError, match="empty content"):
         generator.generate_local_skill_batch({}, batch_size=1)
 
 
@@ -308,8 +271,8 @@ def test_local_llm_poc_runs_bounded_research_only_loop(monkeypatch):
         })
         candidate = runner_test_candidate()
         return {
-            "provider": "opencode-go-compatible",
-            "model": model or "deepseek-v4-flash",
+            "provider": "pi-agent-rpc",
+            "model": model or "opencode-go/deepseek-v4-flash",
             "thinking": thinking,
             "reasoning_effort": reasoning_effort if thinking == "enabled" else None,
             "requested": batch_size,
@@ -623,15 +586,14 @@ def test_generate_local_skill_batch_limits_repairs_and_refills_with_new_hypothes
     ]
     calls = 0
 
-    def fake_post(*_args, **_kwargs):
+    def fake_request(**_kwargs):
         nonlocal calls
         payload = payloads[min(calls, len(payloads) - 1)]
         calls += 1
-        return _FakeResponse({"choices": [{"message": {"content": json.dumps(payload)}}]})
+        return json.dumps(payload)
 
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setattr(generator, "_load_skill_context", lambda _context: (["wq-alpha-repair"], "skill text"))
-    monkeypatch.setattr(generator.httpx, "post", fake_post)
+    monkeypatch.setattr(generator, "_request_candidate_content", fake_request)
 
     result = generator.generate_local_skill_batch(
         {
@@ -668,16 +630,15 @@ def test_generate_local_skill_batch_respects_zero_repair_budget(monkeypatch):
     ]
     calls = 0
 
-    def fake_post(*_args, **_kwargs):
+    def fake_request(**_kwargs):
         nonlocal calls
         payload = payloads[min(calls, len(payloads) - 1)]
         calls += 1
-        return _FakeResponse({"choices": [{"message": {"content": json.dumps(payload)}}]})
+        return json.dumps(payload)
 
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setenv("WQ_LOCAL_LLM_CHUNK_ATTEMPTS", "2")
     monkeypatch.setattr(generator, "_load_skill_context", lambda _context: (["wq-alpha-repair"], "skill text"))
-    monkeypatch.setattr(generator.httpx, "post", fake_post)
+    monkeypatch.setattr(generator, "_request_candidate_content", fake_request)
 
     result = generator.generate_local_skill_batch(
         {
@@ -851,13 +812,18 @@ def test_generation_failure_progressively_shrinks_batch_before_giving_up(monkeyp
 
     result = runner.run_local_llm_research(cycle_id="generation-recovery-cycle", max_batches=1)
 
-    assert generation_calls == [("disabled", 4), ("disabled", 2), ("disabled", 1)]
+    assert generation_calls == [("enabled", 2), ("disabled", 4), ("disabled", 2), ("disabled", 1)]
     assert result["productive_batches_this_run"] == 1
     assert result["generation_attempts_this_run"] == 1
     round_event = result["local_llm_rounds_this_run"][0]
     assert round_event["status"] == "completed"
     assert round_event["reasoning_mode"]["recovery_stage"] == "shrink_to_1"
-    assert [item["status"] for item in round_event["generation_recovery"]] == ["failed", "failed", "succeeded"]
+    assert [item["status"] for item in round_event["generation_recovery"]] == [
+        "failed",
+        "failed",
+        "succeeded",
+        "succeeded",
+    ]
 
 
 def test_generation_recovery_accumulates_partial_batches_before_simulation(monkeypatch):
@@ -908,7 +874,7 @@ def test_generation_recovery_accumulates_partial_batches_before_simulation(monke
 
     result = runner.run_local_llm_research(cycle_id="accumulate-cycle", max_batches=1, batch_size=4)
 
-    assert [item[0] for item in generated_calls] == [4, 2, 1]
+    assert [item[0] for item in generated_calls] == [2, 3, 1]
     assert candidate(1)["expression"] in generated_calls[1][1]
     assert len(captured["skill_candidates"]) == 4
     assert result["local_llm_rounds_this_run"][0]["generation_recovery"][-1]["accumulated"] == 4

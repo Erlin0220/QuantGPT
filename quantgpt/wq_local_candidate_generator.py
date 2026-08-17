@@ -1,4 +1,4 @@
-"""Local OpenCode Go / DeepSeek candidate generation for WorldQuant research."""
+"""Local Pi Agent / DeepSeek candidate generation for WorldQuant research."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-import httpx
+from .pi_agent_client import PiAgentError, run_pi_prompt
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _BASE_SKILLS = [
@@ -25,8 +25,8 @@ _FAILURE_SKILLS = [
     "wq-alpha-repair",
 ]
 _DIVERSIFY_SKILLS = ["wq-alpha-diversify"]
-_DEFAULT_BASE_URL = "https://opencode.ai/zen/go/v1"
-_DEFAULT_MODEL = "deepseek-v4-flash"
+_DEFAULT_MODEL = "opencode-go/deepseek-v4-flash"
+_PI_THINKING_LEVELS = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 _CORE_DATA_FIELDS = {
     "open",
     "high",
@@ -220,7 +220,7 @@ def _normalize_candidate(raw: dict[str, Any], planner_context: dict[str, Any] | 
         "knowledge_card_ids": _string_list(raw.get("knowledge_card_ids")),
         "skill_chain": skill_chain,
         "review_decision": "RUN",
-        "review_notes": str(raw.get("review_notes") or "local OpenCode Go / DSV4 review").strip(),
+        "review_notes": str(raw.get("review_notes") or "local Pi Agent / DSV4 review").strip(),
         "robustness_plan": {"mode": "skill_defined", "checks": checks[:4]},
         "candidate_evidence_policy": {"mode": "calibrated_evidence_hierarchy"},
         "local_llm_route": route,
@@ -516,10 +516,21 @@ Rules:
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
+def _pi_thinking_level(thinking: str, reasoning_effort: str) -> str:
+    requested = str(thinking or "").strip().lower()
+    if requested == "enabled":
+        return "max" if reasoning_effort == "max" else "high"
+    if requested == "disabled":
+        return "off"
+    if requested in _PI_THINKING_LEVELS:
+        return requested
+    raise LocalCandidateGenerationError(
+        "thinking must be enabled/disabled or one of off, minimal, low, medium, high, xhigh, max"
+    )
+
+
 def _request_candidate_content(
     *,
-    base_url: str,
-    api_key: str,
     model: str,
     messages: list[dict[str, str]],
     timeout_seconds: float,
@@ -527,7 +538,8 @@ def _request_candidate_content(
     reasoning_effort: str,
     request_attempts: int | None = None,
 ) -> str:
-    default_attempts = 1 if thinking == "enabled" else 2
+    pi_thinking = _pi_thinking_level(thinking, reasoning_effort)
+    default_attempts = 1 if pi_thinking in {"high", "xhigh", "max"} else 2
     retries = max(
         1,
         min(
@@ -535,51 +547,33 @@ def _request_candidate_content(
             int(request_attempts or os.environ.get("WQ_LOCAL_LLM_REQUEST_ATTEMPTS") or default_attempts),
         ),
     )
-    default_max_tokens = 16384 if thinking == "enabled" else 2048
-    max_tokens = max(1024, int(os.environ.get("WQ_LOCAL_LLM_MAX_TOKENS") or default_max_tokens))
+    prompt_parts = []
+    for message in messages:
+        role = str(message.get("role") or "user").upper()
+        content = str(message.get("content") or "").strip()
+        if content:
+            prompt_parts.append(f"[{role}]\n{content}")
+    prompt = "\n\n".join(prompt_parts).strip()
+    if not prompt:
+        raise LocalCandidateGenerationError("Pi Agent prompt is empty")
+
     last_error: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
-            request_body: dict[str, Any] = {
-                "model": model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "thinking": {"type": thinking},
-                "response_format": {"type": "json_object"},
-            }
-            if thinking == "enabled":
-                request_body["reasoning_effort"] = reasoning_effort
-            else:
-                request_body["temperature"] = 0.35
-            response = httpx.post(
-                f"{base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json=request_body,
-                timeout=timeout_seconds,
+            return run_pi_prompt(
+                prompt,
+                workspace=_REPO_ROOT,
+                model=model,
+                thinking=pi_thinking,
+                timeout_seconds=timeout_seconds,
             )
-            response.raise_for_status()
-            payload = response.json()
-            choices = payload.get("choices") if isinstance(payload, dict) else None
-            message = choices[0].get("message") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else None
-            content = message.get("content") if isinstance(message, dict) else ""
-            if str(content or "").strip():
-                return str(content)
-            reasoning = str(message.get("reasoning_content") or "").strip() if isinstance(message, dict) else ""
-            detail = "reasoning_content was present but final content was empty" if reasoning else "no final content was returned"
-            last_error = LocalCandidateGenerationError(f"local LLM returned no candidate JSON: {detail}")
-        except httpx.HTTPStatusError as exc:
-            last_error = exc
-            if exc.response.status_code < 500:
-                break
-        except (httpx.TransportError, ValueError) as exc:
+        except (PiAgentError, OSError, ValueError) as exc:
             last_error = exc
         if attempt < retries:
             time.sleep(0.5 * attempt)
     assert last_error is not None
-    if isinstance(last_error, LocalCandidateGenerationError):
-        raise last_error
     raise LocalCandidateGenerationError(
-        f"local LLM request failed: {type(last_error).__name__}: {last_error}"
+        f"Pi Agent request failed: {type(last_error).__name__}: {last_error}"
     ) from last_error
 
 
@@ -592,18 +586,13 @@ def generate_local_skill_batch(
     thinking: str | None = None,
     reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
-    """Generate one Skill-reviewed candidate batch through the OpenCode Go compatible API."""
-    api_key = str(os.environ.get("DEEPSEEK_API_KEY") or "").strip()
-    if not api_key:
-        raise LocalCandidateGenerationError("DEEPSEEK_API_KEY is not configured")
-    base_url = str(os.environ.get("DEEPSEEK_BASE_URL") or _DEFAULT_BASE_URL).rstrip("/")
-    resolved_model = str(model or os.environ.get("DEEPSEEK_MODEL") or _DEFAULT_MODEL).strip()
-    resolved_thinking = str(thinking or os.environ.get("WQ_LOCAL_LLM_THINKING") or "disabled").strip().lower()
-    if resolved_thinking not in {"enabled", "disabled"}:
-        raise LocalCandidateGenerationError("thinking must be enabled or disabled")
+    """Generate one Skill-reviewed candidate batch through a local Pi Agent RPC process."""
+    resolved_model = str(model or os.environ.get("WQ_PI_MODEL") or _DEFAULT_MODEL).strip()
+    resolved_thinking = str(thinking or os.environ.get("WQ_PI_THINKING") or "max").strip().lower()
     resolved_effort = str(reasoning_effort or os.environ.get("WQ_LOCAL_LLM_REASONING_EFFORT") or "max").strip().lower()
     if resolved_effort not in {"high", "max"}:
         raise LocalCandidateGenerationError("reasoning_effort must be high or max")
+    resolved_pi_thinking = _pi_thinking_level(resolved_thinking, resolved_effort)
     size = max(1, min(20, int(batch_size)))
     chunk_size = max(1, min(4, int(os.environ.get("WQ_LOCAL_LLM_CHUNK_SIZE") or 2)))
     effective_timeout = max(
@@ -620,7 +609,7 @@ def generate_local_skill_batch(
             int(
                 planner_context.get("local_llm_request_attempts")
                 or os.environ.get("WQ_LOCAL_LLM_REQUEST_ATTEMPTS")
-                or (1 if resolved_thinking == "enabled" else 2)
+                or (1 if resolved_pi_thinking in {"high", "xhigh", "max"} else 2)
             ),
         ),
     )
@@ -703,8 +692,6 @@ def generate_local_skill_batch(
                 ][-8:]
             messages = _build_messages(chunk_context, batch_size=requested_chunk, skill_context=skill_context)
             content = _request_candidate_content(
-                base_url=base_url,
-                api_key=api_key,
                 model=resolved_model,
                 messages=messages,
                 timeout_seconds=effective_timeout,
@@ -846,10 +833,10 @@ def generate_local_skill_batch(
             )
 
     return {
-        "provider": "opencode-go-compatible",
+        "provider": "pi-agent-rpc",
         "model": resolved_model,
-        "thinking": resolved_thinking,
-        "reasoning_effort": resolved_effort if resolved_thinking == "enabled" else None,
+        "thinking": resolved_pi_thinking,
+        "reasoning_effort": resolved_effort if resolved_pi_thinking in {"high", "xhigh", "max"} else None,
         "requested": size,
         "generated": len(candidates[:size]),
         "requests": request_count,

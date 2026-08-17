@@ -1,4 +1,4 @@
-"""Lifecycle manager for the local OpenCode-Go WorldQuant research daemon."""
+"""Lifecycle manager for the local Pi Agent WorldQuant research daemon."""
 
 from __future__ import annotations
 

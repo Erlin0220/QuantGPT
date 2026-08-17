@@ -1,4 +1,4 @@
-"""Durable local OpenCode-Go WorldQuant research daemon."""
+"""Durable local Pi Agent WorldQuant research daemon."""
 
 from __future__ import annotations
 
@@ -86,7 +86,7 @@ def run_local_research_daemon(
     budget_minutes: int = 50,
     batch_size: int = 8,
     max_simulations_per_batch: int = 8,
-    reasoning_policy: str = "adaptive",
+    reasoning_policy: str = "max",
     max_cycles: int = 0,
 ) -> None:
     """Continuously run restart-safe research cycles until the process is stopped."""

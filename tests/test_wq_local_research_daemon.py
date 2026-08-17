@@ -51,7 +51,7 @@ def test_daemon_runs_restart_safe_cycles_and_never_requests_submission(monkeypat
             "ok": True,
             "status": "TARGET_REACHED",
             "cycle_id": f"cycle-{len(calls)}",
-            "model": "deepseek-v4-flash",
+            "model": "opencode-go/deepseek-v4-flash",
             "reasoning_policy": kwargs["reasoning_policy"],
             "progress": {"should_stop": True, "stop_reason": "target_reached"},
             "research_cycle": {},
@@ -65,7 +65,7 @@ def test_daemon_runs_restart_safe_cycles_and_never_requests_submission(monkeypat
 
     assert len(calls) == 2
     assert all(call["submission_deferred"] is True for call in calls)
-    assert all(call["reasoning_policy"] == "adaptive" for call in calls)
+    assert all(call["reasoning_policy"] == "max" for call in calls)
     assert all(call["target_simulations"] == 100 for call in calls)
     assert all(call["budget_minutes"] == 50 for call in calls)
     assert all(call["batch_size"] == 8 for call in calls)
