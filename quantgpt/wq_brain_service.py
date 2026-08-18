@@ -971,6 +971,161 @@ def run_check_alphas(
     return {"request_id": request_id, "summary": summary, "alphas": results}
 
 
+def run_daily_submission_gate(
+    client,
+    account: str = "primary",
+    *,
+    request_id: str | None = None,
+    check_cancelled: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    """Consume the daily ACTIVE-first submission gate using the tracked Candidate Inventory.
+
+    This is the reusable production path for non-MCP workers. It reconciles any
+    uncertain prior submission first, refreshes platform status for the highest
+    ranked fallback-eligible candidates, optionally performs configured
+    robustness revalidation, then reserves and formally submits only the slots
+    still required by the daily ACTIVE target.
+    """
+    from .wq_submission_policy import (
+        _run_coro_sync,
+        finalize_submission_attempt_sync,
+        get_candidate_robustness_revalidation_payloads_sync,
+        get_submission_policy_status,
+        reconcile_candidate_platform_statuses_sync,
+        record_research_candidates_sync,
+        reserve_submission_sync,
+    )
+
+    request_id = _resolve_request_id(client, request_id)
+    recovery = reconcile_submission_uncertainty(client, account)
+    if not recovery.get("ok"):
+        return {
+            "ok": False,
+            "status": "RECONCILIATION_REQUIRED",
+            "request_id": request_id,
+            "submission_recovery": recovery,
+        }
+
+    policy = dict(_run_coro_sync(get_submission_policy_status(account)))
+    remaining_target = max(0, int(policy.get("remaining_active_target") or 0))
+    remaining_slots = max(0, int(policy.get("remaining_submission_slots") or 0))
+    if remaining_target <= 0 or remaining_slots <= 0:
+        return {
+            "ok": True,
+            "status": "SUBMISSION_NOT_REQUIRED",
+            "request_id": request_id,
+            "submission_recovery": recovery,
+            "submission_policy": policy,
+        }
+
+    candidate_ids = [
+        str(item.get("alpha_id") or "").strip()
+        for item in (policy.get("submission_candidate_top") or [])
+        if str(item.get("alpha_id") or "").strip()
+    ]
+    candidate_ids = list(dict.fromkeys(candidate_ids))[: max(remaining_target, remaining_slots, 1) * 3]
+    if not candidate_ids:
+        return {
+            "ok": True,
+            "status": "NO_SUBMISSION_CANDIDATE",
+            "request_id": request_id,
+            "submission_recovery": recovery,
+            "submission_policy": policy,
+        }
+
+    preflight = run_check_alphas(client, candidate_ids, request_id=request_id)
+    reconcile_candidate_platform_statuses_sync(account, preflight.get("alphas", {}))
+    policy = dict(_run_coro_sync(get_submission_policy_status(account)))
+
+    robustness_revalidation: dict[str, dict[str, Any]] = {}
+    if os.environ.get("WQ_REQUIRE_PRE_SUBMIT_ROBUSTNESS", "0").strip() == "1":
+        from .wq_autonomous_research import validate_candidate_robustness
+
+        pending_ids = [
+            str(item.get("alpha_id") or "").strip()
+            for item in (policy.get("submission_candidate_top") or [])
+            if str(item.get("alpha_id") or "").strip()
+        ]
+        pending = get_candidate_robustness_revalidation_payloads_sync(account, pending_ids)
+        for payload in pending:
+            if check_cancelled and check_cancelled():
+                break
+            alpha_id = str(payload.get("alpha_id") or "").strip()
+            settings = dict(payload.get("settings") or {})
+            robustness = validate_candidate_robustness(
+                client,
+                payload,
+                region=str(settings.get("region") or "USA"),
+                universe=str(settings.get("universe") or "TOP3000"),
+                delay=int(settings.get("delay") or 1),
+                decay=int(settings.get("decay") or 0),
+                neutralization=str(settings.get("neutralization") or "SUBINDUSTRY"),
+                truncation=float(settings.get("truncation") or 0.08),
+                check_cancelled=check_cancelled,
+            )
+            merged_validation = dict(payload.get("validation") or {})
+            merged_validation.update(robustness)
+            payload["validation"] = merged_validation
+            saved = record_research_candidates_sync(
+                account,
+                [payload],
+                settings=settings,
+                tag=payload.get("tag"),
+            )
+            robustness_revalidation[alpha_id] = {
+                "status": robustness.get("status"),
+                "robustness_score": robustness.get("robustness_score"),
+                "validation_simulations": robustness.get("validation_simulations"),
+                "candidate_rows_saved": saved,
+            }
+        policy = dict(_run_coro_sync(get_submission_policy_status(account)))
+    else:
+        robustness_revalidation["_policy"] = {
+            "status": "advisory_not_blocking",
+            "reason": "daily ACTIVE target uses official BRAIN SC as the final fallback filter",
+        }
+
+    remaining_target = max(0, int(policy.get("remaining_active_target") or 0))
+    remaining_slots = max(0, int(policy.get("remaining_submission_slots") or 0))
+    submit_limit = min(remaining_target, remaining_slots)
+    submit_ids = [
+        str(item.get("alpha_id") or "").strip()
+        for item in (policy.get("submission_candidate_top") or [])
+        if str(item.get("alpha_id") or "").strip()
+    ]
+    submit_ids = list(dict.fromkeys(submit_ids))[:submit_limit]
+    if not submit_ids:
+        return {
+            "ok": True,
+            "status": "NO_SUBMISSION_CANDIDATE",
+            "request_id": request_id,
+            "submission_recovery": recovery,
+            "preflight": preflight,
+            "robustness_revalidation": robustness_revalidation,
+            "submission_policy": policy,
+        }
+
+    result = run_submit_by_ids(
+        client,
+        submit_ids,
+        check_cancelled=check_cancelled,
+        submission_guard=lambda alpha_id: reserve_submission_sync(account, alpha_id),
+        submission_result_callback=lambda alpha_id, entry: finalize_submission_attempt_sync(account, alpha_id, entry),
+        request_id=request_id,
+    )
+    return {
+        "ok": True,
+        "status": "SUBMISSION_ATTEMPTED",
+        "request_id": request_id,
+        "submission_recovery": recovery,
+        "preflight": preflight,
+        "robustness_revalidation": robustness_revalidation,
+        "submission_policy": policy,
+        "submitted_alpha_ids": submit_ids,
+        **result,
+    }
+
+
 def run_list_alphas(
     client,
     limit: int = 100,

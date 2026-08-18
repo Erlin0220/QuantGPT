@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from .wq_brain_client import get_client
+from .wq_brain_service import run_daily_submission_gate
 from .wq_research_cycle_runner import run_local_llm_research
 
 logger = logging.getLogger(__name__)
@@ -29,10 +32,12 @@ def classify_daemon_result(result: dict[str, Any]) -> DaemonDecision:
         return DaemonDecision(2.0, str(progress.get("stop_reason") or "cycle_complete"), completed_cycle=True)
     if status in {"BATCH_INFLIGHT", "research_singleflight_busy"}:
         return DaemonDecision(15.0, status)
-    if status in {"SUBMISSION_REQUIRED", "RECONCILIATION_REQUIRED"}:
-        # This daemon is explicitly research-only (submission_deferred=True).
-        # A formal-submission gate must not consume the 50-minute Simulation budget.
-        return DaemonDecision(1.0, f"research_only_gate_deferred:{status}")
+    if status == "SUBMISSION_ATTEMPTED":
+        return DaemonDecision(2.0, status)
+    if status in {"SUBMISSION_NOT_REQUIRED", "NO_SUBMISSION_CANDIDATE"}:
+        return DaemonDecision(1.0, status)
+    if status == "RECONCILIATION_REQUIRED":
+        return DaemonDecision(15.0, status)
     if status == "local_llm_generation_failed":
         return DaemonDecision(3.0, status)
     if status in {"wq_not_configured", "brain_authentication_failed"}:
@@ -79,6 +84,58 @@ def compact_daemon_event(result: dict[str, Any], decision: DaemonDecision) -> di
     }
 
 
+def run_submission_gate(*, account: str, trigger: dict[str, Any]) -> dict[str, Any]:
+    """Resolve a production submission/reconciliation gate for the local daemon."""
+    from .wq_active_session import ensure_active_first_session, record_submission_transition
+    from .wq_submission_policy import _run_coro_sync, get_submission_policy_status
+
+    request_id = f"local-daemon-submit-{uuid.uuid4().hex[:12]}"
+    client = get_client(account, request_id=request_id)
+    active_session_id: str | None = None
+    try:
+        policy = dict(_run_coro_sync(get_submission_policy_status(account)))
+        active_session = _run_coro_sync(ensure_active_first_session(account, policy))
+        active_session_id = str((active_session or {}).get("session_id") or "") or None
+        if not client.authenticate():
+            return {
+                "ok": False,
+                "status": "brain_authentication_failed",
+                "request_id": request_id,
+                "cycle_id": trigger.get("cycle_id"),
+                "progress": trigger.get("progress") or {},
+                "error": client.last_error or {"error": "WQ BRAIN authentication failed"},
+            }
+
+        result = run_daily_submission_gate(client, account, request_id=request_id)
+        response = {
+            **result,
+            "cycle_id": trigger.get("cycle_id"),
+            "progress": trigger.get("progress") or {},
+            "trigger_status": trigger.get("status"),
+        }
+        if active_session_id:
+            try:
+                response["active_first_session"] = _run_coro_sync(
+                    record_submission_transition(active_session_id, response, account)
+                )
+            except Exception as exc:
+                logger.warning("Failed to advance ACTIVE-first submission session: %s", exc)
+                response["active_first_session"] = {"error": str(exc)}
+        return response
+    except Exception as exc:
+        logger.exception("WQ local submission gate failed")
+        return {
+            "ok": False,
+            "status": "submission_gate_failed",
+            "request_id": request_id,
+            "cycle_id": trigger.get("cycle_id"),
+            "progress": trigger.get("progress") or {},
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    finally:
+        client.close()
+
+
 def run_local_research_daemon(
     *,
     account: str = "primary",
@@ -89,7 +146,7 @@ def run_local_research_daemon(
     reasoning_policy: str = "max",
     max_cycles: int = 0,
 ) -> None:
-    """Continuously run restart-safe research cycles until the process is stopped."""
+    """Continuously run ACTIVE-first submission plus restart-safe research cycles."""
     completed_cycles = 0
     while max_cycles <= 0 or completed_cycles < max_cycles:
         result = run_local_llm_research(
@@ -100,8 +157,10 @@ def run_local_research_daemon(
             batch_size=batch_size,
             max_simulations_per_batch=max_simulations_per_batch,
             reasoning_policy=reasoning_policy,
-            submission_deferred=True,
+            submission_deferred=False,
         )
+        if str(result.get("status") or "") in {"SUBMISSION_REQUIRED", "RECONCILIATION_REQUIRED"}:
+            result = run_submission_gate(account=account, trigger=result)
         decision = classify_daemon_result(result)
         logger.info("WQ local research daemon event %s", json.dumps(compact_daemon_event(result, decision), ensure_ascii=False))
         if decision.completed_cycle:

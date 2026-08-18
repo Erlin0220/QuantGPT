@@ -1,13 +1,19 @@
 """Tests for wq_brain_client.py and routes/wq_brain.py."""
 
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import requests
 
 from quantgpt.wq_brain_client import WQBrainClient, configured_accounts, get_client, is_configured
-from quantgpt.wq_brain_service import run_account_status, run_list_alphas, run_single_simulation, run_submit_by_ids
+from quantgpt.wq_brain_service import (
+    run_account_status,
+    run_daily_submission_gate,
+    run_list_alphas,
+    run_single_simulation,
+    run_submit_by_ids,
+)
 
 
 class TestIsConfigured:
@@ -248,6 +254,58 @@ class TestSubmitByIdsService:
         assert entry["confirmed_not_submitted"] is True
         assert entry["platform_check_failure"] == "LOW_SUB_UNIVERSE_SHARPE"
         assert result["timeout"] == 0
+
+
+class TestDailySubmissionGateService:
+    def test_preflights_ranked_inventory_then_submits_only_remaining_target(self):
+        client = MagicMock()
+        client.request_id = "req-daily-gate"
+        client.submit_alpha.side_effect = [
+            {"ok": True, "platform_status": "ACTIVE", "detail": "accepted"},
+            {"ok": True, "platform_status": "ACTIVE", "detail": "accepted"},
+        ]
+        policy = {
+            "remaining_active_target": 2,
+            "remaining_submission_slots": 2,
+            "submission_candidate_top": [
+                {"alpha_id": "alpha-best"},
+                {"alpha_id": "alpha-second"},
+                {"alpha_id": "alpha-third"},
+            ],
+        }
+        preflight = {
+            "request_id": "req-daily-gate",
+            "summary": {"total": 3, "unsubmitted": 3},
+            "alphas": {
+                "alpha-best": {"ok": True, "status": "UNSUBMITTED", "sc_result": "PENDING"},
+                "alpha-second": {"ok": True, "status": "UNSUBMITTED", "sc_result": "PENDING"},
+                "alpha-third": {"ok": True, "status": "UNSUBMITTED", "sc_result": "PENDING"},
+            },
+        }
+
+        with (
+            patch("quantgpt.wq_brain_service.reconcile_submission_uncertainty", return_value={"ok": True, "checked": 0}),
+            patch("quantgpt.wq_brain_service.run_check_alphas", return_value=preflight) as check_alphas,
+            patch("quantgpt.wq_brain_service.time.sleep", return_value=None),
+            patch("quantgpt.wq_submission_policy.get_submission_policy_status", new=AsyncMock(side_effect=[policy, policy])),
+            patch("quantgpt.wq_submission_policy.reconcile_candidate_platform_statuses_sync") as reconcile_candidates,
+            patch("quantgpt.wq_submission_policy.reserve_submission_sync", return_value={"allowed": True}) as reserve_submission,
+            patch("quantgpt.wq_submission_policy.finalize_submission_attempt_sync") as finalize_submission,
+        ):
+            result = run_daily_submission_gate(client, "primary", request_id="req-daily-gate")
+
+        assert result["status"] == "SUBMISSION_ATTEMPTED"
+        assert result["submitted_alpha_ids"] == ["alpha-best", "alpha-second"]
+        check_alphas.assert_called_once_with(
+            client,
+            ["alpha-best", "alpha-second", "alpha-third"],
+            request_id="req-daily-gate",
+        )
+        reconcile_candidates.assert_called_once_with("primary", preflight["alphas"])
+        assert [call.args[0] for call in reserve_submission.call_args_list] == ["primary", "primary"]
+        assert [call.args[1] for call in reserve_submission.call_args_list] == ["alpha-best", "alpha-second"]
+        assert [call.args[1] for call in finalize_submission.call_args_list] == ["alpha-best", "alpha-second"]
+        assert client.submit_alpha.call_count == 2
 
 
 class TestListAlphasService:
