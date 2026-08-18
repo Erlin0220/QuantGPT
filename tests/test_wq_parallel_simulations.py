@@ -94,6 +94,25 @@ class TestAdaptiveParallelResearch(unittest.TestCase):
         self.assertEqual(result["summary"]["concurrency"]["initial"], 3)
         self.assertEqual(result["summary"]["concurrency"]["peak"], 3)
 
+    def test_default_concurrency_ceiling_stays_at_three(self):
+        shared = _SharedState()
+        expressions = [f"rank(-ts_delta(close, {window}))" for window in range(2, 10)]
+
+        with patch.dict(os.environ, {}, clear=False):
+            for key in ("WQ_SIM_CONCURRENCY", "WQ_SIM_CONCURRENCY_MAX", "WQ_SIM_CONCURRENCY_GROWTH_WAVES"):
+                os.environ.pop(key, None)
+            result = run_research_batch(
+                _ParallelFakeClient(shared),
+                expressions,
+                skip_existing=False,
+            )
+
+        concurrency = result["summary"]["concurrency"]
+        self.assertEqual(concurrency["initial"], 3)
+        self.assertEqual(concurrency["max"], 3)
+        self.assertEqual(concurrency["peak"], 3)
+        self.assertLessEqual(shared.max_active, 3)
+
     def test_research_reduces_concurrency_after_brain_throttle_signal(self):
         shared = _SharedState(throttle_above=1)
         expressions = [f"rank(-ts_delta(close, {window}))" for window in range(2, 8)]

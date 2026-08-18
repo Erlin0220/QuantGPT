@@ -14,6 +14,14 @@ import psutil
 ROOT = Path(__file__).resolve().parent.parent
 PID_FILE = ROOT / ".wq-local-research.pid"
 LAUNCHER = ROOT / "scripts" / "run_wq_local_research_background.pyw"
+_RELOAD_PATHS = (
+    LAUNCHER,
+    ROOT / "quantgpt" / "wq_local_research_daemon.py",
+    ROOT / "quantgpt" / "wq_research_cycle_runner.py",
+    ROOT / "quantgpt" / "wq_brain_service.py",
+    ROOT / "quantgpt" / "wq_submission_policy.py",
+    ROOT / "quantgpt" / "wq_brain_client.py",
+)
 
 
 def _read_pid() -> int | None:
@@ -36,12 +44,34 @@ def _remove_pid_file() -> None:
         pass
 
 
-def _is_research_process(process: psutil.Process) -> bool:
+def _is_research_process(process: psutil.Process) -> bool | None:
+    """Identify the launcher, preserving AccessDenied as an unknown result.
+
+    The scheduled task runs the daemon at Highest privilege. A normal desktop
+    shell can see its PID but may not read cmdline(); treating AccessDenied as
+    False made the lifecycle manager delete a valid authoritative PID file and
+    report the still-running daemon as stopped.
+    """
     try:
         command = " ".join(process.cmdline()).lower()
-    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+    except psutil.AccessDenied:
+        return None
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
         return False
     return str(ROOT).lower() in command and "run_wq_local_research_background.pyw" in command
+
+
+def _process_needs_restart(process: psutil.Process) -> bool:
+    """Restart a long-lived daemon after its execution-path code changed."""
+    try:
+        started_at = float(process.create_time())
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return False
+    newest_source = max(
+        (path.stat().st_mtime for path in _RELOAD_PATHS if path.is_file()),
+        default=0.0,
+    )
+    return newest_source > started_at + 1.0
 
 
 def _running_process() -> psutil.Process | None:
@@ -51,10 +81,12 @@ def _running_process() -> psutil.Process | None:
             process = psutil.Process(pid)
         except psutil.NoSuchProcess:
             process = None
-        if process is not None and _is_research_process(process):
-            return process
+        if process is not None:
+            match = _is_research_process(process)
+            if match is True or match is None:
+                return process
     for process in psutil.process_iter(["pid"]):
-        if _is_research_process(process):
+        if _is_research_process(process) is True:
             _write_pid(process.pid)
             return process
     _remove_pid_file()
@@ -80,8 +112,14 @@ def _launcher_python() -> Path:
 
 
 def start(timeout: float = 10.0) -> None:
-    if status():
-        return
+    running = _running_process()
+    if running is not None:
+        if not _process_needs_restart(running):
+            print(f"WQ local research running: pid={running.pid}")
+            return
+        print(f"WQ local research code changed; restarting stale pid={running.pid}")
+        stop()
+
     command = [str(_launcher_python()), str(LAUNCHER)]
     if os.name == "nt":
         process = subprocess.Popen(

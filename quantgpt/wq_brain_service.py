@@ -122,7 +122,10 @@ def _remember_adaptive_concurrency(final: int, throttle_events: int, maximum: in
 
 def _concurrency_settings(total: int) -> tuple[int, int, int]:
     configured_initial = min(_env_int("WQ_SIM_CONCURRENCY", 3), _GLOBAL_SIMULATION_LIMIT)
-    maximum = min(max(configured_initial, _env_int("WQ_SIM_CONCURRENCY_MAX", 4)), _GLOBAL_SIMULATION_LIMIT)
+    # This account consistently accepts three concurrent Simulations but rejects
+    # the fourth with CONCURRENT_SIMULATION_LIMIT. Keep 3 as the safe default;
+    # operators can explicitly opt back into probing 4 via the environment.
+    maximum = min(max(configured_initial, _env_int("WQ_SIM_CONCURRENCY_MAX", 3)), _GLOBAL_SIMULATION_LIMIT)
     with _ADAPTIVE_CONCURRENCY_LOCK:
         learned = _ADAPTIVE_CONCURRENCY_HINT
     initial = min(maximum, learned) if learned is not None else configured_initial
