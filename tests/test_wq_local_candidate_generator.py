@@ -678,6 +678,49 @@ def test_low_fitness_pressure_forces_fast_cross_mechanism_escape():
     assert mode["thinking"] == "disabled"
     assert mode["reason"] == "low_fitness_escape_fast"
 
+
+def test_low_fitness_context_keeps_recent_failures_and_positive_memory():
+    evidence = [
+        {
+            "expression": f"rank(ts_mean(returns, {window}))",
+            "fitness": 0.4 + index * 0.05,
+            "failure_reason": "low_fitness",
+        }
+        for index, window in enumerate((5, 10, 20, 40, 60, 80, 120, 160))
+    ]
+    positive = [
+        {"expression": f"rank(close / adv{window})", "family": f"positive_{window}"}
+        for window in (20, 60, 120)
+    ]
+    pressure = runner._local_llm_low_fitness_pressure(evidence)
+
+    compact = generator._compact_planner_context(
+        {
+            "current_cycle_trial_evidence": evidence,
+            "research_memory_positive": positive,
+            "local_llm_low_fitness_pressure": pressure,
+            "local_llm_force_diversify": False,
+        }
+    )
+    messages = generator._build_messages(
+        {
+            "current_cycle_trial_evidence": evidence,
+            "research_memory_positive": positive,
+            "local_llm_low_fitness_pressure": pressure,
+            "local_llm_force_diversify": False,
+        },
+        batch_size=8,
+        skill_context="skill text",
+    )
+
+    assert compact["low_fitness_pressure"]["active"] is True
+    assert [item["expression"] for item in compact["current_cycle_trial_evidence"]] == [
+        item["expression"] for item in evidence[-6:]
+    ]
+    assert len(compact["research_memory_positive"]) == 3
+    assert "MIXED escape batch" in messages[1]["content"]
+
+
 def test_local_llm_exclusions_include_cross_cycle_history():
     exclusions = runner._local_llm_exclusion_expressions(
         {"recent_trial_expressions": ["rank(close)", "rank(volume)"]},

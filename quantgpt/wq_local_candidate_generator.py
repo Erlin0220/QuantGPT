@@ -393,13 +393,14 @@ def _diverse_context_slice(items: Any, *, limit: int) -> list[dict[str, Any]]:
 def _compact_planner_context(planner_context: dict[str, Any]) -> dict[str, Any]:
     """Keep only decision-relevant evidence for the next candidate batch."""
     force_diversify = bool(planner_context.get("local_llm_force_diversify"))
+    low_fitness_pressure = dict(planner_context.get("local_llm_low_fitness_pressure") or {})
     selected_cells = _allocated_context_cells(
         planner_context.get("selected_cells"),
         force_diversify=force_diversify,
     )
     positive_memory = (
         _diverse_context_slice(planner_context.get("research_memory_positive"), limit=4)
-        if force_diversify
+        if force_diversify or low_fitness_pressure.get("active")
         else list(planner_context.get("research_memory_positive") or [])[:1]
     )
     return {
@@ -419,7 +420,8 @@ def _compact_planner_context(planner_context: dict[str, Any]) -> dict[str, Any]:
         "avoid_structure_signatures": list(planner_context.get("avoid_structure_signatures") or [])[:12],
         "research_memory_positive": positive_memory,
         "research_memory_negative": list(planner_context.get("research_memory_negative") or [])[:1],
-        "current_cycle_trial_evidence": list(planner_context.get("current_cycle_trial_evidence") or [])[:6],
+        "current_cycle_trial_evidence": list(planner_context.get("current_cycle_trial_evidence") or [])[-6:],
+        "low_fitness_pressure": low_fitness_pressure,
         "exclude_expressions": list(
             planner_context.get("local_llm_exclude_expressions")
             or planner_context.get("local_poc_exclude_expressions")
@@ -500,6 +502,7 @@ Rules:
 - Every expression must differ in mechanism/information source or structure, not just a lookback number.
 - Every expression in exclude_expressions is HARD-FORBIDDEN; never return it again.
 - If force_diversify=true, every candidate MUST use route=DIVERSIFY and diversity_case.changed_dimensions MUST include information_source or economic_mechanism. Prefer a family outside recent_families and change the data source/operator skeleton rather than only a window.
+- If low_fitness_pressure.active=true and force_diversify=false, use a MIXED escape batch rather than blind whole-batch novelty: at least half the candidates should use route=DIVERSIFY with a genuinely different information source/economic mechanism; use the remaining capacity for NEW_HYPOTHESIS ideas grounded by research_memory_positive or scheduler exploitation cells. Do not repeat the operator skeleton of recent low-fitness trials, and do not add complexity merely to rescue Fitness. Prefer the smallest expression that tests a distinct expected-return driver.
 - selected_cells preserves the scheduler's exploitation/exploration allocation. If exploration_slots_remaining > 0, at least that many candidates MUST use route=DIVERSIFY and be genuinely different in information source/economic mechanism. If forced_exploration_fields is non-empty, an exploration candidate MUST use at least one exact field_id from that list; do not claim an exploration dataset without using one of its grounded fields. Only when forced_exploration_fields is empty may you fall back to an orthogonal core price/volume mechanism.
 - data_fields must list every data field used by the expression and no operators.
 - Use knowledge_card_ids only when an id is literally present in supplied context; otherwise [].

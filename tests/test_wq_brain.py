@@ -415,7 +415,9 @@ class TestAccountStatusService:
         assert result["leaderboard"]["score_semantics"] == "PERFORMANCE"
         assert result["consultant_level"] == "GOLD"
         assert result["gold_reached"] is True
-        assert result["goal_reached"] is False
+        assert result["goal_reached"] is True
+        assert result["goal_basis"] == "consultant_active"
+        assert result["research_objective"] == "CONSULTANT_PERFORMANCE"
 
     def test_does_not_treat_next_level_as_current_level(self):
         client = MagicMock()

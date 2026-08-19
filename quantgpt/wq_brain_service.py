@@ -882,11 +882,20 @@ def run_account_status(
     else:
         points_status = "CURRENT"
 
-    goal_reached = bool(
+    milestone_reached_from_points = bool(
         points is not None
         and points >= target_points
         and (gold_reached or consultant_status in {"ONBOARDING", "ACTIVE"})
     )
+    goal_reached = consultant_status == "ACTIVE" or milestone_reached_from_points
+    goal_basis = (
+        "consultant_active"
+        if consultant_status == "ACTIVE"
+        else "points_and_gold"
+        if milestone_reached_from_points
+        else "not_reached"
+    )
+    research_objective = "CONSULTANT_PERFORMANCE" if consultant_status == "ACTIVE" else "REACH_CONSULTANT"
 
     return {
         "ok": True,
@@ -903,6 +912,8 @@ def run_account_status(
         "consultant_status": consultant_status,
         "consultant_level": consultant_level,
         "goal_reached": goal_reached,
+        "goal_basis": goal_basis,
+        "research_objective": research_objective,
         "challenge": {
             "status": challenge.get("status"),
             "scoring": challenge.get("scoring"),

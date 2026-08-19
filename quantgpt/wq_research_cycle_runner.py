@@ -1726,9 +1726,11 @@ def run_local_llm_research(
         planner_context["local_llm_exclude_expressions"] = _local_llm_exclusion_expressions(planner_context, cycle)
         planner_context["local_llm_duplicate_pressure"] = duplicate_pressure
         planner_context["local_llm_low_fitness_pressure"] = low_fitness_pressure
-        planner_context["local_llm_force_diversify"] = bool(
-            duplicate_pressure.get("force_diversify") or low_fitness_pressure.get("active")
-        )
+        # Duplicate/nonproductive pressure justifies a whole-batch diversity escape.
+        # Repeated low-fitness is different: preserve some scheduler exploitation so
+        # proven mechanisms remain represented while the generator explores new
+        # information sources/mechanisms in the rest of the batch.
+        planner_context["local_llm_force_diversify"] = bool(duplicate_pressure.get("force_diversify"))
         planner_context["local_llm_recent_families"] = recent_families[-8:]
         planner_context["local_llm_recent_dataset_ids"] = recent_dataset_ids[-8:]
         planner_context["local_llm_repair_parent_counts"] = _local_llm_repair_parent_counts(cycle)

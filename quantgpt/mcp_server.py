@@ -2204,9 +2204,10 @@ async def wq_brain_active_session_state(account: str = "primary") -> str:
 async def wq_brain_account_status(account: str = "primary") -> str:
     """读取当前 WorldQuant BRAIN 账号的 Points、等级和 Alpha 数量。
 
-    这是 Autonomous WQ Research 的停止条件/进度工具。只有当 Challenge leaderboard
+    这是 Autonomous WQ Research 的账号里程碑/进度工具。只有当 Challenge leaderboard
     score 的语义确实是 Points 时才作为累计 Points；PERFORMANCE 排名分数不会污染 Points。
-    Gold 使用平台实际当前等级，progress.level 仅表示下一目标等级。
+    Gold 使用平台实际当前等级，progress.level 仅表示下一目标等级；已正式成为 Consultant
+    时，顾问里程碑视为完成，后续研究目标切换为 Consultant Performance。
 
     Args:
         account: WQ 账号 ('primary' 或 'alt')
@@ -2308,12 +2309,21 @@ async def wq_brain_account_status(account: str = "primary") -> str:
                 result["points_status"] = "SYNC_UNKNOWN"
                 remaining = max(0.0, target_points - cached_points_value)
                 result["points_remaining"] = int(remaining) if remaining.is_integer() else remaining
-                result["goal_reached"] = bool(
+                cached_milestone_reached = bool(
                     cached_points_value >= target_points
                     and (
                         result.get("gold_reached")
                         or result.get("consultant_status") in {"ONBOARDING", "ACTIVE"}
                     )
+                )
+                consultant_active = result.get("consultant_status") == "ACTIVE"
+                result["goal_reached"] = consultant_active or cached_milestone_reached
+                result["goal_basis"] = (
+                    "consultant_active"
+                    if consultant_active
+                    else "points_and_gold"
+                    if cached_milestone_reached
+                    else "not_reached"
                 )
         if account == "primary":
             from .wq_active_session import ensure_active_first_session
@@ -2354,49 +2364,57 @@ async def wq_brain_account_status(account: str = "primary") -> str:
                 "active_task": active_summary,
                 "stale_after_seconds": _WQ_RESEARCH_STALE_SECONDS,
             }
-            from .wq_control_tower import build_research_control_tower
             from .wq_research_memory import load_research_memory
 
             memory = await load_research_memory(account, limit=2000)
-            result["research_learning"] = build_research_control_tower(
-                memory,
-                result.get("submission_policy") or {},
-            )
-            result["research_memory"] = {
+            funnel = memory.get("candidate_funnel") or {}
+            recent_funnel = funnel.get("recent_500_events") or {}
+            guidance = memory.get("research_memory_guidance") or {}
+            active_conversion = memory.get("active_conversion") or {}
+            result["research_summary"] = {
                 "trials": memory.get("trials", 0),
-                "family_counts": memory.get("family_counts", {}),
-                "candidate_family_counts": memory.get("candidate_family_counts", {}),
-                "self_correlation_family_counts": memory.get("self_correlation_family_counts", {}),
                 "status_counts": memory.get("status_counts", {}),
                 "failure_stage_counts": memory.get("failure_stage_counts", {}),
                 "failure_reason_counts": memory.get("failure_reason_counts", {}),
-                "metadata_completeness": memory.get("metadata_completeness", {}),
-                "provenance": memory.get("provenance", {}),
-                "field_registry_count": len(memory.get("field_registry") or {}),
-                "learning_maturity": memory.get("learning_maturity", {}),
-                "research_memory_guidance": memory.get("research_memory_guidance", {}),
-                "knowledge_guidance": {
-                    "policy": (memory.get("knowledge_guidance") or {}).get("policy"),
-                    "active_cards": len((memory.get("knowledge_guidance") or {}).get("cards") or []),
-                    "preferred_templates": len((memory.get("knowledge_guidance") or {}).get("preferred_templates") or []),
-                    "family_confidence": (memory.get("knowledge_guidance") or {}).get("family_confidence", {}),
-                },
-                "candidate_funnel": memory.get("candidate_funnel", {}),
-                "learning_funnel": memory.get("learning_funnel", {}),
-                "research_cells_omitted": len(memory.get("research_cells") or []),
-                "local_correlation_risk": memory.get("local_correlation_risk", {}),
-                "overfitting_evidence": memory.get("overfitting_evidence", {}),
-                "active_conversion": memory.get("active_conversion", {}),
-                "family_points_feedback": memory.get("family_points_feedback", {}),
-                "dataset_points_feedback": memory.get("dataset_points_feedback", {}),
-                "operator_points_feedback": memory.get("operator_points_feedback", {}),
-                "points_feedback_coverage": memory.get("points_feedback_coverage", {}),
-                "points_feedback_gate": memory.get("points_feedback_gate", {}),
-                "points_attribution_rule": memory.get("points_attribution_rule"),
+                "trial_to_candidate": (memory.get("learning_funnel") or {}).get("trial_to_candidate", {}),
+                "bottleneck_stage": recent_funnel.get("bottleneck_stage") or funnel.get("bottleneck_stage"),
+                "bottleneck_failure_rate": recent_funnel.get("bottleneck_failure_rate"),
+                "active_conversion_global": active_conversion.get("global", {}),
+                "top_positive": list(guidance.get("positive") or [])[:3],
+                "top_negative": list(guidance.get("negative") or [])[:3],
             }
         except Exception as exc:
             logger.warning("Failed to read WQ research gate: %s", exc)
             result["research_gate"] = {"error": str(exc)}
+
+    policy = result.get("submission_policy")
+    if isinstance(policy, dict) and "error" not in policy:
+        status_policy_keys = (
+            "submission_day",
+            "daily_submission_budget",
+            "used_submission_slots",
+            "remaining_submission_slots",
+            "daily_active_count",
+            "daily_active_target",
+            "remaining_active_target",
+            "daily_active_target_met",
+            "objective_mode",
+            "research_mode",
+            "research_strategy",
+            "inventory_mode",
+            "inventory_deficit",
+            "candidate_queue_count",
+            "high_confidence_candidate_count",
+            "fallback_submission_candidate_count",
+            "last_observed_points",
+            "last_points_status",
+            "submission_frozen",
+            "submission_reconciliation_required",
+            "submission_warning",
+        )
+        result["submission_policy"] = {
+            key: policy.get(key) for key in status_policy_keys if key in policy
+        }
     return json.dumps(result, ensure_ascii=False, indent=2, default=str)
 
 

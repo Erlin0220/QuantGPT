@@ -26,6 +26,9 @@ def main() -> None:
         sys.stderr = stderr
 
         os.chdir(root)
+        root_text = str(root)
+        if root_text not in sys.path:
+            sys.path.insert(0, root_text)
         sys.argv = [
             "quantgpt",
             "--transport",
