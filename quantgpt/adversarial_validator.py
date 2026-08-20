@@ -12,6 +12,7 @@ Complements anti_overfit.py with 4 destructive tests:
 
 import logging
 from dataclasses import dataclass, field
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -48,7 +49,7 @@ def _daily_spearman_ic(df: pd.DataFrame, factor_col: str = "factor_value",
         corr, _ = sp_stats.spearmanr(g[factor_col], g[ret_col])
         return corr if not np.isnan(corr) else 0.0
 
-    return valid.groupby("trade_date", group_keys=False).apply(_sp).dropna()
+    return cast(pd.Series, valid.groupby("trade_date", group_keys=False).apply(_sp)).dropna()
 
 
 class AdversarialValidator:

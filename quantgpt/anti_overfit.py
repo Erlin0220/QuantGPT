@@ -14,6 +14,7 @@ is robust or likely overfitted:
 
 import logging
 from dataclasses import dataclass, field
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -79,7 +80,8 @@ class AntiOverfitDetector:
             corr, _ = sp_stats.spearmanr(g["factor_value"], g["fwd_ret"])
             return corr if not np.isnan(corr) else 0.0
 
-        return valid.groupby("trade_date").apply(_spearman).dropna()
+        grouped = valid.groupby("trade_date").apply(_spearman)
+        return cast(pd.Series, grouped).dropna()
 
     def run_all(self) -> AntiOverfitResult:
         """Run all 4 anti-overfit tests and return composite result."""
@@ -127,9 +129,10 @@ class AntiOverfitDetector:
         positive_rate = float((ic_series > 0).sum() / len(ic_series))
 
         # Yearly IC
-        yearly_ic = ic_series.groupby(ic_series.index.year).mean()
+        years = [pd.Timestamp(value).year for value in ic_series.index]
+        yearly_ic = cast(pd.Series, ic_series.groupby(years).mean())
         overall_sign = np.sign(ic_mean)
-        yearly_signs = np.sign(yearly_ic.values)
+        yearly_signs = np.sign(yearly_ic.to_numpy())
         has_reversal = bool(np.any(yearly_signs != overall_sign)) if overall_sign != 0 else True
 
         passed = (positive_rate >= 0.55) and (abs(ic_mean) >= 0.02) and (not has_reversal)

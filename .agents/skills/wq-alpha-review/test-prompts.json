@@ -1,0 +1,7 @@
+[
+  {"prompt":"这 8 个 FASTEXPR 先别跑，帮我挑哪些值得花 BRAIN simulation 额度。","expected":"invoke","reason":"pre-simulation review"},
+  {"prompt":"检查这些表达式有没有用不存在的 BRAIN 字段或算子。","expected":"invoke","reason":"live validity review"},
+  {"prompt":"这个 D0 因子有没有未来数据风险？","expected":"invoke","reason":"timing/look-ahead review"},
+  {"prompt":"Alpha 已经 LOW_FITNESS 了，继续怎么改？","expected":"not_invoke","reason":"use wq-alpha-repair"},
+  {"prompt":"给我从头想一批新 Alpha。","expected":"not_invoke","reason":"use wq-alpha-hypothesis"}
+]

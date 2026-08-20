@@ -10,6 +10,7 @@ import logging
 import threading
 import time
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -45,7 +46,7 @@ def industry_neutralize(
         return fv - ind_mean
 
     result = factor_df.groupby("trade_date", group_keys=False).apply(_neutralize_date)
-    return result
+    return cast(pd.Series, result)
 
 
 def cap_neutralize(
@@ -84,7 +85,7 @@ def cap_neutralize(
             return pd.Series(fv, index=group.index)
 
     result = factor_df.groupby("trade_date", group_keys=False).apply(_neutralize_date)
-    return result
+    return cast(pd.Series, result)
 
 
 def neutralize_factor(
@@ -123,7 +124,9 @@ def neutralize_factor(
 
     if market_cap:
         # Use close * volume as rough market cap proxy (actual cap data not available)
-        work["market_cap"] = market_df["close"].values * market_df["volume"].values
+        close_values = np.asarray(cast(pd.Series, market_df["close"]), dtype=float)
+        volume_values = np.asarray(cast(pd.Series, market_df["volume"]), dtype=float)
+        work["market_cap"] = close_values * volume_values
         work["factor_value"] = cap_neutralize(work).values
         work = work.drop(columns=["market_cap"])
 

@@ -13,10 +13,12 @@ class TestAdminLogin:
 
 
 class TestAdminOverview:
-    @pytest.mark.skip(reason="admin_overview uses date_trunc which is PostgreSQL-only")
     async def test_accessible_without_token(self, client):
         resp = await client.get("/api/v1/admin/overview")
         assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["daily_tasks"]) == 7
+        assert len(data["user_trend"]) == 30
 
 
 class TestAdminUsers:

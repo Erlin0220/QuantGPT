@@ -1,14 +1,19 @@
 """Tests for wq_brain_client.py and routes/wq_brain.py."""
 
 import os
-import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import requests
 
-from quantgpt.wq_brain_client import SUBMIT_THRESHOLDS, WQBrainClient, configured_accounts, get_client, is_configured
-
-pytestmark = pytest.mark.asyncio
+from quantgpt.wq_brain_client import WQBrainClient, configured_accounts, get_client, is_configured
+from quantgpt.wq_brain_service import (
+    run_account_status,
+    run_daily_submission_gate,
+    run_list_alphas,
+    run_single_simulation,
+    run_submit_by_ids,
+)
 
 
 class TestIsConfigured:
@@ -80,6 +85,28 @@ class TestWQBrainClient:
         c = WQBrainClient(email="a", password="b")
         c.close()
 
+    def test_http_log_contains_request_id_and_502_status(self, caplog):
+        c = WQBrainClient(email="a", password="b", request_id="req-http-log")
+        response = MagicMock(status_code=502)
+        response.raw.retries.history = ()
+
+        with patch.object(requests.Session, "request", return_value=response), caplog.at_level("WARNING"):
+            c._get_session().get("https://api.worldquantbrain.com/test")
+
+        assert "request_id=req-http-log" in caplog.text
+        assert "status=502" in caplog.text
+
+    def test_http_log_keeps_transient_502_retry_history(self, caplog):
+        c = WQBrainClient(email="a", password="b", request_id="req-retry-log")
+        response = MagicMock(status_code=200)
+        response.raw.retries.history = (MagicMock(status=502, error=None),)
+
+        with patch.object(requests.Session, "request", return_value=response), caplog.at_level("WARNING"):
+            c._get_session().get("https://api.worldquantbrain.com/test")
+
+        assert "WQ HTTP retry request_id=req-retry-log" in caplog.text
+        assert "status=502" in caplog.text
+
     def test_authenticate_success(self):
         c = WQBrainClient(email="a@b.com", password="pw")
         mock_session = MagicMock()
@@ -109,8 +136,407 @@ class TestWQBrainClient:
         c._session = mock_session
         assert c.authenticate() is False
 
+    def test_submit_connection_timeout_is_unknown_and_never_blindly_retried(self):
+        c = WQBrainClient(email="a@b.com", password="pw")
+        mock_session = MagicMock()
+        mock_session.post.side_effect = requests.Timeout("socket timed out")
+        c._session = mock_session
+
+        result = c.submit_alpha("alpha-timeout")
+
+        assert result["ok"] is False
+        assert result["platform_status"] == "UNKNOWN"
+        assert result["submission_uncertain"] is True
+        assert mock_session.post.call_count == 1
+
+    def test_submit_poll_timeout_with_unknown_platform_status_is_not_marked_active(self):
+        c = WQBrainClient(email="a@b.com", password="pw")
+        mock_session = MagicMock()
+        submit_response = MagicMock(status_code=201, text="accepted")
+        mock_session.post.return_value = submit_response
+        c._session = mock_session
+        c._poll_alpha_submission = MagicMock(return_value={
+            "status_code": 200,
+            "ok": False,
+            "detail": "poll timed out",
+            "platform_status": "TIMEOUT",
+        })
+        c._fetch_alpha = MagicMock(return_value={})
+
+        result = c.submit_alpha("alpha-unknown")
+
+        assert result["ok"] is False
+        assert result["platform_status"] == "UNKNOWN"
+        assert result["submission_uncertain"] is True
+
+    def test_account_metadata_endpoints(self):
+        c = WQBrainClient(email="a@b.com", password="pw")
+        mock_session = MagicMock()
+        competition_resp = MagicMock(status_code=200)
+        competition_resp.json.return_value = {"results": [{"id": "challenge"}]}
+        summary_resp = MagicMock(status_code=200)
+        summary_resp.json.return_value = {"active": 1, "unsubmitted": 2, "decommissioned": 0}
+        mock_session.get.side_effect = [competition_resp, summary_resp]
+        c._session = mock_session
+
+        assert c.get_user_competitions("U1")["results"][0]["id"] == "challenge"
+        assert c.get_user_alpha_summary()["active"] == 1
+        assert mock_session.get.call_args_list[0].args[0].endswith("/users/U1/competitions")
+        assert mock_session.get.call_args_list[1].args[0].endswith("/users/self/alphas/summary")
+
+
+class TestRequestCorrelationService:
+    def test_single_simulation_preserves_structured_502_error(self):
+        request_id = "req-service-502"
+        client = MagicMock()
+        client.request_id = request_id
+        client.list_operator_names.return_value = {"rank"}
+        client.simulate.return_value = {
+            "ok": False,
+            "error": "HTTP 502: bad gateway",
+            "request_id": request_id,
+            "layer": "wq_http",
+            "kind": "http_error",
+            "http_status": 502,
+            "retryable": True,
+        }
+
+        result = run_single_simulation(
+            client,
+            "rank(close)",
+            request_id=request_id,
+        )
+
+        assert result["request_id"] == request_id
+        assert result["layer"] == "wq_http"
+        assert result["kind"] == "http_error"
+        assert result["http_status"] == 502
+        assert result["retryable"] is True
+
+
+class TestSubmitByIdsService:
+    def test_uncertain_remote_result_maps_to_fail_closed_submit_unknown(self):
+        client = MagicMock()
+        client.submit_alpha.return_value = {
+            "ok": False,
+            "platform_status": "UNKNOWN",
+            "submission_uncertain": True,
+            "detail": "network outcome unknown",
+        }
+
+        result = run_submit_by_ids(
+            client,
+            ["alpha-unknown"],
+            submission_guard=lambda _alpha_id: {"allowed": True},
+        )
+
+        assert result["active"] == 0
+        assert result["timeout"] == 1
+        assert result["results"]["alpha-unknown"]["final_status"] == "SUBMIT_UNKNOWN"
+        assert result["results"]["alpha-unknown"]["submission_uncertain"] is True
+
+    def test_explicit_403_platform_check_failure_is_terminal_other_fail(self):
+        client = MagicMock()
+        client.submit_alpha.return_value = {
+            "ok": False,
+            "status_code": 403,
+            "detail": '{"is":{"checks":[{"name":"LOW_SUB_UNIVERSE_SHARPE","result":"FAIL","limit":0.55,"value":0.5},{"name":"SELF_CORRELATION","result":"PENDING"}]}}',
+        }
+
+        result = run_submit_by_ids(
+            client,
+            ["alpha-platform-fail"],
+            submission_guard=lambda _alpha_id: {"allowed": True},
+        )
+
+        entry = result["results"]["alpha-platform-fail"]
+        assert entry["final_status"] == "OTHER_FAIL"
+        assert entry["confirmed_not_submitted"] is True
+        assert entry["platform_check_failure"] == "LOW_SUB_UNIVERSE_SHARPE"
+        assert result["timeout"] == 0
+
+
+class TestDailySubmissionGateService:
+    def test_preflights_ranked_inventory_then_submits_only_remaining_target(self):
+        client = MagicMock()
+        client.request_id = "req-daily-gate"
+        client.submit_alpha.side_effect = [
+            {"ok": True, "platform_status": "ACTIVE", "detail": "accepted"},
+            {"ok": True, "platform_status": "ACTIVE", "detail": "accepted"},
+        ]
+        policy = {
+            "remaining_active_target": 2,
+            "remaining_submission_slots": 2,
+            "submission_candidate_top": [
+                {"alpha_id": "alpha-best"},
+                {"alpha_id": "alpha-second"},
+                {"alpha_id": "alpha-third"},
+            ],
+        }
+        preflight = {
+            "request_id": "req-daily-gate",
+            "summary": {"total": 3, "unsubmitted": 3},
+            "alphas": {
+                "alpha-best": {"ok": True, "status": "UNSUBMITTED", "sc_result": "PENDING"},
+                "alpha-second": {"ok": True, "status": "UNSUBMITTED", "sc_result": "PENDING"},
+                "alpha-third": {"ok": True, "status": "UNSUBMITTED", "sc_result": "PENDING"},
+            },
+        }
+
+        with (
+            patch("quantgpt.wq_brain_service.reconcile_submission_uncertainty", return_value={"ok": True, "checked": 0}),
+            patch("quantgpt.wq_brain_service.run_check_alphas", return_value=preflight) as check_alphas,
+            patch("quantgpt.wq_brain_service.time.sleep", return_value=None),
+            patch("quantgpt.wq_submission_policy.get_submission_policy_status", new=AsyncMock(side_effect=[policy, policy])),
+            patch("quantgpt.wq_submission_policy.reconcile_candidate_platform_statuses_sync") as reconcile_candidates,
+            patch("quantgpt.wq_submission_policy.reserve_submission_sync", return_value={"allowed": True}) as reserve_submission,
+            patch("quantgpt.wq_submission_policy.finalize_submission_attempt_sync") as finalize_submission,
+        ):
+            result = run_daily_submission_gate(client, "primary", request_id="req-daily-gate")
+
+        assert result["status"] == "SUBMISSION_ATTEMPTED"
+        assert result["submitted_alpha_ids"] == ["alpha-best", "alpha-second"]
+        check_alphas.assert_called_once_with(
+            client,
+            ["alpha-best", "alpha-second", "alpha-third"],
+            request_id="req-daily-gate",
+        )
+        reconcile_candidates.assert_called_once_with("primary", preflight["alphas"])
+        assert [call.args[0] for call in reserve_submission.call_args_list] == ["primary", "primary"]
+        assert [call.args[1] for call in reserve_submission.call_args_list] == ["alpha-best", "alpha-second"]
+        assert [call.args[1] for call in finalize_submission.call_args_list] == ["alpha-best", "alpha-second"]
+        assert client.submit_alpha.call_count == 2
+
+
+class TestListAlphasService:
+    def test_status_filter_is_sent_to_platform_before_pagination(self):
+        client = MagicMock()
+        session = MagicMock()
+        client._get_session.return_value = session
+
+        def get_alphas(_url, *, params, timeout):
+            response = MagicMock(status_code=200)
+            if params.get("status") == "ACTIVE":
+                response.json.return_value = {
+                    "results": [{
+                        "id": "active-1",
+                        "status": "ACTIVE",
+                        "regular": {"code": "rank(close)"},
+                        "settings": {"neutralization": "INDUSTRY"},
+                        "is": {"fitness": 1.2, "sharpe": 1.8},
+                    }],
+                }
+            else:
+                response.json.return_value = {
+                    "results": [{
+                        "id": "recent-unsubmitted",
+                        "status": "UNSUBMITTED",
+                        "regular": {"code": "rank(volume)"},
+                        "settings": {"neutralization": "INDUSTRY"},
+                        "is": {"fitness": 0.5, "sharpe": 0.7},
+                    }],
+                }
+            return response
+
+        session.get.side_effect = get_alphas
+
+        result = run_list_alphas(client, limit=100, offset=0, status_filter="active")
+
+        assert result["ok"] is True
+        assert result["total"] == 1
+        assert result["alphas"][0]["alpha_id"] == "active-1"
+        assert session.get.call_args.kwargs["params"]["status"] == "ACTIVE"
+
+
+class TestAccountStatusService:
+    def test_maps_points_levels_and_alpha_counts(self):
+        client = MagicMock()
+        client.get_user_info.return_value = {
+            "id": "U1",
+            "geniusLevel": "BRONZE",
+            "level": "NONE",
+            "onboarding": None,
+        }
+        client.get_user_competitions.return_value = {
+            "results": [{
+                "id": "challenge",
+                "leaderboard": {"score": 1234.0, "level": "BRONZE"},
+                "progress": {"level": "SILVER", "score": {"remaining": 1766.0}},
+            }],
+        }
+        client.get_user_alpha_summary.return_value = {
+            "active": 4,
+            "unsubmitted": 12,
+            "decommissioned": 1,
+        }
+
+        result = run_account_status(client)
+
+        assert result["ok"] is True
+        assert result["points"] == 1234
+        assert result["points_source"] == "challenge.leaderboard.score"
+        assert result["genius_level"] == "BRONZE"
+        assert result["next_genius_level"] == "SILVER"
+        assert result["points_remaining"] == 8766
+        assert result["alpha_counts"] == {
+            "total": 17,
+            "submitted": 5,
+            "active": 4,
+            "unsubmitted": 12,
+            "decommissioned": 1,
+        }
+        assert result["goal_reached"] is False
+
+    def test_performance_leaderboard_score_is_not_treated_as_points(self):
+        client = MagicMock()
+        client.get_user_info.return_value = {
+            "id": "U1",
+            "geniusLevel": None,
+            "level": "GOLD",
+            "onboarding": None,
+        }
+        client.get_user_competitions.return_value = {
+            "results": [{
+                "id": "challenge",
+                "status": "ACCEPTED",
+                "scoring": "PERFORMANCE",
+                "leaderboard": {"rank": 2318, "score": 0.36, "level": None},
+                "progress": {"level": "GRANDMASTER", "score": {"remaining": 0.64}},
+            }],
+        }
+        client.get_user_alpha_summary.return_value = {"is": {}, "os": {}}
+
+        result = run_account_status(client, allow_alpha_count_fallback=False)
+
+        assert result["points"] is None
+        assert result["points_source"] is None
+        assert result["points_status"] == "SYNC_UNKNOWN"
+        assert result["leaderboard"]["score"] == 0.36
+        assert result["leaderboard"]["score_semantics"] == "PERFORMANCE"
+        assert result["consultant_level"] == "GOLD"
+        assert result["gold_reached"] is True
+        assert result["goal_reached"] is True
+        assert result["goal_basis"] == "consultant_active"
+        assert result["research_objective"] == "CONSULTANT_PERFORMANCE"
+
+    def test_does_not_treat_next_level_as_current_level(self):
+        client = MagicMock()
+        client.get_user_info.return_value = {"id": "U1", "geniusLevel": None, "level": "NONE"}
+        client.get_user_competitions.return_value = {
+            "results": [{
+                "id": "challenge",
+                "leaderboard": {"score": 0.0, "level": None},
+                "progress": {"level": "BRONZE", "score": {"remaining": 1000.0}},
+            }],
+        }
+        client.get_user_alpha_summary.return_value = {
+            "active": 1,
+            "unsubmitted": 32,
+            "decommissioned": 0,
+        }
+
+        result = run_account_status(client)
+
+        assert result["points"] == 0
+        assert result["genius_level"] == "NONE"
+        assert result["next_genius_level"] == "BRONZE"
+        assert result["gold_reached"] is False
+        assert result["consultant_status"] == "NOT_CONSULTANT"
+
+    def test_marks_leaderboard_lag_when_active_alphas_are_not_counted(self):
+        client = MagicMock()
+        client.get_user_info.return_value = {"id": "U1", "geniusLevel": None, "level": "NONE"}
+        client.get_user_competitions.return_value = {
+            "results": [{
+                "id": "challenge",
+                "status": "ACCEPTED",
+                "signUpDate": "2026-04-11T12:04:42-04:00",
+                "submissions": False,
+                "leaderboard": {"rank": 129114, "score": 0.0, "alphas": 0, "level": None},
+                "progress": {"level": "BRONZE", "score": {"remaining": 1000.0}},
+            }],
+        }
+        client.get_user_alpha_summary.return_value = {
+            "active": 3,
+            "unsubmitted": 272,
+            "decommissioned": 0,
+        }
+
+        result = run_account_status(client)
+
+        assert result["points"] == 0
+        assert result["points_status"] == "LEADERBOARD_LAGGING"
+        assert result["leaderboard"]["rank"] == 129114
+        assert result["leaderboard"]["alpha_count"] == 0
+        assert result["leaderboard"]["active_alpha_gap"] == 3
+        assert result["challenge"]["status"] == "ACCEPTED"
+        assert result["challenge"]["submissions"] is False
+
+    @patch("quantgpt.wq_brain_service.run_list_alphas")
+    def test_missing_platform_alpha_counts_never_claims_points_current(self, mock_list_alphas):
+        client = MagicMock()
+        client.get_user_info.return_value = {"id": "U1", "geniusLevel": "BRONZE", "level": "BRONZE"}
+        client.get_user_competitions.return_value = {
+            "results": [{"id": "challenge", "leaderboard": {"score": 3949.0, "alphas": 5, "level": "BRONZE"}}],
+        }
+        client.get_user_alpha_summary.return_value = {}
+        mock_list_alphas.return_value = {"ok": False, "error": "platform unavailable"}
+
+        result = run_account_status(client)
+
+        assert result["points"] == 3949
+        assert result["alpha_counts"]["active"] is None
+        assert result["leaderboard"]["active_alpha_gap"] is None
+        assert result["points_status"] == "SYNC_UNKNOWN"
+
+    @patch("quantgpt.wq_brain_service.run_list_alphas")
+    def test_can_skip_expensive_alpha_count_fallback(self, mock_list_alphas):
+        client = MagicMock()
+        client.get_user_info.return_value = {"id": "U1", "geniusLevel": "GOLD", "level": "GOLD"}
+        client.get_user_competitions.return_value = {
+            "results": [{"id": "challenge", "leaderboard": {"score": 11939.0, "level": "GOLD"}}],
+        }
+        client.get_user_alpha_summary.return_value = {"is": {}, "os": {}}
+
+        result = run_account_status(client, allow_alpha_count_fallback=False)
+
+        assert result["points"] == 11939
+        assert result["genius_level"] == "GOLD"
+        assert result["alpha_counts"]["active"] is None
+        mock_list_alphas.assert_not_called()
+
+    @patch("quantgpt.wq_brain_service.run_list_alphas")
+    def test_falls_back_to_paginated_alpha_counts(self, mock_list_alphas):
+        client = MagicMock()
+        client.get_user_info.return_value = {"id": "U1", "geniusLevel": None, "level": "NONE"}
+        client.get_user_competitions.return_value = {
+            "results": [{"id": "challenge", "leaderboard": {"score": 0.0, "level": None}}],
+        }
+        client.get_user_alpha_summary.return_value = {}
+        mock_list_alphas.return_value = {
+            "ok": True,
+            "alphas": [
+                {"status": "ACTIVE"},
+                {"status": "UNSUBMITTED"},
+                {"status": "UNSUBMITTED"},
+                {"status": "DECOMMISSIONED"},
+            ],
+        }
+
+        result = run_account_status(client)
+
+        assert result["alpha_counts"] == {
+            "total": 4,
+            "submitted": 2,
+            "active": 1,
+            "unsubmitted": 2,
+            "decommissioned": 1,
+        }
+        mock_list_alphas.assert_called_once_with(client, limit=100, offset=0)
+
 
 class TestWQBrainStatusEndpoint:
+    @pytest.mark.asyncio
     async def test_status_returns_config(self, client):
         resp = await client.get("/api/v1/wq-brain/status")
         assert resp.status_code == 200
@@ -121,6 +547,7 @@ class TestWQBrainStatusEndpoint:
 
 
 class TestWQBrainSubmitEndpoint:
+    @pytest.mark.asyncio
     async def test_submit_returns_503_when_not_configured(self, client):
         with patch.dict(os.environ, {"WQ_BRAIN_EMAIL": "", "WQ_BRAIN_PASSWORD": ""}, clear=False):
             resp = await client.post("/api/v1/wq-brain/submit", json={
@@ -129,20 +556,24 @@ class TestWQBrainSubmitEndpoint:
             })
             assert resp.status_code == 503
 
+    @pytest.mark.asyncio
     async def test_submit_creates_task(self, client):
-        with patch.dict(os.environ, {"WQ_BRAIN_EMAIL": "a@b.com", "WQ_BRAIN_PASSWORD": "pw"}, clear=False):
-            with patch("quantgpt.routes.wq_brain._run_wq_brain_task"):
-                resp = await client.post("/api/v1/wq-brain/submit", json={
-                    "expression": "rank(close)",
-                    "tag": "test-agent",
-                })
-                assert resp.status_code == 202
-                data = resp.json()
-                assert "task_id" in data
-                assert data["status"] == "pending"
+        with (
+            patch.dict(os.environ, {"WQ_BRAIN_EMAIL": "a@b.com", "WQ_BRAIN_PASSWORD": "pw"}, clear=False),
+            patch("quantgpt.routes.wq_brain._run_wq_brain_task"),
+        ):
+            resp = await client.post("/api/v1/wq-brain/submit", json={
+                "expression": "rank(close)",
+                "tag": "test-agent",
+            })
+            assert resp.status_code == 202
+            data = resp.json()
+            assert "task_id" in data
+            assert data["status"] == "pending"
 
 
 class TestSubmittedAlphasEndpoint:
+    @pytest.mark.asyncio
     async def test_list_returns_empty(self, client):
         resp = await client.get("/api/v1/wq-brain/submitted-alphas")
         assert resp.status_code == 200
@@ -152,6 +583,7 @@ class TestSubmittedAlphasEndpoint:
 
 
 class TestSubmitAlphaEndpoint:
+    @pytest.mark.asyncio
     async def test_submit_alpha_task_not_found(self, client):
         with patch.dict(os.environ, {"WQ_BRAIN_EMAIL": "a@b.com", "WQ_BRAIN_PASSWORD": "pw"}, clear=False):
             resp = await client.post("/api/v1/wq-brain/nonexistent/submit-alpha")

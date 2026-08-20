@@ -28,6 +28,13 @@ frontend/dist/
 
 # Logs
 logs/
+.quantgpt.pid
+.quantgpt.server.lock
+.wq-local-research.pid
+.wq-local-research.lock
+*.db-shm
+*.db-wal
+*.bak-*
 
 # MCP config (local paths)
 .mcp.json
@@ -44,6 +51,11 @@ marketing/
 # Research notes (runtime artifacts, not source code)
 research_notes/
 docs/factor_research/
+.scratch/**/.runtime/
+
+# Local investigation/probe scripts and Windows reserved-name artifacts
+/tmp_*.py
+/NUL
 
 # IDE
 .vscode/
@@ -53,6 +65,9 @@ docs/factor_research/
 .DS_Store
 engine/target/
 engine/Cargo.lock
+
+# CodeGraph local index
+.codegraph/
 
 # Database
 *.db

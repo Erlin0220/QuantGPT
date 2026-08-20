@@ -1,8 +1,6 @@
 """Admin panel routes: login, overview, users, tasks, feedbacks."""
 
-import hmac
 import logging
-import os
 import uuid as uuid_mod
 from datetime import datetime, timedelta, timezone
 
@@ -76,18 +74,31 @@ async def admin_overview(db: AsyncSession = Depends(get_db)):
         {"name": row[0], "value": row[1]} for row in status_dist_q.all()
     ]
 
-    # Daily task counts for last 7 days (for trend chart)
-    seven_days_ago = (now - timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
-    daily_q = await db.execute(
-        select(
-            func.date_trunc("day", Task.created_at).label("day"),
-            func.count(Task.id),
-        )
-        .where(Task.created_at >= seven_days_ago)
-        .group_by("day")
-        .order_by("day")
+    # Daily task counts for last 7 days (for trend chart). PostgreSQL has
+    # date_trunc; the default local deployment uses SQLite and needs date().
+    dialect_name = db.get_bind().dialect.name
+    day_bucket = lambda column: (  # noqa: E731
+        func.date_trunc("day", column) if dialect_name == "postgresql" else func.date(column)
     )
-    daily_map = {row[0].strftime("%m-%d"): row[1] for row in daily_q.all()}
+
+    def month_day(value) -> str:
+        if hasattr(value, "strftime"):
+            return value.strftime("%m-%d")
+        text = str(value or "")
+        try:
+            return datetime.fromisoformat(text).strftime("%m-%d")
+        except ValueError:
+            return text[5:10] if len(text) >= 10 else text
+
+    seven_days_ago = (now - timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
+    task_day = day_bucket(Task.created_at).label("day")
+    daily_q = await db.execute(
+        select(task_day, func.count(Task.id))
+        .where(Task.created_at >= seven_days_ago)
+        .group_by(task_day)
+        .order_by(task_day)
+    )
+    daily_map = {month_day(row[0]): row[1] for row in daily_q.all()}
     daily_tasks = []
     for i in range(7):
         d = seven_days_ago + timedelta(days=i)
@@ -96,16 +107,14 @@ async def admin_overview(db: AsyncSession = Depends(get_db)):
 
     # Daily new user registrations for last 30 days (for user trend chart)
     thirty_days_ago = (now - timedelta(days=29)).replace(hour=0, minute=0, second=0, microsecond=0)
+    user_day = day_bucket(User.created_at).label("day")
     daily_user_q = await db.execute(
-        select(
-            func.date_trunc("day", User.created_at).label("day"),
-            func.count(User.id),
-        )
+        select(user_day, func.count(User.id))
         .where(User.created_at >= thirty_days_ago)
-        .group_by("day")
-        .order_by("day")
+        .group_by(user_day)
+        .order_by(user_day)
     )
-    daily_user_map = {row[0].strftime("%m-%d"): row[1] for row in daily_user_q.all()}
+    daily_user_map = {month_day(row[0]): row[1] for row in daily_user_q.all()}
 
     # Cumulative user count before the 30-day window
     base_user_q = await db.execute(
@@ -306,7 +315,12 @@ async def resolve_feedback(
 
             asyncio.create_task(_safe_send())
 
-    return {"id": str(fb.id), "resolved": True, "resolved_at": fb.resolved_at.isoformat()}
+    resolved_at = fb.resolved_at
+    return {
+        "id": str(fb.id),
+        "resolved": True,
+        "resolved_at": resolved_at.isoformat() if resolved_at is not None else None,
+    }
 
 
 # ---- Factor Deep Research Report ----

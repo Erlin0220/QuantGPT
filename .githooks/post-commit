@@ -1,0 +1,32 @@
+#!/usr/bin/env sh
+set -eu
+
+# Auto-sync completed commits to the owner's remote without forcing history.
+# Set QUANTGPT_AUTOSYNC=0 for an emergency local-only commit.
+if [ "${QUANTGPT_AUTOSYNC:-1}" = "0" ]; then
+  exit 0
+fi
+
+branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+[ -n "$branch" ] || exit 0
+
+# Do not push intermediate commits created by history-rewriting or conflict flows.
+for marker in rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD; do
+  path="$(git rev-parse --git-path "$marker" 2>/dev/null || true)"
+  if [ -n "$path" ] && [ -e "$path" ]; then
+    exit 0
+  fi
+done
+
+remote="$(git config --get quantgpt.autosyncRemote 2>/dev/null || true)"
+remote="${remote:-personal}"
+
+if ! git remote get-url "$remote" >/dev/null 2>&1; then
+  printf 'QuantGPT auto-sync skipped: remote %s is not configured.\n' "$remote" >&2
+  exit 0
+fi
+
+if ! git push "$remote" "HEAD:refs/heads/$branch"; then
+  printf 'QuantGPT auto-sync failed for %s/%s; commit remains local.\n' "$remote" "$branch" >&2
+  exit 0
+fi

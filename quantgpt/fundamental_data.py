@@ -7,6 +7,7 @@ baostock path: fetches quarterly data from 6 APIs, aligns to daily via pubDate m
 import logging
 import re
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -370,19 +371,28 @@ class FundamentalDataFetcher:
             return market_df
         merged = pd.concat(result_parts, ignore_index=True)
 
+        def numeric_series(name: str) -> pd.Series:
+            if name not in merged.columns:
+                return pd.Series(np.nan, index=merged.index, dtype=float)
+            return cast(pd.Series, pd.to_numeric(cast(pd.Series, merged[name]), errors="coerce"))
+
+        close_val = numeric_series("close")
+        net_profit_val = numeric_series("net_profit")
+        total_share_val = numeric_series("total_share")
+        revenue_val = numeric_series("revenue")
+        roe_val = numeric_series("roe")
+        eq_mult = numeric_series("equity_multiplier")
+
         # Compute derived variables
         if "pe" in needed_vars:
             with np.errstate(divide="ignore", invalid="ignore"):
                 merged["pe"] = np.where(
-                    (merged.get("net_profit", 0) != 0) & merged.get("net_profit", pd.Series(dtype=float)).notna(),
-                    merged["close"] * merged.get("total_share", np.nan) / merged.get("net_profit", np.nan),
+                    (net_profit_val != 0) & net_profit_val.notna(),
+                    close_val * total_share_val / net_profit_val,
                     np.nan,
                 )
         if "pb" in needed_vars:
             with np.errstate(divide="ignore", invalid="ignore"):
-                roe_val = merged.get("roe", pd.Series(dtype=float))
-                net_profit_val = merged.get("net_profit", pd.Series(dtype=float))
-                total_share_val = merged.get("total_share", pd.Series(dtype=float))
                 # book value = net_profit / roe (annualized equity approximation)
                 book_value = np.where(
                     (roe_val != 0) & roe_val.notna(),
@@ -397,23 +407,19 @@ class FundamentalDataFetcher:
         if "ps" in needed_vars:
             with np.errstate(divide="ignore", invalid="ignore"):
                 merged["ps"] = np.where(
-                    (merged.get("revenue", 0) != 0) & merged.get("revenue", pd.Series(dtype=float)).notna(),
-                    merged["close"] * merged.get("total_share", np.nan) / merged.get("revenue", np.nan),
+                    (revenue_val != 0) & revenue_val.notna(),
+                    close_val * total_share_val / revenue_val,
                     np.nan,
                 )
         if "roa" in needed_vars:
             with np.errstate(divide="ignore", invalid="ignore"):
-                eq_mult = merged.get("equity_multiplier", pd.Series(dtype=float))
                 merged["roa"] = np.where(
                     (eq_mult != 0) & eq_mult.notna(),
-                    merged.get("roe", np.nan) / eq_mult,
+                    roe_val / eq_mult,
                     np.nan,
                 )
         if "bps" in needed_vars:
             with np.errstate(divide="ignore", invalid="ignore"):
-                roe_val = merged.get("roe", pd.Series(dtype=float))
-                net_profit_val = merged.get("net_profit", pd.Series(dtype=float))
-                total_share_val = merged.get("total_share", pd.Series(dtype=float))
                 book_value = np.where(
                     (roe_val != 0) & roe_val.notna(),
                     net_profit_val / roe_val,
@@ -426,8 +432,6 @@ class FundamentalDataFetcher:
                 )
         if "nav" in needed_vars:
             with np.errstate(divide="ignore", invalid="ignore"):
-                roe_val = merged.get("roe", pd.Series(dtype=float))
-                net_profit_val = merged.get("net_profit", pd.Series(dtype=float))
                 merged["nav"] = np.where(
                     (roe_val != 0) & roe_val.notna(),
                     net_profit_val / roe_val,
@@ -573,7 +577,7 @@ class FundamentalDataFetcher:
 
         result_parts = []
         for code, mkt_group in market_df.groupby("stock_code", sort=False):
-            stock_divs = div_df[div_df["stock_code"] == code].sort_values("ex_date")
+            stock_divs = cast(pd.DataFrame, div_df.loc[div_df["stock_code"] == code]).sort_values("ex_date")
             if len(stock_divs) == 0:
                 mkt_group = mkt_group.copy()
                 mkt_group["dividend_yield"] = np.nan
@@ -584,9 +588,10 @@ class FundamentalDataFetcher:
             # For each trade_date, compute TTM dividend (sum of cash_per_share
             # where ex_date is within [trade_date - 365d, trade_date])
             ttm_divs = []
-            div_dates = stock_divs["ex_date"].values
-            div_cash = stock_divs["cash_per_share"].values
-            for td in mkt_sorted["trade_date"].values:
+            div_dates = np.asarray(cast(pd.Series, stock_divs["ex_date"]), dtype="datetime64[ns]")
+            div_cash = np.asarray(cast(pd.Series, stock_divs["cash_per_share"]), dtype=float)
+            trade_dates = np.asarray(cast(pd.Series, mkt_sorted["trade_date"]), dtype="datetime64[ns]")
+            for td in trade_dates:
                 td_ts = pd.Timestamp(td)
                 cutoff = td_ts - pd.Timedelta(days=365)
                 mask = (div_dates >= cutoff.to_numpy()) & (div_dates <= td_ts.to_numpy())
@@ -680,7 +685,7 @@ def _load_factor_cache(stock_code: str, start_date: str, end_date: str) -> pd.Da
         req_start = pd.Timestamp(start_date)
         req_end = pd.Timestamp(end_date)
         if cache_min <= req_start + pd.Timedelta(days=5) and cache_max >= req_end - pd.Timedelta(days=5):
-            filtered = df[(df["trade_date"] >= req_start) & (df["trade_date"] <= req_end)]
+            filtered = cast(pd.DataFrame, df.loc[(df["trade_date"] >= req_start) & (df["trade_date"] <= req_end)])
             if len(filtered) > 0:
                 return filtered
     except Exception as e:
@@ -749,7 +754,7 @@ def _fetch_factors_rq(
 
     # Keep only stock_code, trade_date, + variable columns
     var_cols = [c for c in df.columns if c not in ("order_book_id", "date")]
-    return df[var_cols]
+    return cast(pd.DataFrame, df.loc[:, var_cols])
 
 
 def prewarm_factors_rq(
@@ -789,7 +794,7 @@ def prewarm_factors_rq(
         df = _fetch_factors_rq(batch, start_date, end_date)
         if df is not None and len(df) > 0:
             for code, group in df.groupby("stock_code"):
-                _save_factor_cache(code, group)
+                _save_factor_cache(str(code), group)
             logger.info(f"Factor batch {i // batch_size + 1}: {df['stock_code'].nunique()}/{len(batch)} stocks ({i + len(batch)}/{len(to_fetch)} total)")
         else:
             logger.warning(f"Factor batch {i // batch_size + 1}: no data returned")
@@ -842,7 +847,7 @@ def enrich_with_fundamentals_rq(
                 fetched = _fetch_factors_rq(batch, start_date, end_date, rq_factors)
                 if fetched is not None and len(fetched) > 0:
                     for code, group in fetched.groupby("stock_code"):
-                        _save_factor_cache(code, group)
+                        _save_factor_cache(str(code), group)
                     cached_parts.append(fetched)
                     logger.info(f"[rqdatac] Fetched factors for {fetched['stock_code'].nunique()} stocks, cached")
         else:

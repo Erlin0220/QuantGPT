@@ -83,8 +83,12 @@ def eval_factor_expression(df: pd.DataFrame, expression: str) -> pd.Series:
                 start = i
         stock_offsets.append((start, len(sc)))
 
+    engine = _engine
+    if engine is None:
+        from .expression_parser import parse_expression
+        return parse_expression(expression)(df)
     try:
-        result = _engine.eval_expression(expression, columns, stock_offsets, date_offsets)
+        result = engine.eval_expression(expression, columns, stock_offsets, date_offsets)
         return pd.Series(result, index=df.index, name="factor_value")
     except Exception as e:
         logger.warning(f"Rust eval_expression failed ({e}), falling back to Python")
@@ -99,7 +103,10 @@ def compute_metrics_rust(daily_returns: pd.Series, periods_per_year: int = 252) 
         return {}
 
     rets = daily_returns.to_numpy(dtype=np.float64, na_value=0.0)
+    engine = _engine
+    if engine is None:
+        return {}
     try:
-        return dict(_engine.compute_metrics(rets, float(periods_per_year)))
+        return dict(engine.compute_metrics(rets, float(periods_per_year)))
     except Exception:
         return {}

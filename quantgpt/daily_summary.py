@@ -2,22 +2,21 @@
 
 Pipeline:
 1. Fetch market data (hs300 stocks, last 70 days) + benchmark returns
-2. Compute factor signals from 15 core factor templates
-3. Build rich LLM prompt with real factor data
-4. Generate markdown report via DeepSeek
+2. Compute factor signals from core factor templates
+3. Build a structured market-data snapshot for storage
+4. Leave narrative interpretation to the ChatGPT client
 5. Store to DB
 """
 
 import json
 import logging
-import os
 import re
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
 import pandas as pd
-from openai import OpenAI
 
 from .factor_signals import FactorSignal, compute_factor_signals
 from .industry_analysis import compute_industry_signals
@@ -28,11 +27,6 @@ logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _TEMPLATES_PATH = Path(__file__).resolve().parent / "templates" / "factors.json"
-
-_DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-_DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
-_DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
-
 
 def _load_factor_templates() -> list:
     """Load factor templates from JSON."""
@@ -55,12 +49,13 @@ def _get_today_index_changes(date: str | None = None) -> dict:
             ret = fetch_benchmark_returns(code, start, today)
             if ret is not None and len(ret) > 0:
                 # Use exact date match, not last available
-                ret.index = pd.to_datetime(ret.index).normalize()
+                ret.index = pd.Index([cast(pd.Timestamp, pd.Timestamp(value)).normalize() for value in ret.index])
                 if target in ret.index:
                     metrics[f"{name}_change"] = round(float(ret.loc[target]) * 100, 2)
                 else:
                     # Fallback to last date, but log warning
-                    logger.warning(f"[daily_summary] {name} has no data for {today}, latest is {ret.index[-1].strftime('%Y-%m-%d')}")
+                    latest_date = str(ret.index[-1])[:10]
+                    logger.warning(f"[daily_summary] {name} has no data for {today}, latest is {latest_date}")
                     metrics[f"{name}_change"] = round(float(ret.iloc[-1]) * 100, 2)
             else:
                 metrics[f"{name}_change"] = 0.0
@@ -321,32 +316,61 @@ def _build_llm_prompt(
     return "\n".join(lines)
 
 
-# ─── LLM call ─────────────────────────────────────────────────────
+def _build_data_snapshot(
+    today: str,
+    index_changes: dict,
+    factor_signals: list[FactorSignal],
+    regime_data: dict,
+    industry_signals: list,
+) -> str:
+    """Build a deterministic snapshot; narrative reasoning belongs to ChatGPT."""
+    lines = [
+        f"# {today} A股盘后数据快照",
+        "",
+        "> QuantGPT 服务端不再调用 LLM；以下仅保存结构化观测，解读与研究建议由 ChatGPT 客户端完成。",
+        "",
+        "## 指数",
+    ]
+    if index_changes:
+        for name, value in index_changes.items():
+            if isinstance(value, (int, float)):
+                lines.append(f"- {name}: {value:.4f}")
+            else:
+                lines.append(f"- {name}: {value}")
+    else:
+        lines.append("- 暂无可用指数数据")
 
+    lines.extend(["", "## 市场状态"])
+    lines.append(f"- {regime_data.get('headline') or '暂无明确状态'}")
 
-def _call_llm(prompt: str) -> str:
-    """Call DeepSeek LLM for market summary."""
-    client = OpenAI(api_key=_DEEPSEEK_API_KEY, base_url=_DEEPSEEK_BASE_URL)
-    resp = client.chat.completions.create(
-        model=_DEEPSEEK_MODEL,
-        messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.4,
-        max_tokens=5000,
-    )
-    text = resp.choices[0].message.content.strip()
+    lines.extend(["", "## 因子信号"])
+    ranked_signals = sorted(factor_signals, key=lambda item: abs(int(item.signal_strength)), reverse=True)
+    for signal in ranked_signals[:10]:
+        lines.append(
+            f"- {signal.factor_name}: {signal.direction}；强度 {signal.signal_strength:+d}；"
+            f"20日分位 {signal.percentile_20d:.1f}"
+        )
+    if not ranked_signals:
+        lines.append("- 暂无可用因子信号")
 
-    # Strip any preamble before the first markdown heading
-    match = re.search(r'^(#{1,3}\s)', text, re.MULTILINE)
-    if match and match.start() > 0:
-        text = text[match.start():]
+    lines.extend(["", "## 行业信号"])
+    if industry_signals:
+        for item in industry_signals[:10]:
+            if isinstance(item, dict):
+                name = item.get("industry") or item.get("name") or item.get("industry_name") or "unknown"
+                score = item.get("score") or item.get("signal_strength") or item.get("composite_score")
+                lines.append(f"- {name}: {score if score is not None else '有结构化信号'}")
+            else:
+                lines.append(f"- {item}")
+    else:
+        lines.append("- 暂无可用行业信号")
 
-    # Post-process: ensure blank lines around headings and between list items
-    text = _fix_markdown_spacing(text)
-
-    return text
+    lines.extend([
+        "",
+        "---",
+        "*仅供量化研究，不构成投资建议。*",
+    ])
+    return _fix_markdown_spacing("\n".join(lines))
 
 
 def _fix_markdown_spacing(text: str) -> str:
@@ -489,11 +513,9 @@ async def generate_daily_summary(db, market: str = "a_share", date: str | None =
     except Exception as e:
         logger.warning(f"[daily_summary] Failed to load history: {e}")
 
-    # Step 5: Build prompt and call LLM
-    prompt = _build_llm_prompt(today, index_changes, factor_signals, regime_data, industry_signals, history_summaries)
-    logger.info(f"[daily_summary] LLM prompt: {len(prompt)} chars, calling DeepSeek...")
-    content = _call_llm(prompt)
-    logger.info(f"[daily_summary] LLM response: {len(content)} chars")
+    # Step 5: Store a deterministic snapshot. ChatGPT performs narrative analysis when requested.
+    content = _build_data_snapshot(today, index_changes, factor_signals, regime_data, industry_signals)
+    logger.info(f"[daily_summary] structured snapshot: {len(content)} chars")
 
     # Step 6: Store in DB
     metrics = {

@@ -1,6 +1,6 @@
 """WQ BRAIN batch operations — param sweep, batch submit by ID, batch status check, finalize."""
 
-import itertools
+import asyncio
 import logging
 import os
 import threading
@@ -13,16 +13,16 @@ from pydantic import BaseModel, Field
 from ..auth import get_current_user
 from ..models import User
 from ..task_store import (
+    MAX_ACTIVE_TASKS,
     active_task_count,
     check_rate_limit,
     persist_task_to_db,
     tasks,
     tasks_lock,
-    MAX_ACTIVE_TASKS,
 )
 from ..wq_brain_client import get_client, is_configured
 from ..wq_brain_service import (
-    fitness_to_grade,
+    reconcile_submission_uncertainty,
     run_batch_simulation,
     run_check_alphas,
     run_submit_by_ids,
@@ -51,7 +51,7 @@ class WQBrainBatchRequest(BaseModel):
     neutralizations: list[str] = Field(default=["SUBINDUSTRY"], description="Neutralizations to sweep")
     decay: int = Field(0, ge=0, le=20, description="Alpha decay (shared)")
     truncation: float = Field(0.08, ge=0, le=0.5, description="Weight truncation (shared)")
-    auto_submit: bool = Field(False, description="Auto-submit if all IS checks pass")
+    auto_submit: bool = Field(False, description="Deprecated; formal submission must use the validated Candidate submit-by-id flow")
     account: str = Field("primary", description="WQ account: 'primary' or 'alt'")
     session_id: str | None = Field(None, description="Session ID")
 
@@ -120,6 +120,7 @@ def _classify_alpha_check(data: dict) -> dict:
 
 def _finalize_alpha_statuses(client, alpha_ids: list[str], user_id: str | None = None) -> dict:
     """Query platform for real SC results and update DB for resolved alphas."""
+    from ..wq_submission_policy import finalize_submission_attempt_sync
     results = {}
     summary = {"total": len(alpha_ids), "resolved": 0, "active": 0, "sc_fail": 0, "sc_pending": 0, "unsubmitted": 0, "error": 0}
 
@@ -127,6 +128,7 @@ def _finalize_alpha_statuses(client, alpha_ids: list[str], user_id: str | None =
         data = client.check_alpha_status(alpha_id)
         classified = _classify_alpha_check(data)
         results[alpha_id] = classified
+        finalize_submission_attempt_sync("primary", alpha_id, classified)
 
         fs = classified["final_status"]
         if fs == "ACTIVE":
@@ -155,6 +157,8 @@ def _finalize_alpha_statuses(client, alpha_ids: list[str], user_id: str | None =
 
 
 def _run_batch_task(task_id: str, req: WQBrainBatchRequest, user_id: str):
+    from ..wq_submission_policy import finalize_submission_attempt_sync, reserve_submission_sync
+
     task = tasks.get(task_id)
     if not task:
         return
@@ -185,6 +189,8 @@ def _run_batch_task(task_id: str, req: WQBrainBatchRequest, user_id: str):
             user_id=user_id, tag=req.tag,
             on_progress=on_progress,
             check_cancelled=lambda: task.get("cancelled", False),
+            submission_guard=lambda alpha_id: reserve_submission_sync(account, alpha_id),
+            submission_result_callback=lambda alpha_id, submit_result: finalize_submission_attempt_sync(account, alpha_id, submit_result),
         )
         client.close()
 
@@ -219,6 +225,11 @@ async def wq_brain_batch_submit(
 ):
     if not is_configured():
         raise HTTPException(status_code=503, detail="WQ BRAIN 未配置")
+    if req.auto_submit:
+        raise HTTPException(
+            status_code=422,
+            detail="auto_submit 已停用；请先研究并进入 Candidate Queue，再使用 submit-by-id 正式提交",
+        )
 
     for r in req.regions:
         if r not in VALID_REGIONS:
@@ -272,6 +283,13 @@ async def wq_brain_batch_submit(
 
 
 def _run_batch_submit_by_id(task_id: str, alpha_ids: list[str], account: str, user_id: str):
+    from ..wq_submission_policy import (
+        _run_coro_sync,
+        finalize_submission_attempt_sync,
+        reconcile_candidate_platform_statuses,
+        reserve_submission_sync,
+    )
+
     task = tasks.get(task_id)
     if not task:
         return
@@ -286,6 +304,19 @@ def _run_batch_submit_by_id(task_id: str, alpha_ids: list[str], account: str, us
             task["error"] = f"WQ BRAIN 认证失败 (account={account})"
             return
 
+        task["status"] = "finalizing"
+        task["progress_message"] = "preflight: reconciling unresolved formal submissions"
+        submission_recovery = reconcile_submission_uncertainty(client, account)
+        task["submission_recovery"] = submission_recovery
+        if not submission_recovery.get("ok"):
+            task["status"] = "failed"
+            task["error"] = "存在尚未与 BRAIN 对账完成的正式提交；为避免超额提交，本次提交已冻结"
+            return
+
+        task["progress_message"] = "preflight: refreshing BRAIN metrics and SC state"
+        preflight = run_check_alphas(client, alpha_ids)
+        _run_coro_sync(reconcile_candidate_platform_statuses(account, preflight.get("alphas", {})))
+        task["preflight"] = preflight
         task["status"] = "running"
 
         def on_progress(current, total, aid):
@@ -304,6 +335,8 @@ def _run_batch_submit_by_id(task_id: str, alpha_ids: list[str], account: str, us
             on_progress=on_progress,
             check_cancelled=lambda: task.get("cancelled", False),
             on_each_done=on_each_done,
+            submission_guard=lambda alpha_id: reserve_submission_sync(account, alpha_id),
+            submission_result_callback=lambda alpha_id, entry: finalize_submission_attempt_sync(account, alpha_id, entry),
         )
         client.close()
 
@@ -311,7 +344,7 @@ def _run_batch_submit_by_id(task_id: str, alpha_ids: list[str], account: str, us
             task["status"] = "cancelled"
         else:
             task["status"] = "completed"
-            task["result"] = result
+            task["result"] = {"preflight": preflight, **result}
 
         logger.info(
             f"[{task_id}] batch submit done: "
@@ -420,7 +453,7 @@ async def wq_brain_batch_finalize(
     if not client.authenticate():
         raise HTTPException(status_code=502, detail="WQ BRAIN 认证失败")
 
-    result = _finalize_alpha_statuses(client, req.alpha_ids, user_id=str(user.id))
+    result = await asyncio.to_thread(_finalize_alpha_statuses, client, req.alpha_ids, str(user.id))
     client.close()
 
     return result

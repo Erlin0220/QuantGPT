@@ -10,15 +10,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from dotenv import load_dotenv
+
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 
 async def main():
-    from quantgpt.db import _get_session_factory, init_db
-    from quantgpt.models import Task as TaskModel, User
-    from quantgpt.auth import _DEV_USER_ID
-    from quantgpt.wq_brain_client import WQBrainClient, is_configured
     from sqlalchemy import func, select
+
+    from quantgpt.auth import _DEV_USER_ID
+    from quantgpt.db import _get_session_factory, init_db
+    from quantgpt.models import Task as TaskModel
+    from quantgpt.models import User
+    from quantgpt.wq_brain_client import WQBrainClient, is_configured
 
     await init_db()
     factory = _get_session_factory()

@@ -10,9 +10,7 @@ Refactored with QuantaAlpha three-phase evolution architecture:
   Phase 3: Strategy execution (Mutation / Crossover / Explore)
 """
 
-import hashlib
 import logging
-import os
 import re
 import traceback
 from pathlib import Path
@@ -20,13 +18,9 @@ from typing import Callable
 
 import pandas as pd
 
-from .crossover_engine import build_crossover_prompt, extract_top_segments
 from .expression_parser import parse_expression
-from .meta_evolution import EvolutionStrategy, select_strategy
-from .mutation_engine import MutationEngine
 from .report import generate_report
 from .task_executor import _run_backtest_in_process, get_executor
-from .trajectory_analyzer import analyze_trajectory
 
 logger = logging.getLogger(__name__)
 
@@ -124,81 +118,6 @@ def compute_factor_score(
         "cloud_predicted_pass": cloud_predicted_pass,
         "capped": capped, "cap_reason": cap_reason,
     }
-
-
-# ---- Prompt building ----
-
-_FACTOR_CATEGORIES = [
-    ("Momentum", "rank(ts_delta(close, 20) / ts_shift(close, 20))"),
-    ("Reversal", "rank(-1 * ts_delta(close, 5) / ts_shift(close, 5))"),
-    ("Volatility", "rank(ts_std(close/ts_shift(close,1)-1, 20))"),
-    ("Volume", "rank(volume / ts_mean(volume, 20))"),
-    ("Value", "rank((close - ts_min(close, 60)) / (ts_max(close, 60) - ts_min(close, 60) + 1e-8))"),
-    ("Correlation", "rank(ts_corr(close, volume, 20))"),
-    ("MeanReversion", "rank((close - ts_mean(close, 20)) / (ts_std(close, 20) + 1e-8))"),
-    ("Intraday", "rank((close - open) / (high - low + 1e-8))"),
-    ("NonlinearMomentum", "sign_power(ts_delta(close, 20) / close, 0.5) * rank(volume / adv20)"),
-    ("DecayWeighted", "decay_linear(rank(ts_corr(vwap, volume, 10)), 5)"),
-    ("Interaction", "rank(ts_corr(close, volume, 20)) * rank(ts_delta(close, 10) / close)"),
-    ("Conditional", "rank(where(ts_rank(volume, 20) > 0.7, ts_delta(close, 10) / close, 0))"),
-]
-
-_SYSTEM_PROMPT_TEMPLATE = """你是一个量化因子表达式优化专家。
-
-{operators_doc}
-
-## 多样性与非线性原则
-1. 只能使用上述 SUPPORTED OPERATORS 中列出的函数
-2. 优先使用非线性变换（sign_power, tanh, sigmoid, log）捕捉市场动态
-3. 组合不同类别的信号（动量+量价+波动率），而非仅调整单一信号的参数
-4. 使用交互项（乘法组合）来增强因子区分度
-5. 考虑条件因子（where）来捕捉不同市场状态
-6. 使用衰减加权（decay_linear）来对近期数据赋予更高权重
-
-## 输出格式要求（必须严格遵守）
-只返回一个因子表达式，不要任何解释、分析或推理过程。
-不要使用 markdown 代码块、反引号或引号包裹。
-你的回复必须是恰好一行可执行的因子表达式。
-
-## 复杂度限制
-- 函数嵌套层数不能超过 10 层
-- 表达式总长度不能超过 500 个字符
-"""
-
-
-def _build_explore_prompt(
-    expression: str, score: float, metrics: dict,
-    previous_expressions: list[str], iteration_index: int,
-    task_id: str, direction: str | None,
-) -> str:
-    """Build user prompt for EXPLORE strategy (try completely different approach)."""
-    # Select rotated category examples
-    seed_str = f"{task_id}:{iteration_index}"
-    h = int(hashlib.md5(seed_str.encode()).hexdigest(), 16)
-    indices = [(h >> (i * 3)) % 1000 for i in range(len(_FACTOR_CATEGORIES))]
-    ranked = sorted(range(len(_FACTOR_CATEGORIES)), key=lambda i: indices[i])
-    selected = [_FACTOR_CATEGORIES[i] for i in ranked[:5]]
-
-    parts = [
-        f"当前因子: {expression}",
-        f"评分: {score}/100 — 需要完全不同的方向",
-        "",
-        "## 参考因子类别（请选择一个全新方向）",
-    ]
-    for name, example in selected:
-        parts.append(f"- {name}: {example}")
-
-    if previous_expressions:
-        parts.append("")
-        parts.append("## 禁止重复（以下表达式已使用）")
-        for expr in previous_expressions[-10:]:
-            parts.append(f"- {expr}")
-
-    if direction:
-        parts.append(f"\n## 用户指定方向\n请重点朝以下方向改进：{direction}")
-
-    parts.append("\n请生成一个全新方向的因子表达式：")
-    return "\n".join(parts)
 
 
 # ---- Duplicate detection ----
@@ -315,40 +234,6 @@ def _evaluate_candidate(
 
 # ---- Main adaptive iteration loop ----
 
-def _call_llm(system_prompt: str, user_prompt: str, temperature: float = 0.9) -> str:
-    """Call LLM and return cleaned expression string."""
-    import time as _time
-
-    from openai import OpenAI
-
-    from .llm_service import clean_expression as _clean_expression
-
-    api_key = os.environ.get("DEEPSEEK_API_KEY")
-    if not api_key:
-        raise RuntimeError("DEEPSEEK_API_KEY not set")
-    base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
-    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
-    client = OpenAI(api_key=api_key, base_url=base_url)
-
-    for attempt in range(3):
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=temperature,
-                max_tokens=256,
-                timeout=60,
-            )
-            return _clean_expression(resp.choices[0].message.content)
-        except Exception as e:
-            logger.warning(f"LLM call attempt {attempt+1} failed: {e}")
-            _time.sleep(3 * (attempt + 1))
-    raise RuntimeError("LLM call failed after 3 attempts")
-
-
 def _validate_expression(expr: str) -> str | None:
     """Validate expression syntax. Returns error string or None if valid."""
     from .llm_service import validate_parentheses as _validate_parentheses
@@ -385,123 +270,44 @@ def generate_iteration_candidates(
     on_progress: Callable[[int, dict], None] | None = None,
     task_id: str = "",
     direction: str | None = None,
+    chatgpt_expressions: list[str] | None = None,
 ) -> list[dict]:
-    """Generate N candidate factor improvements using adaptive evolution.
+    """Validate and evaluate candidate expressions authored by the ChatGPT client."""
+    del parent_metrics, parent_score, parent_grade, max_concurrent
 
-    Serial-adaptive loop: generate → evaluate → analyze trajectory → select strategy → repeat.
-    Each candidate builds on the trajectory of all previous candidates.
-    """
-    from .llm_service import OPERATORS_DOC as _FACTOR_OPERATORS
+    supplied = list(chatgpt_expressions or [])[:n_candidates]
+    if not supplied:
+        raise RuntimeError(
+            "未提供 ChatGPT 候选表达式。请先让 ChatGPT 根据 diagnose_factor/mutation_prompt 生成候选，"
+            "再通过 chatgpt_expressions 提交评估。"
+        )
 
-    system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(operators_doc=_FACTOR_OPERATORS)
     all_expressions = [parent_expression]
-    trajectory: list[dict] = [{
-        "expression": parent_expression,
-        "score": parent_score,
-        "metrics": parent_metrics,
-        "strategy": "parent",
-    }]
     candidates: list[dict] = []
-
-    for i in range(n_candidates):
+    for i, raw_expression in enumerate(supplied):
+        expression = str(raw_expression or "").strip()
         try:
-            # Phase 1: Analyze trajectory
-            traj_metrics = analyze_trajectory(trajectory)
-
-            # Phase 2: Select strategy
-            current_score = trajectory[-1]["score"] if trajectory else parent_score
-            nesting = sum(1 for c in parent_expression if c == '(')
-            strategy = select_strategy(traj_metrics, current_score, nesting)
-            logger.info(f"[{task_id}] candidate {i}: strategy={strategy.value}, "
-                        f"traj_score={current_score}, best={traj_metrics.best_score}")
-
-            # Phase 3: Build prompt based on strategy
-            if strategy == EvolutionStrategy.RECOMBINE:
-                segments = extract_top_segments(trajectory)
-                if len(segments) >= 2:
-                    _, user_prompt = build_crossover_prompt(
-                        segments, parent_expression, current_score, _FACTOR_OPERATORS)
-                else:
-                    strategy = EvolutionStrategy.EXPLORE
-
-            if strategy == EvolutionStrategy.EXPLORE:
-                user_prompt = _build_explore_prompt(
-                    parent_expression, current_score, parent_metrics,
-                    all_expressions, i, task_id, direction)
-
-            elif strategy in (EvolutionStrategy.EXPLOIT, EvolutionStrategy.SIMPLIFY):
-                # Use best expression as base for mutation
-                base_expr = traj_metrics.best_expression or parent_expression
-                base_metrics = parent_metrics
-                for t in trajectory:
-                    if t["expression"] == base_expr:
-                        base_metrics = t.get("metrics", parent_metrics)
-                        break
-                engine = MutationEngine(base_expr, base_metrics, traj_metrics.best_score)
-                _, user_prompt = engine.build_mutation_prompt(_FACTOR_OPERATORS)
-
-                # Append anti-repeat and direction
-                extra = []
-                if all_expressions:
-                    extra.append("\n## 禁止重复")
-                    for expr in all_expressions[-10:]:
-                        extra.append(f"- {expr}")
-                if direction:
-                    extra.append(f"\n## 用户指定方向\n请重点朝以下方向改进：{direction}")
-                user_prompt += "\n".join(extra)
-
-            # Generate expression via LLM (with dedup retries)
-            temp = 0.9 if strategy != EvolutionStrategy.EXPLORE else 1.2
-            raw_expression = None
-            for dedup_attempt in range(4):
-                expr = _call_llm(system_prompt, user_prompt, temperature=min(temp + dedup_attempt * 0.2, 1.8))
-                err = _validate_expression(expr)
-                if err:
-                    logger.warning(f"[{task_id}] candidate {i} validation failed: {err}")
-                    raw_expression = expr
-                    break
-                if not is_duplicate_expression(expr, all_expressions):
-                    raw_expression = expr
-                    break
-                logger.info(f"[{task_id}] candidate {i} duplicate, retry {dedup_attempt+1}")
-            if raw_expression is None:
-                raw_expression = expr  # last attempt even if duplicate
-
-            # Validate
-            err = _validate_expression(raw_expression)
+            if not expression:
+                raise ValueError("候选表达式为空")
+            if is_duplicate_expression(expression, all_expressions):
+                raise ValueError("候选表达式与父因子或本轮候选重复")
+            err = _validate_expression(expression)
             if err:
-                result = {"expression": raw_expression, "status": "failed", "error": err, "score": 0}
-                candidates.append(result)
-                trajectory.append({"expression": raw_expression, "score": 0, "strategy": strategy.value})
-                if on_progress:
-                    on_progress(len(candidates), result)
-                continue
+                raise ValueError(err)
 
-            all_expressions.append(raw_expression)
-
-            # Evaluate
-            result = _evaluate_candidate(raw_expression, params, market_df, user_id)
-            result["strategy_used"] = strategy.value
+            all_expressions.append(expression)
+            result = _evaluate_candidate(expression, params, market_df, user_id)
+            result["strategy_used"] = "chatgpt_client"
+            if direction:
+                result["direction"] = direction
             candidates.append(result)
-
-            # Record in trajectory
-            trajectory.append({
-                "expression": raw_expression,
-                "score": result.get("score", 0),
-                "metrics": result.get("metrics", {}),
-                "strategy": strategy.value,
-            })
-
-            if on_progress:
-                on_progress(len(candidates), result)
-
         except Exception as e:
-            logger.error(f"[{task_id}] candidate {i} failed: {traceback.format_exc()}")
-            result = {"expression": "unknown", "status": "failed", "error": str(e), "score": 0}
+            logger.error(f"[{task_id}] ChatGPT candidate {i} failed: {traceback.format_exc()}")
+            result = {"expression": expression or "unknown", "status": "failed", "error": str(e), "score": 0}
             candidates.append(result)
-            trajectory.append({"expression": "unknown", "score": 0, "strategy": "error"})
-            if on_progress:
-                on_progress(len(candidates), result)
+
+        if on_progress:
+            on_progress(len(candidates), result)
 
     candidates.sort(key=lambda c: (c.get("status") == "success", c.get("score", 0)), reverse=True)
     return candidates

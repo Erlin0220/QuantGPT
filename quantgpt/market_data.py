@@ -11,6 +11,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -22,12 +23,14 @@ _bs_lock = threading.Lock()
 
 try:
     import baostock as bs
+
     HAS_BAOSTOCK = True
 except ImportError:
     HAS_BAOSTOCK = False
 
 try:
     import rqdatac
+
     HAS_RQDATAC = True
 except ImportError:
     HAS_RQDATAC = False
@@ -44,11 +47,11 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CACHE_ONLY = os.environ.get("QUANTGPT_CACHE_ONLY", "").lower() in ("1", "true", "yes")
 
 BENCHMARK_CODES = {
-    "hs300":  {"baostock": "sh.000300", "rqdatac": "000300.XSHG", "name": "沪深300"},
-    "zz500":  {"baostock": "sh.000905", "rqdatac": "000905.XSHG", "name": "中证500"},
+    "hs300": {"baostock": "sh.000300", "rqdatac": "000300.XSHG", "name": "沪深300"},
+    "zz500": {"baostock": "sh.000905", "rqdatac": "000905.XSHG", "name": "中证500"},
     "csi500": {"baostock": "sh.000905", "rqdatac": "000905.XSHG", "name": "中证500"},  # alias
     "csi1000": {"baostock": "sh.000852", "rqdatac": "000852.XSHG", "name": "中证1000"},
-    "sz50":   {"baostock": "sh.000016", "rqdatac": "000016.XSHG", "name": "上证50"},
+    "sz50": {"baostock": "sh.000016", "rqdatac": "000016.XSHG", "name": "上证50"},
 }
 
 # rqdatac index codes for universe fetching
@@ -63,7 +66,11 @@ _RQ_INDEX_CODES = {
 # Pre-defined stock universes
 UNIVERSES = {
     "small_scale": [
-        "sh.600519", "sh.601318", "sz.000858", "sz.000333", "sh.600036",
+        "sh.600519",
+        "sh.601318",
+        "sz.000858",
+        "sz.000333",
+        "sh.600036",
     ],
 }
 
@@ -71,6 +78,7 @@ UNIVERSES = {
 
 
 # ─── Code conversion helpers ───────────────────────────────────────
+
 
 def _to_rq_code(bs_code: str) -> str:
     """Convert baostock code to rqdatac code: sh.600519 → 600519.XSHG"""
@@ -87,6 +95,7 @@ def _from_rq_code(rq_code: str) -> str:
 
 
 # ─── rqdatac initialization ────────────────────────────────────────
+
 
 def _rqdatac_init() -> bool:
     """Lazy-init rqdatac session. Returns True if ready to use.
@@ -136,6 +145,7 @@ def enable_rqdatac():
 
 # ─── baostock helpers (unchanged) ──────────────────────────────────
 
+
 def _baostock_login():
     """Login to baostock, return True on success. Retries on network errors."""
     if not HAS_BAOSTOCK:
@@ -146,7 +156,7 @@ def _baostock_login():
             if lg.error_code == "0":
                 return True
             if attempt < 2:
-                logger.warning(f"baostock login attempt {attempt+1} failed: {lg.error_msg}, retrying...")
+                logger.warning(f"baostock login attempt {attempt + 1} failed: {lg.error_msg}, retrying...")
                 time.sleep(2 * (attempt + 1))
                 continue
             raise RuntimeError(f"baostock login failed: {lg.error_msg}")
@@ -154,7 +164,7 @@ def _baostock_login():
             raise
         except Exception as e:
             if attempt < 2:
-                logger.warning(f"baostock login attempt {attempt+1} error: {e}, retrying...")
+                logger.warning(f"baostock login attempt {attempt + 1} error: {e}, retrying...")
                 time.sleep(2 * (attempt + 1))
                 continue
             raise RuntimeError(f"baostock login error: {e}")
@@ -170,6 +180,7 @@ def _baostock_logout():
 
 # ─── Universe functions ────────────────────────────────────────────
 
+
 def get_universe(name: str, date: str | None = None) -> list[str]:
     """Return stock code list for a named universe.
 
@@ -182,7 +193,9 @@ def get_universe(name: str, date: str | None = None) -> list[str]:
     if name in ("hs300", "csi500", "zz500", "csi1000", "csi2000"):
         return _fetch_index_constituents(name, date)
 
-    raise ValueError(f"Unknown universe: {name}. Available: {list(UNIVERSES.keys()) + ['hs300', 'csi500', 'zz500', 'csi1000', 'csi2000']}")
+    raise ValueError(
+        f"Unknown universe: {name}. Available: {list(UNIVERSES.keys()) + ['hs300', 'csi500', 'zz500', 'csi1000', 'csi2000']}"
+    )
 
 
 def _fetch_index_constituents(name: str, date: str | None = None) -> list[str]:
@@ -306,11 +319,10 @@ def _fetch_all_stock_codes(date: str | None = None) -> list[str]:
     # Try rqdatac
     if _rqdatac_init():
         try:
-            df = rqdatac.all_instruments(type='CS', date=date)
+            df = rqdatac.all_instruments(type="CS", date=date)
             if df is not None and len(df) > 100:
-                rq_codes = df['order_book_id'].tolist()
-                codes = [_from_rq_code(c) for c in rq_codes
-                         if c.endswith('.XSHG') or c.endswith('.XSHE')]
+                rq_codes = df["order_book_id"].tolist()
+                codes = [_from_rq_code(c) for c in rq_codes if c.endswith(".XSHG") or c.endswith(".XSHE")]
                 # Exclude index-like codes (sh.000xxx)
                 codes = [c for c in codes if not c.startswith("sh.000")]
                 if len(codes) > 100:
@@ -425,7 +437,9 @@ class MarketDataFetcher:
         if os.path.exists(path):
             try:
                 df = pd.read_parquet(path)
-                df["trade_date"] = pd.to_datetime(df["trade_date"])
+                # Pandas 3 may preserve Parquet's microsecond unit; normalize the
+                # cache boundary so downstream comparisons keep the stable schema.
+                df["trade_date"] = pd.to_datetime(df["trade_date"]).astype("datetime64[ns]")
                 return df
             except Exception as e:
                 logger.warning(f"Cache load failed for {stock_code}: {e}")
@@ -449,8 +463,8 @@ class MarketDataFetcher:
                 rq_codes,
                 start_date=start_date,
                 end_date=end_date,
-                frequency='1d',
-                adjust_type='pre',
+                frequency="1d",
+                adjust_type="pre",
                 expect_df=True,
             )
             if rq_df is None or len(rq_df) == 0:
@@ -466,7 +480,9 @@ class MarketDataFetcher:
             logger.warning(f"rqdatac batch fetch failed: {e}")
             return {}
 
-    def _fetch_remote_bs(self, stock_code: str, start_date: str, end_date: str, already_logged_in: bool = False) -> pd.DataFrame | None:
+    def _fetch_remote_bs(
+        self, stock_code: str, start_date: str, end_date: str, already_logged_in: bool = False
+    ) -> pd.DataFrame | None:
         """Fetch single stock daily data from baostock."""
         code = self._normalize_stock_code(stock_code)
         logged_in = False
@@ -504,7 +520,9 @@ class MarketDataFetcher:
             if logged_in:
                 _baostock_logout()
 
-    def _fetch_remote(self, stock_code: str, start_date: str, end_date: str, already_logged_in: bool = False) -> pd.DataFrame | None:
+    def _fetch_remote(
+        self, stock_code: str, start_date: str, end_date: str, already_logged_in: bool = False
+    ) -> pd.DataFrame | None:
         """Fetch single stock: baostock (free) → rqdatac (optional)."""
         result = self._fetch_remote_bs(stock_code, start_date, end_date, already_logged_in)
         if result is not None:
@@ -536,7 +554,10 @@ class MarketDataFetcher:
                 # Only use cache if it covers the full requested range
                 # Allow 5-day tolerance for weekends/holidays at boundaries
                 if cache_min <= req_start + pd.Timedelta(days=5) and cache_max >= req_end - pd.Timedelta(days=5):
-                    filtered = cached[(cached["trade_date"] >= req_start) & (cached["trade_date"] <= req_end)]
+                    filtered = cast(
+                        pd.DataFrame,
+                        cached.loc[(cached["trade_date"] >= req_start) & (cached["trade_date"] <= req_end)],
+                    )
                     if len(filtered) > 0:
                         all_data.append(filtered)
                         continue
@@ -558,9 +579,16 @@ class MarketDataFetcher:
                                 if df is not None and len(df) > 0:
                                     existing = self._load_cache(code)
                                     if existing is not None:
-                                        df = pd.concat([existing, df]).drop_duplicates("trade_date", keep="last").sort_values("trade_date")
+                                        df = (
+                                            pd.concat([existing, df])
+                                            .drop_duplicates("trade_date", keep="last")
+                                            .sort_values("trade_date")
+                                        )
                                     self._save_cache(code, df)
-                                    filtered = df[(df["trade_date"] >= req_start) & (df["trade_date"] <= req_end)]
+                                    filtered = cast(
+                                        pd.DataFrame,
+                                        df.loc[(df["trade_date"] >= req_start) & (df["trade_date"] <= req_end)],
+                                    )
                                     if len(filtered) > 0:
                                         all_data.append(filtered)
                                     bs_fetched.add(self._normalize_stock_code(code))
@@ -571,15 +599,22 @@ class MarketDataFetcher:
                 rq_remaining = [c for c in to_fetch if self._normalize_stock_code(c) not in bs_fetched]
                 if rq_remaining and _rqdatac_init():
                     for i in range(0, len(rq_remaining), 200):
-                        chunk = rq_remaining[i:i+200]
+                        chunk = rq_remaining[i : i + 200]
                         rq_results = self._fetch_remote_rq(chunk, start_date, end_date)
                         for bs_code, df in rq_results.items():
                             if df is not None and len(df) > 0:
                                 existing = self._load_cache(bs_code)
                                 if existing is not None:
-                                    df = pd.concat([existing, df]).drop_duplicates("trade_date", keep="last").sort_values("trade_date")
+                                    df = (
+                                        pd.concat([existing, df])
+                                        .drop_duplicates("trade_date", keep="last")
+                                        .sort_values("trade_date")
+                                    )
                                 self._save_cache(bs_code, df)
-                                filtered = df[(df["trade_date"] >= req_start) & (df["trade_date"] <= req_end)]
+                                filtered = cast(
+                                    pd.DataFrame,
+                                    df.loc[(df["trade_date"] >= req_start) & (df["trade_date"] <= req_end)],
+                                )
                                 if len(filtered) > 0:
                                     all_data.append(filtered)
 
@@ -592,14 +627,12 @@ class MarketDataFetcher:
             return result
         return None
 
-    def calculate_forward_returns(self, df: pd.DataFrame, periods: list[int] = None) -> pd.DataFrame:
+    def calculate_forward_returns(self, df: pd.DataFrame, periods: list[int] | None = None) -> pd.DataFrame:
         """Add fwd_ret_{N}d columns."""
         periods = periods or [5]
         df = df.sort_values(["stock_code", "trade_date"])
         for p in periods:
-            df[f"fwd_ret_{p}d"] = df.groupby("stock_code")["close"].transform(
-                lambda x: x.shift(-p) / x - 1
-            )
+            df[f"fwd_ret_{p}d"] = df.groupby("stock_code")["close"].transform(lambda x: x.shift(-p) / x - 1)
         return df
 
 
@@ -631,12 +664,12 @@ def fetch_benchmark_returns(
             req_e = pd.Timestamp(end_date) if end_date else cache_max
             # Only use cache if it covers the full requested range
             if cache_min <= req_s + pd.Timedelta(days=5) and cache_max >= req_e - pd.Timedelta(days=5):
-                ret = df.set_index("trade_date")["daily_return"].dropna()
+                ret = cast(pd.Series, df.set_index("trade_date")["daily_return"]).dropna()
                 ret.name = info["name"]
                 if start_date:
-                    ret = ret[ret.index >= pd.Timestamp(start_date)]
+                    ret = cast(pd.Series, ret.loc[ret.index >= pd.Timestamp(start_date)])
                 if end_date:
-                    ret = ret[ret.index <= pd.Timestamp(end_date)]
+                    ret = cast(pd.Series, ret.loc[ret.index <= pd.Timestamp(end_date)])
                 if len(ret) > 1:
                     return ret
         except Exception:
@@ -657,8 +690,8 @@ def fetch_benchmark_returns(
                 rq_code,
                 start_date=start_date,
                 end_date=end_date,
-                frequency='1d',
-                adjust_type='pre',
+                frequency="1d",
+                adjust_type="pre",
                 expect_df=True,
             )
             if rq_df is not None and len(rq_df) > 0:
@@ -731,22 +764,27 @@ def _fetch_akshare(bs_code: str, start_date: str, end_date: str) -> pd.DataFrame
         ak_end = end_date.replace("-", "")
 
         df = ak.stock_zh_a_hist(
-            symbol=symbol, period="daily",
-            start_date=ak_start, end_date=ak_end, adjust="qfq",
+            symbol=symbol,
+            period="daily",
+            start_date=ak_start,
+            end_date=ak_end,
+            adjust="qfq",
         )
         if df is None or len(df) == 0:
             return None
 
-        df = df.rename(columns={
-            "日期": "trade_date",
-            "开盘": "open",
-            "最高": "high",
-            "最低": "low",
-            "收盘": "close",
-            "成交量": "volume",
-            "成交额": "amount",
-            "涨跌幅": "pct_change",
-        })
+        df = df.rename(
+            columns={
+                "日期": "trade_date",
+                "开盘": "open",
+                "最高": "high",
+                "最低": "low",
+                "收盘": "close",
+                "成交量": "volume",
+                "成交额": "amount",
+                "涨跌幅": "pct_change",
+            }
+        )
         df["stock_code"] = bs_code
         df["trade_date"] = pd.to_datetime(df["trade_date"])
         for col in ("open", "high", "low", "close", "volume", "amount", "pct_change"):
@@ -814,7 +852,11 @@ def _refresh_all_cached_stocks_impl():
             if new_data is not None and len(new_data) > 0:
                 existing = fetcher._load_cache(bs_code)
                 if existing is not None:
-                    merged = pd.concat([existing, new_data]).drop_duplicates("trade_date", keep="last").sort_values("trade_date")
+                    merged = (
+                        pd.concat([existing, new_data])
+                        .drop_duplicates("trade_date", keep="last")
+                        .sort_values("trade_date")
+                    )
                 else:
                     merged = new_data
                 fetcher._save_cache(bs_code, merged)
@@ -837,7 +879,11 @@ def _refresh_all_cached_stocks_impl():
                         if new_data is not None and len(new_data) > 0:
                             existing = fetcher._load_cache(bs_code)
                             if existing is not None:
-                                merged = pd.concat([existing, new_data]).drop_duplicates("trade_date", keep="last").sort_values("trade_date")
+                                merged = (
+                                    pd.concat([existing, new_data])
+                                    .drop_duplicates("trade_date", keep="last")
+                                    .sort_values("trade_date")
+                                )
                             else:
                                 merged = new_data
                             fetcher._save_cache(bs_code, merged)
@@ -850,10 +896,14 @@ def _refresh_all_cached_stocks_impl():
                 _baostock_logout()
 
     no_data = len(stocks_to_update) - updated - failed
-    logger.info(f"[refresh] Done: {updated} updated (akshare: {updated - bs_fallback}, baostock: {bs_fallback}), {failed} failed, {no_data} no new data")
+    logger.info(
+        f"[refresh] Done: {updated} updated (akshare: {updated - bs_fallback}, baostock: {bs_fallback}), {failed} failed, {no_data} no new data"
+    )
 
 
-def refresh_all_stocks_full(stock_codes: list[str] | None = None, start_date: str | None = None, end_date: str | None = None):
+def refresh_all_stocks_full(
+    stock_codes: list[str] | None = None, start_date: str | None = None, end_date: str | None = None
+):
     """Full refresh via rqdatac. Manual trigger only.
 
     Fetches complete history for given stocks (or all cached stocks) and
@@ -883,7 +933,7 @@ def refresh_all_stocks_full(stock_codes: list[str] | None = None, start_date: st
     chunk_size = 50  # rqdatac batch limit
 
     for i in range(0, len(stock_codes), chunk_size):
-        chunk = stock_codes[i:i + chunk_size]
+        chunk = stock_codes[i : i + chunk_size]
         try:
             results = fetcher._fetch_remote_rq(chunk, start, today)
             for bs_code, df in results.items():
@@ -942,20 +992,25 @@ def refresh_all_stocks_rqdatac_incremental():
 
     # Group by start_date for efficient batch fetching
     from collections import defaultdict
+
     by_start: defaultdict[str, list] = defaultdict(list)
     for bs_code, start_date in stocks_to_update:
         by_start[start_date].append(bs_code)
 
     for start_date, codes in by_start.items():
         for i in range(0, len(codes), chunk_size):
-            chunk = codes[i:i + chunk_size]
+            chunk = codes[i : i + chunk_size]
             try:
                 results = fetcher._fetch_remote_rq(chunk, start_date, today)
                 for bs_code, df in results.items():
                     if df is not None and len(df) > 0:
                         existing = fetcher._load_cache(bs_code)
                         if existing is not None:
-                            merged = pd.concat([existing, df]).drop_duplicates("trade_date", keep="last").sort_values("trade_date")
+                            merged = (
+                                pd.concat([existing, df])
+                                .drop_duplicates("trade_date", keep="last")
+                                .sort_values("trade_date")
+                            )
                         else:
                             merged = df
                         fetcher._save_cache(bs_code, merged)
@@ -966,4 +1021,6 @@ def refresh_all_stocks_rqdatac_incremental():
 
         logger.info(f"[rq_incr] start_date={start_date}: processed {len(codes)} stocks")
 
-    logger.info(f"[rq_incr] Done: {updated} updated, {failed} failed, {len(stocks_to_update) - updated - failed} no new data")
+    logger.info(
+        f"[rq_incr] Done: {updated} updated, {failed} failed, {len(stocks_to_update) - updated - failed} no new data"
+    )

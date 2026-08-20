@@ -1,6 +1,7 @@
 """Factor attribution — decompose composite factor returns into sub-factor contributions."""
 
 import logging
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -145,12 +146,16 @@ def _compute_marginal_contributions(
 
     # Equal-weight composite IC
     labels = list(factor_values.keys())
-    combined = sum(factor_values[l] for l in labels) / len(labels)
+    combined = factor_values[labels[0]].copy()
+    for label in labels[1:]:
+        combined = combined + factor_values[label]
+    combined = combined / len(labels)
 
     # Forward returns for IC calculation
-    fwd = market_df.groupby(stock_col)["close"].pct_change(holding_period).shift(-holding_period)
+    fwd = cast(pd.Series, market_df.groupby(stock_col)["close"].pct_change(holding_period).shift(-holding_period))
+    trade_dates = cast(pd.Series, market_df["trade_date"])
 
-    full_ic = _rank_ic(combined, fwd, market_df["trade_date"])
+    full_ic = _rank_ic(combined, fwd, trade_dates)
 
     contributions = []
     for label in labels:
@@ -159,8 +164,11 @@ def _compute_marginal_contributions(
         if not remaining:
             contributions.append({"label": label, "marginal_ic": round(full_ic, 6)})
             continue
-        partial = sum(factor_values[l] for l in remaining) / len(remaining)
-        partial_ic = _rank_ic(partial, fwd, market_df["trade_date"])
+        partial = factor_values[remaining[0]].copy()
+        for remaining_label in remaining[1:]:
+            partial = partial + factor_values[remaining_label]
+        partial = partial / len(remaining)
+        partial_ic = _rank_ic(partial, fwd, trade_dates)
         marginal = full_ic - partial_ic
         contributions.append({
             "label": label,
@@ -181,4 +189,5 @@ def _rank_ic(factor_series: pd.Series, returns_series: pd.Series, date_series: p
     ics = df.groupby("date").apply(
         lambda g: g["factor"].corr(g["ret"], method="spearman") if len(g) > 5 else np.nan
     )
-    return float(ics.dropna().mean()) if len(ics.dropna()) > 0 else 0.0
+    clean_ics = cast(pd.Series, ics).dropna()
+    return float(clean_ics.mean()) if len(clean_ics) > 0 else 0.0

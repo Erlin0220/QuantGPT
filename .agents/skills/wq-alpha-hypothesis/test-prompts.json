@@ -1,0 +1,7 @@
+[
+  {"prompt":"找一批值得提交 WorldQuant 的新 Alpha，优先补候选库存。","expected":"invoke","reason":"new WQ Alpha generation"},
+  {"prompt":"基于现金流和分析师预期给我 5 个 BRAIN 候选。","expected":"invoke","reason":"hypothesis and live-field generation"},
+  {"prompt":"这个 Alpha LOW_FITNESS，应该怎么改？","expected":"not_invoke","reason":"use wq-alpha-repair"},
+  {"prompt":"现有 Alpha self-correlation 太高，换一批不同方向。","expected":"not_invoke","reason":"use wq-alpha-diversify"},
+  {"prompt":"解释 Sharpe 是什么意思。","expected":"not_invoke","reason":"education only"}
+]

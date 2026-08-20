@@ -12,6 +12,8 @@ import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +174,7 @@ _embedded_images: list[tuple[str, bytes]] = []
 _CHARTS_BASE_URL = "http://localhost:8003/charts"
 
 
-def _img_tag(fig: plt.Figure, alt: str = "") -> str:
+def _img_tag(fig: Figure, alt: str = "") -> str:
     """Save chart to disk and return an HTML img tag with public URL."""
     _CHARTS_DIR.mkdir(parents=True, exist_ok=True)
     filename = f"chart_{len(_embedded_images)}.png"
@@ -189,7 +191,7 @@ def _img_tag(fig: plt.Figure, alt: str = "") -> str:
             f'style="width:100%;max-width:720px;height:auto;display:block;margin:16px auto;border-radius:8px;">')
 
 
-def _style_chart(ax: plt.Axes, title: str = "", ylabel: str = "") -> None:
+def _style_chart(ax: Axes, title: str = "", ylabel: str = "") -> None:
     """Apply consistent styling to chart axes."""
     ax.set_facecolor(_BG_COLOR)
     ax.spines["top"].set_visible(False)
@@ -410,7 +412,7 @@ def generate_metrics_comparison_chart(top_factors: list[dict]) -> str:
 
     fig.suptitle("Top 因子关键指标对比", fontsize=13, fontweight="600",
                  color="#1e293b", y=0.98)
-    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
     return _img_tag(fig, "关键指标对比")
 
 

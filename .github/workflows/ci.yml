@@ -24,7 +24,7 @@ jobs:
         run: ruff check quantgpt/ tests/
 
       - name: Type check
-        run: pyright quantgpt/ --level basic
+        run: pyright quantgpt/
 
       - name: Test with coverage
         env:

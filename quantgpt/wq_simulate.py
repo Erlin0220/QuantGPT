@@ -6,6 +6,8 @@ Returns, and Fitness calculations. Used to estimate whether a factor
 would pass WQ BRAIN's IS (In-Sample) tests.
 """
 
+from typing import cast
+
 import numpy as np
 import pandas as pd
 
@@ -156,7 +158,7 @@ def _sub_universe_sharpe(
     BRAIN sub-universe test proxy: both halves must have positive Sharpe
     above a minimum threshold.
     """
-    all_stocks = work_df["stock_code"].unique()
+    all_stocks = pd.unique(cast(pd.Series, work_df["stock_code"]))
     if len(all_stocks) < 10:
         return {"sub_sharpe_min": 0.0, "threshold": 1.19, "pass": False}
 
@@ -170,14 +172,14 @@ def _sub_universe_sharpe(
     sharpes = []
 
     for stock_set in [half_a, half_b]:
-        sub_df = work_df[work_df["stock_code"].isin(stock_set)]
+        sub_df = cast(pd.DataFrame, work_df.loc[work_df["stock_code"].isin(stock_set)])
         dates = sorted(sub_df["trade_date"].unique())
         current_weights = None
         pending_weights = None
         daily_pnl = []
 
         for date in dates:
-            day_data = sub_df[sub_df["trade_date"] == date]
+            day_data = cast(pd.DataFrame, sub_df.loc[sub_df["trade_date"] == date])
 
             if pending_weights is not None:
                 current_weights = pending_weights

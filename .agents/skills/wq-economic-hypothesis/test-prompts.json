@@ -1,0 +1,7 @@
+[
+  {"prompt":"最近新 Alpha 大量 low_fitness，先从经济机制重新想一批研究假设。","expected":"invoke","reason":"weak hypothesis quality is the target failure mode"},
+  {"prompt":"给我设计一批新的 WorldQuant Alpha 思路，但不要先套算子。","expected":"invoke","reason":"new alpha generation should start from mechanism-first cases"},
+  {"prompt":"同一个基本面数据集还能从哪些不同经济问题展开，而不是只改窗口？","expected":"invoke","reason":"semantic expansion from an information-rich dataset"},
+  {"prompt":"这个 Alpha 已经 SC_FAIL，帮我判断为什么。","expected":"not_invoke","reason":"use wq-failure-diagnosis first for an existing failed alpha"},
+  {"prompt":"这个近失 Alpha decay 从 5 调到 10 值不值得再试？","expected":"not_invoke","reason":"use wq-experiment-allocation for bounded repair decisions"}
+]

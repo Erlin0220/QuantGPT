@@ -4,9 +4,10 @@ import uuid
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from quantgpt.alpha_tracker import check_self_correlation, compute_similarity, record_submitted_alpha
+from quantgpt.alpha_tracker import compute_similarity
 from quantgpt.models import Base, SubmittedAlpha
 
 
@@ -67,9 +68,6 @@ class TestCheckSelfCorrelation:
     @pytest.mark.asyncio
     async def test_no_submitted_alphas(self, alpha_factory):
         """When no alphas are submitted, expression is safe."""
-        from quantgpt.expression_parser import normalize_expression
-        from sqlalchemy import select
-
         user_id = uuid.uuid4()
         async with alpha_factory() as session:
             result = await session.execute(

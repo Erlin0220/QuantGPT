@@ -210,9 +210,9 @@ def factor_df_to_cloud_format(factor_df: pd.DataFrame) -> list[dict]:
     for trade_date, group in factor_df.groupby("trade_date"):
         values = {}
         for _, row in group.iterrows():
-            val = row["factor_value"]
+            val = row.at["factor_value"]
             if np.isfinite(val):
-                values[row["stock_code"]] = round(float(val), 6)
+                values[str(row.at["stock_code"])] = round(float(val), 6)
         if values:
             data.append({"date": str(trade_date).split(" ")[0], "values": values})
     return data

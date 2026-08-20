@@ -1,14 +1,6 @@
-"""LLM integration — DeepSeek API calls for factor expression generation and interpretation."""
+"""Factor-expression text utilities shared by API and ChatGPT-facing workflows."""
 
-import json
-import logging
-import os
 import re
-
-from .expression_parser import __doc__ as _expr_module_doc
-
-logger = logging.getLogger(__name__)
-
 
 _FACTOR_OPERATORS = """
 ================================================================================
@@ -183,9 +175,23 @@ def clean_expression(raw: str) -> str:
         text = text.rsplit("```", 1)[0]
     text = text.strip("`").strip()
     if "\n" in text:
-        factor_ops = ["rank(", "ts_mean(", "ts_std(", "ts_delta(", "ts_shift(",
-                       "ts_corr(", "where(", "sign_power(", "power(", "decay_linear(",
-                       "log(", "abs(", "zscore(", "close", "volume"]
+        factor_ops = [
+            "rank(",
+            "ts_mean(",
+            "ts_std(",
+            "ts_delta(",
+            "ts_shift(",
+            "ts_corr(",
+            "where(",
+            "sign_power(",
+            "power(",
+            "decay_linear(",
+            "log(",
+            "abs(",
+            "zscore(",
+            "close",
+            "volume",
+        ]
         for line in reversed(text.split("\n")):
             line = line.strip()
             if any(op in line for op in factor_ops):
@@ -197,9 +203,9 @@ def validate_parentheses(expr: str) -> str | None:
     """Check if parentheses are balanced. Returns error message or None."""
     depth = 0
     for i, ch in enumerate(expr):
-        if ch == '(':
+        if ch == "(":
             depth += 1
-        elif ch == ')':
+        elif ch == ")":
             depth -= 1
             if depth < 0:
                 return f"括号不平衡：位置 {i} 处多余的右括号 ')'"
@@ -208,149 +214,10 @@ def validate_parentheses(expr: str) -> str | None:
     return None
 
 
-def _get_client():
-    from openai import OpenAI
-    api_key = os.environ.get("DEEPSEEK_API_KEY")
-    if not api_key:
-        raise RuntimeError("DEEPSEEK_API_KEY environment variable is not set")
-    base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
-    return OpenAI(api_key=api_key, base_url=base_url)
-
-
-def _get_model() -> str:
-    return os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
-
-
-def call_deepseek(prompt: str) -> str:
-    """Call DeepSeek API to generate factor expression."""
-    client = _get_client()
-    operators_doc = _expr_module_doc or _FACTOR_OPERATORS
-    system = _SYSTEM_PROMPT.format(operators=operators_doc)
-
-    resp = client.chat.completions.create(
-        model=_get_model(),
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.1,
-        max_tokens=256,
-        timeout=30,
-    )
-    return clean_expression(resp.choices[0].message.content)
-
-
-def call_fix_expression(expression: str, error: str, prompt: str) -> str:
-    """Call LLM to fix a broken factor expression."""
-    client = _get_client()
-    operators_doc = _expr_module_doc or _FACTOR_OPERATORS
-
-    system = (
-        "你是一个因子表达式修复助手。\n\n"
-        f"{operators_doc}\n\n"
-        "修复下面的表达式。只返回修正后的表达式，不要任何解释、代码块或引号。"
-    )
-    user = (
-        f"用户需求: {prompt}\n\n"
-        f"以下因子表达式执行失败:\n"
-        f"`{expression}`\n\n"
-        f"错误信息:\n{error}"
-    )
-
-    resp = client.chat.completions.create(
-        model=_get_model(),
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=0.1,
-        max_tokens=256,
-        timeout=30,
-    )
-    return clean_expression(resp.choices[0].message.content)
-
-
-_INTERPRET_SYSTEM = """你是一位专业的量化研究员，擅长用通俗语言解读因子表达式的经济含义并撰写研究报告。
-
-你的任务是解读一个因子表达式，输出 JSON，格式如下：
-{
-  "logic": "因子的核心逻辑（1-2句，说明该因子捕捉了什么市场现象）",
-  "source": "收益来源（1-2句，说明为什么这个因子能产生超额收益，背后的行为金融或基本面逻辑）",
-  "guidance": "交易指导（2-4句，从经济含义角度指导用户如何利用该因子思路交易，禁止推荐具体标的，聚焦行为规律和风险提示）",
-  "risk": "主要风险（1句，说明该因子在什么市场环境下容易失效）",
-  "conclusion": "核心结论（2-3句，总结因子整体表现和是否推荐使用）",
-  "suggestions": ["改进建议1", "改进建议2"]
-}
-
-注意：评级(rating)由系统算法自动生成，你不需要输出评级。
-
-交易指导要求：
-- 禁止推荐任何具体标的
-- 从行为金融角度出发，指出市场参与者的非理性行为
-- 结合回测指标（如换手率、IC、单调性）给出实操建议
-- 语言简洁，面向普通投资者
-
-只输出 JSON，不要任何额外文字。"""
-
-
-def call_interpret_factor(
-    expression: str,
-    prompt: str,
-    metrics: dict,
-    backtest_summary: dict,
-) -> dict:
-    """Call LLM to interpret factor economic meaning."""
-    api_key = os.environ.get("DEEPSEEK_API_KEY")
-    if not api_key:
-        return {}
-
-    try:
-        client = _get_client()
-    except RuntimeError:
-        return {}
-
-    sharpe = metrics.get("sharpe", 0)
-    cagr = metrics.get("cagr", 0)
-    max_dd = metrics.get("max_drawdown", 0)
-    ic = backtest_summary.get("ic_mean", 0)
-    rank_ic = backtest_summary.get("rank_ic_mean", 0)
-    mono = backtest_summary.get("monotonicity_score", 0)
-    turnover = backtest_summary.get("turnover", 0)
-
-    user_msg = (
-        f"用户需求：{prompt}\n"
-        f"因子表达式：{expression}\n\n"
-        f"回测指标（供参考）：\n"
-        f"- 年化收益：{cagr*100:.1f}%，Sharpe：{sharpe:.2f}，最大回撤：{max_dd*100:.1f}%\n"
-        f"- IC均值：{ic:.4f}，Rank IC：{rank_ic:.4f}，单调性：{mono:.2f}，换手率：{turnover*100:.1f}%\n"
-    )
-
-    try:
-        resp = client.chat.completions.create(
-            model=_get_model(),
-            messages=[
-                {"role": "system", "content": _INTERPRET_SYSTEM},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0.3,
-            max_tokens=600,
-            timeout=30,
-        )
-        raw = resp.choices[0].message.content.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        return json.loads(raw)
-    except Exception as e:
-        logger.warning(f"Factor interpretation failed: {e}")
-        return {}
-
-
 _EXPR_KEYWORDS = re.compile(
-    r'(?:rank|zscore|ts_mean|ts_std|ts_delta|ts_shift|ts_rank|ts_corr|ts_cov|'
-    r'ts_max|ts_min|ts_sum|ts_argmax|ts_argmin|decay_linear|product|sign_power|'
-    r'where|clip|log|abs|sign|scale|tanh|sigmoid|exp|sqrt|power)\s*\('
+    r"(?:rank|zscore|ts_mean|ts_std|ts_delta|ts_shift|ts_rank|ts_corr|ts_cov|"
+    r"ts_max|ts_min|ts_sum|ts_argmax|ts_argmin|decay_linear|product|sign_power|"
+    r"where|clip|log|abs|sign|scale|tanh|sigmoid|exp|sqrt|power)\s*\("
 )
 
 
@@ -359,8 +226,9 @@ def looks_like_expression(text: str) -> bool:
     if _EXPR_KEYWORDS.search(text):
         return True
     from .fundamental_data import ALL_FUNDAMENTAL_NAMES as _FN
-    cols = {'open', 'high', 'low', 'close', 'volume', 'amount', 'returns', 'vwap'} | _FN
-    tokens = re.findall(r'[a-zA-Z_]\w*', text)
+
+    cols = {"open", "high", "low", "close", "volume", "amount", "returns", "vwap"} | _FN
+    tokens = re.findall(r"[a-zA-Z_]\w*", text)
     if tokens and all(t in cols for t in tokens):
         return True
     return False
